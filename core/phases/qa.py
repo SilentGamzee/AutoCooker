@@ -124,17 +124,21 @@ class QAPhase(BasePhase):
     def _step4_validate_text(self, model: str) -> bool:
         self.log("─── Step 3.4: Text quality ───")
         wd = self.task.project_path or self.state.working_dir
+        sandbox = create_sandbox(self.task.task_dir, self.task.project_path or self.state.working_dir)
         text_files: list[str] = []
-        for dirpath, _, files in os.walk(wd):
+        for dirpath, _, files in os.walk(self.task.task_dir):
             for fname in files:
                 if fname.endswith((".md", ".txt", ".rst")):
-                    text_files.append(os.path.relpath(os.path.join(dirpath, fname), wd))
+                    # Skip files from other tasks
+                    if dirpath != self.task.task_dir:
+                        continue
+                    text_files.append(os.path.relpath(os.path.join(dirpath, fname), self.task.task_dir))
 
         if not text_files:
             self.log("  No text files", "info")
             return True
 
-        executor = ToolExecutor(working_dir=wd, cache=self.state.cache)
+        executor = ToolExecutor(working_dir=wd, cache=self.state.cache, sandbox=sandbox)
         msg = (
             "Review these files for spelling/grammar:\n"
             + "\n".join(f"- {p}" for p in text_files[:20])
