@@ -4,6 +4,8 @@ import json
 import os
 from typing import Callable, Optional
 
+from core.sandbox import create_sandbox
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Tool schema definitions (OpenAI / Ollama format)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -177,11 +179,13 @@ class ToolExecutor:
         cache,                     # FileCache
         on_task_confirmed: Optional[Callable[[str, str], None]] = None,
         on_task_created: Optional[Callable[[dict], None]] = None,
+        sandbox: Optional['core.sandbox.Sandbox'] = None,
     ):
         self.working_dir = os.path.realpath(working_dir)
         self.cache = cache
         self.on_task_confirmed = on_task_confirmed
         self.on_task_created = on_task_created
+        self.sandbox = sandbox
 
         # Signals from tools back to the phase runner
         self.last_confirmed_task_id: Optional[str] = None
@@ -210,10 +214,24 @@ class ToolExecutor:
         if not abs_path.startswith(self.working_dir):
             raise PermissionError(f"Path escape attempt: {rel_path}")
         return abs_path
+    
+    def _validate_path(self, path: str, operation: str) -> str:
+        """Validate path using sandbox if enabled."""
+        if self.sandbox:
+            allowed, reason = self.sandbox.validate_path(path, operation)
+            if not allowed:
+                return f"BLOCKED: {reason}"
+        return "OK"
 
     def _read_file(self, args: dict) -> str:
         path_rel = args.get("path", "")
         abs_path = self._safe_path(path_rel)
+        
+        # Validate path with sandbox
+        validation = self._validate_path(abs_path, "read")
+        if validation != "OK":
+            return validation
+        
         if not os.path.isfile(abs_path):
             return f"ERROR: File not found: {path_rel}"
         try:
@@ -245,6 +263,12 @@ class ToolExecutor:
         path_rel = args.get("path", "")
         content  = args.get("content", "")
         abs_path = self._safe_path(path_rel)
+        
+        # Validate path with sandbox
+        validation = self._validate_path(abs_path, "write")
+        if validation != "OK":
+            return validation
+        
         os.makedirs(os.path.dirname(abs_path), exist_ok=True)
         try:
             with open(abs_path, "w", encoding="utf-8") as f:

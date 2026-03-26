@@ -68,9 +68,11 @@ class CodingPhase(BasePhase):
                 self.log(f"    ✓ confirm_task_done: {summary[:120]}", "confirm")
 
         wd = self.task.project_path or self.state.working_dir
+        sandbox = create_sandbox(self.task.task_dir, self.task.project_path or self.state.working_dir)
         executor = ToolExecutor(
             working_dir=wd, cache=self.state.cache,
             on_task_confirmed=on_confirmed,
+            sandbox=sandbox,
         )
         msg = (
             f"Implement subtask {sid}: {subtask_dict.get('title','')}\n\n"

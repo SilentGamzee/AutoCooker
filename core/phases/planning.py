@@ -37,9 +37,11 @@ class PlanningPhase(BasePhase):
     # ── 1.1 ──────────────────────────────────────────────────────
     def _step1_task_info(self, model: str) -> bool:
         out_path = self.task.task_json_path
+        sandbox = create_sandbox(self.task.task_dir, self.task.project_path or self.state.working_dir)
         executor = ToolExecutor(
             working_dir=self.task.project_path or self.state.working_dir,
             cache=self.state.cache,
+            sandbox=sandbox,
         )
         msg = (
             f"Create the task info file at: {os.path.relpath(out_path, self.task.project_path or self.state.working_dir)}\n\n"

@@ -39,7 +39,8 @@ class QAPhase(BasePhase):
     def _step1_check_completion(self, model: str) -> bool:
         self.log("─── Step 3.1: Verify completion ───")
         wd = self.task.project_path or self.state.working_dir
-        executor = ToolExecutor(working_dir=wd, cache=self.state.cache)
+        sandbox = create_sandbox(self.task.task_dir, self.task.project_path or self.state.working_dir)
+        executor = ToolExecutor(working_dir=wd, cache=self.state.cache, sandbox=sandbox)
         detail = "\n".join(
             f"[{t.get('status')}] {t.get('id')}: {t.get('title')}\n"
             f"  Structural: {t.get('completion_without_ollama')}\n"
@@ -79,6 +80,7 @@ class QAPhase(BasePhase):
     def _step3_validate_files(self, model: str) -> bool:
         self.log("─── Step 3.3: Validate files ───")
         wd = self.task.project_path or self.state.working_dir
+        sandbox = create_sandbox(self.task.task_dir, self.task.project_path or self.state.working_dir)
         errors: list[str] = []
 
         for root_dir in [self.task.task_dir, wd]:
@@ -86,13 +88,16 @@ class QAPhase(BasePhase):
                 continue
             for fname in os.listdir(root_dir):
                 if fname.endswith(".json"):
+                    # Skip files from other tasks
+                    if root_dir != self.task.task_dir:
+                        continue
                     ok, msg = validate_json_file(os.path.join(root_dir, fname))
                     symbol = "✓" if ok else "✗"
                     self.log(f"  {symbol} {fname}", "ok" if ok else "error")
                     if not ok:
                         errors.append(f"{fname}: {msg}")
 
-        for dirpath, _, files in os.walk(wd):
+        for dirpath, _, files in os.walk(self.task.task_dir):
             for fname in files:
                 if fname.endswith((".xml", ".svg")):
                     try:
@@ -105,7 +110,7 @@ class QAPhase(BasePhase):
         if not errors:
             return True
 
-        executor = ToolExecutor(working_dir=wd, cache=self.state.cache)
+        executor = ToolExecutor(working_dir=wd, cache=self.state.cache, sandbox=sandbox)
         msg = (
             "Fix these structural errors:\n"
             + "\n".join(f"- {e}" for e in errors)
