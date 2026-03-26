@@ -16,7 +16,7 @@ The README must include these sections (use `##` headings):
 
 ## Style guidelines
 - Use clear, direct language
-- Use code blocks (``` ) for commands and code
+- Use code blocks (```) for commands and code
 - Use tables where comparisons help
 - Avoid jargon without explanation
 - Write for a developer who is new to the project
