@@ -270,11 +270,14 @@ def get_active_task_id() -> str:
 # ── Prompt management ────────────────────────────────────────────
 
 PROMPT_MAP = {
-    "01": "01_task_info.md",   "02": "02_assessment.md",
-    "03": "03_tasks.md",       "04": "04_validation.md",
-    "05": "05_coding.md",      "06": "06_readme.md",
-    "08": "08_qa_check.md",    "10": "10_qa_validation.md",
-    "11": "11_qa_text.md",
+    "p1": "p1_discovery.md",
+    "p2": "p2_requirements.md",
+    "p3": "p3_spec.md",
+    "p4": "p4_critique.md",
+    "p5": "p5_impl_plan.md",
+    "p6": "p6_coding.md",
+    "p7": "p7_readme.md",
+    "p8": "p8_qa_check.md",
 }
 
 

@@ -1,13 +1,95 @@
-"""Planning phase: steps 1.1 – 1.4."""
+"""Planning phase: Discovery → Requirements → Spec → Critique → Implementation Plan."""
 from __future__ import annotations
 import json
 import os
+import time
 
 from core.state import AppState, KanbanTask
 from core.tools import ToolExecutor, PLANNING_TOOLS
-from core.validator import validate_task_info, validate_assessment, validate_subtasks
+from core.validator import (
+    validate_task_info,
+    validate_json_file,
+    validate_subtasks,
+)
 from core.phases.base import BasePhase
 
+
+# ── Validators ────────────────────────────────────────────────────
+
+def _read_json(path: str) -> tuple[bool, dict | list | None, str]:
+    if not os.path.isfile(path):
+        return False, None, f"Not found: {path}"
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return True, data, ""
+    except json.JSONDecodeError as e:
+        return False, None, f"JSON error: {e}"
+
+
+def _validate_project_index(path: str) -> tuple[bool, str]:
+    ok, data, err = _read_json(path)
+    if not ok:
+        return False, err
+    if "services" not in data:
+        return False, "Missing 'services' key"
+    return True, "OK"
+
+
+def _validate_requirements(path: str) -> tuple[bool, str]:
+    ok, data, err = _read_json(path)
+    if not ok:
+        return False, err
+    for key in ("task_description", "workflow_type", "acceptance_criteria"):
+        if key not in data:
+            return False, f"Missing '{key}'"
+    if not data.get("task_description", "").strip():
+        return False, "task_description is empty"
+    return True, "OK"
+
+
+def _validate_spec_md(path: str) -> tuple[bool, str]:
+    if not os.path.isfile(path):
+        return False, "spec.md not found"
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+    if len(content.strip()) < 200:
+        return False, "spec.md is too short (< 200 chars)"
+    for heading in ("## Overview", "## Task Scope", "## Acceptance Criteria"):
+        if heading not in content:
+            return False, f"Missing section: {heading}"
+    return True, "OK"
+
+
+def _validate_impl_plan(path: str) -> tuple[bool, str]:
+    ok, data, err = _read_json(path)
+    if not ok:
+        return False, err
+    if "phases" not in data or not isinstance(data["phases"], list):
+        return False, "Missing 'phases' array"
+    if not data["phases"]:
+        return False, "'phases' is empty"
+    all_subtasks = []
+    for phase in data["phases"]:
+        subs = phase.get("subtasks", [])
+        if not isinstance(subs, list) or len(subs) == 0:
+            return False, f"Phase '{phase.get('id','?')}' has no subtasks"
+        for s in subs:
+            if not s.get("id") or not s.get("title") or not s.get("description"):
+                return False, f"Subtask missing id/title/description: {s}"
+            if not s.get("completion_without_ollama", "").strip():
+                return False, f"Subtask {s['id']} missing 'completion_without_ollama'"
+            # Must reference at least one file
+            has_files = s.get("files_to_create") or s.get("files_to_modify")
+            if not has_files:
+                return False, f"Subtask {s['id']} has no files_to_create or files_to_modify"
+            all_subtasks.append(s)
+    if not all_subtasks:
+        return False, "No subtasks found in any phase"
+    return True, "OK"
+
+
+# ── Phase ─────────────────────────────────────────────────────────
 
 class PlanningPhase(BasePhase):
     def __init__(self, state: AppState, task: KanbanTask):
@@ -16,154 +98,239 @@ class PlanningPhase(BasePhase):
     def run(self) -> bool:
         self.log("═══ PLANNING PHASE START ═══")
         model = self.task.models.get("planning") or "llama3.1"
-        self.state.cache.update_file_paths(self.task.project_path or self.state.working_dir)
-        self.log(f"  Cached {len(self.state.cache.file_paths)} project files", "info")
+        wd = self.task.project_path or self.state.working_dir
+
+        # Initial file scan
+        self.state.cache.update_file_paths(wd)
+        self.log(f"  Scanned {len(self.state.cache.file_paths)} project files", "info")
 
         steps = [
-            ("1.1 Task info",  self._step1_task_info),
-            ("1.2 Assessment", self._step2_assessment),
-            ("1.3 Tasks",      self._step3_tasks),
-            ("1.4 Validate",   self._step4_validation),
+            ("1.1 Discovery",       self._step1_discovery),
+            ("1.2 Requirements",    self._step2_requirements),
+            ("1.3 Spec",            self._step3_spec),
+            ("1.4 Critique",        self._step4_critique),
+            ("1.5 Impl Plan",       self._step5_impl_plan),
+            ("1.6 Load Subtasks",   self._step6_load_subtasks),
         ]
+
         for name, fn in steps:
             self.log(f"─── Step {name} ───")
             ok = fn(model)
-            if not ok and name != "1.4 Validate":
-                self.log(f"[FAIL] Step {name} failed – aborting planning", "error")
-                return False
+            if not ok:
+                # 1.4 Critique failure is non-fatal (fixes are applied inside)
+                if "Critique" in name:
+                    self.log(f"[WARN] Step {name} had issues but spec was fixed", "warn")
+                else:
+                    self.log(f"[FAIL] Step {name} failed – aborting planning", "error")
+                    return False
+
         self.log("═══ PLANNING PHASE COMPLETE ═══")
         return True
 
-    # ── 1.1 ──────────────────────────────────────────────────────
-    def _step1_task_info(self, model: str) -> bool:
-        out_path = self.task.task_json_path
+    # ── 1.1 Discovery ─────────────────────────────────────────────
+    def _step1_discovery(self, model: str) -> bool:
+        wd = self.task.project_path or self.state.working_dir
+        proj_index_path = os.path.join(self.task.task_dir, "project_index.json")
+        context_path    = os.path.join(self.task.task_dir, "context.json")
+
         sandbox = create_sandbox(self.task.task_dir, self.task.project_path or self.state.working_dir)
-        executor = ToolExecutor(
-            working_dir=self.task.project_path or self.state.working_dir,
-            cache=self.state.cache,
-            sandbox=sandbox,
-        )
+        executor = ToolExecutor(working_dir=wd, cache=self.state.cache, sandbox=sandbox)
         msg = (
-            f"Create the task info file at: {os.path.relpath(out_path, self.task.project_path or self.state.working_dir)}\n\n"
-            f"Task name: {self.task.title}\nTask description: {self.task.description}\n"
-            f"Planning model: {self.task.models.get('planning')}\n"
-            f"Coding model: {self.task.models.get('coding')}\n"
-            f"QA model: {self.task.models.get('qa')}\n"
-            f"Git branch: {self.task.git_branch}\n"
-            f"Project path: {self.task.project_path}\nTask directory: {self.task.task_dir}\n\n"
-            "JSON must contain: name, description, models (planning/coding/qa), git_branch, project_path, task_dir."
+            f"Investigate the project at: {wd}\n"
+            f"Task to implement: {self.task.title}\n"
+            f"Task description: {self.task.description}\n\n"
+            f"Write project_index.json to: {os.path.relpath(proj_index_path, wd)}\n"
+            f"Write context.json to: {os.path.relpath(context_path, wd)}\n\n"
+            "Use list_directory and read_file extensively to understand the project. "
+            "Read at least 3 source files that implement similar functionality to this task."
         )
+
+        def validate():
+            ok1, m1 = _validate_project_index(proj_index_path)
+            if not ok1:
+                return False, f"project_index.json: {m1}"
+            ok2, m2 = validate_json_file(context_path)
+            if not ok2:
+                return False, f"context.json: {m2}"
+            return True, "OK"
+
         return self.run_loop(
-            "1.1 Task info", "01_task_info.md", PLANNING_TOOLS, executor, msg,
-            lambda: validate_task_info(out_path), model,
+            "1.1 Discovery", "p1_discovery.md",
+            PLANNING_TOOLS, executor, msg, validate, model,
         )
 
-    # ── 1.2 ──────────────────────────────────────────────────────
-    def _step2_assessment(self, model: str) -> bool:
-        out_path = os.path.join(self.task.task_dir, "assessment.json")
+    # ── 1.2 Requirements ──────────────────────────────────────────
+    def _step2_requirements(self, model: str) -> bool:
         wd = self.task.project_path or self.state.working_dir
-        executor = ToolExecutor(working_dir=wd, cache=self.state.cache)
+        req_path     = os.path.join(self.task.task_dir, "requirements.json")
+        proj_idx_path = os.path.join(self.task.task_dir, "project_index.json")
+        context_path  = os.path.join(self.task.task_dir, "context.json")
+
+        # Provide prior output as context
+        proj_idx = self._read_file_safe(proj_idx_path)
+        ctx      = self._read_file_safe(context_path)
+        
+        sandbox = create_sandbox(self.task.task_dir, self.task.project_path or self.state.working_dir)
+        executor = ToolExecutor(working_dir=wd, cache=self.state.cache, sandbox=sandbox)
         msg = (
-            f"Analyse the project files to assess complexity of:\n"
-            f"Name: {self.task.title}\nDescription: {self.task.description}\n\n"
-            "Use list_directory and read_file to inspect the project.\n"
-            f"Write assessment JSON to: {os.path.relpath(out_path, wd)}\n\n"
-            "JSON must contain: hours (number), complexity (Simple|Standard|Complex), "
-            "min_tasks (integer), files_analyzed (array), reasoning (string)"
+            f"Task name: {self.task.title}\n"
+            f"Task description: {self.task.description}\n\n"
+            f"project_index.json:\n{proj_idx}\n\n"
+            f"context.json:\n{ctx}\n\n"
+            f"Write requirements.json to: {os.path.relpath(req_path, wd)}\n\n"
+            "Create a structured requirements.json that derives concrete acceptance criteria "
+            "from the task description. Every acceptance criterion must be verifiable by "
+            "reading a file — not by subjective judgment."
         )
+
+        def validate():
+            return _validate_requirements(req_path)
+
         return self.run_loop(
-            "1.2 Assessment", "02_assessment.md", PLANNING_TOOLS, executor, msg,
-            lambda: validate_assessment(out_path), model,
+            "1.2 Requirements", "p2_requirements.md",
+            PLANNING_TOOLS, executor, msg, validate, model,
         )
 
-    # ── 1.3 ──────────────────────────────────────────────────────
-    def _step3_tasks(self, model: str) -> bool:
-        assessment_path = os.path.join(self.task.task_dir, "assessment.json")
-        subtasks_path   = os.path.join(self.task.task_dir, "subtasks.json")
-        min_tasks = 1
-        try:
-            with open(assessment_path, "r", encoding="utf-8") as f:
-                min_tasks = int(json.load(f).get("min_tasks", 1))
-        except Exception:
-            pass
+    # ── 1.3 Spec ──────────────────────────────────────────────────
+    def _step3_spec(self, model: str) -> bool:
+        wd          = self.task.project_path or self.state.working_dir
+        spec_path   = os.path.join(self.task.task_dir, "spec.md")
+        req_path    = os.path.join(self.task.task_dir, "requirements.json")
+        context_path = os.path.join(self.task.task_dir, "context.json")
 
-        wd = self.task.project_path or self.state.working_dir
-
-        def on_task_created(d: dict):
-            self.log(f"    + Task: {d.get('id')} – {d.get('title','')}", "tool_write")
-
-        executor = ToolExecutor(
-            working_dir=wd, cache=self.state.cache,
-            on_task_created=on_task_created,
-        )
+        req_content = self._read_file_safe(req_path)
+        ctx_content = self._read_file_safe(context_path)
+        
+        sandbox = create_sandbox(self.task.task_dir, self.task.project_path or self.state.working_dir)
+        executor = ToolExecutor(working_dir=wd, cache=self.state.cache, sandbox=sandbox)
         msg = (
-            f"Read assessment.json (min_tasks={min_tasks}), then create {min_tasks}+ subtasks.\n"
-            "Use create_task tool for each subtask, then write all to "
-            f"{os.path.relpath(subtasks_path, wd)} as a JSON array.\n\n"
-            "Each task: id, title, description, completion_with_ollama, completion_without_ollama"
+            f"requirements.json:\n{req_content}\n\n"
+            f"context.json:\n{ctx_content}\n\n"
+            f"Write spec.md to: {os.path.relpath(spec_path, wd)}\n\n"
+            "Read the reference files listed in context.json before writing the spec. "
+            "Include actual code snippets from those files in the Patterns section. "
+            "The acceptance criteria section must be copied verbatim from requirements.json."
         )
-        ok = self.run_loop(
-            "1.3 Tasks", "03_tasks.md", PLANNING_TOOLS, executor, msg,
-            lambda: validate_subtasks(subtasks_path, expected_min=min_tasks), model,
+
+        def validate():
+            return _validate_spec_md(spec_path)
+
+        return self.run_loop(
+            "1.3 Spec", "p3_spec.md",
+            PLANNING_TOOLS, executor, msg, validate, model,
         )
-        if ok:
-            self.state.load_subtasks_for_task(self.task)
-            try:
-                import eel
-                eel.task_updated(self.task.to_dict())
-            except Exception:
-                pass
-        return ok
 
-    # ── 1.4 ──────────────────────────────────────────────────────
-    def _step4_validation(self, model: str) -> bool:
-        assessment_path = os.path.join(self.task.task_dir, "assessment.json")
-        subtasks_path   = os.path.join(self.task.task_dir, "subtasks.json")
-        min_tasks = 1
-        try:
-            with open(assessment_path, "r", encoding="utf-8") as f:
-                min_tasks = int(json.load(f).get("min_tasks", 1))
-        except Exception:
-            pass
+    # ── 1.4 Critique ──────────────────────────────────────────────
+    def _step4_critique(self, model: str) -> bool:
+        wd            = self.task.project_path or self.state.working_dir
+        spec_path     = os.path.join(self.task.task_dir, "spec.md")
+        req_path      = os.path.join(self.task.task_dir, "requirements.json")
+        context_path  = os.path.join(self.task.task_dir, "context.json")
+        critique_path = os.path.join(self.task.task_dir, "critique_report.json")
 
-        errors = []
-        for fn, path, label in [
-            (validate_task_info, self.task.task_json_path, "task_info"),
-            (validate_assessment, assessment_path, "assessment"),
-        ]:
-            ok, msg = fn(path)
+        spec_content = self._read_file_safe(spec_path)
+        req_content  = self._read_file_safe(req_path)
+        ctx_content  = self._read_file_safe(context_path)
+
+        sandbox = create_sandbox(self.task.task_dir, self.task.project_path or self.state.working_dir)
+        executor = ToolExecutor(working_dir=wd, cache=self.state.cache, sandbox=sandbox)
+        msg = (
+            f"spec.md:\n{spec_content}\n\n"
+            f"requirements.json:\n{req_content}\n\n"
+            f"context.json:\n{ctx_content}\n\n"
+            f"Write critique_report.json to: {os.path.relpath(critique_path, wd)}\n"
+            f"If you fix issues, rewrite spec.md at: {os.path.relpath(spec_path, wd)}\n\n"
+            "Focus on: validation drift (requirements that describe only verification, "
+            "not actual implementation), unverifiable acceptance criteria, and invented file paths."
+        )
+
+        def validate():
+            ok, msg = validate_json_file(critique_path)
             if not ok:
-                errors.append(f"{label}: {msg}")
+                return False, f"critique_report.json: {msg}"
+            # Spec must still be valid after any fixes
+            return _validate_spec_md(spec_path)
 
-        ok, msg = validate_subtasks(subtasks_path, expected_min=min_tasks)
+        return self.run_loop(
+            "1.4 Critique", "p4_critique.md",
+            PLANNING_TOOLS, executor, msg, validate, model,
+            max_outer_iterations=5,
+        )
+
+    # ── 1.5 Implementation Plan ───────────────────────────────────
+    def _step5_impl_plan(self, model: str) -> bool:
+        wd          = self.task.project_path or self.state.working_dir
+        plan_path   = os.path.join(self.task.task_dir, "implementation_plan.json")
+        spec_path   = os.path.join(self.task.task_dir, "spec.md")
+        context_path = os.path.join(self.task.task_dir, "context.json")
+        req_path    = os.path.join(self.task.task_dir, "requirements.json")
+
+        spec_content = self._read_file_safe(spec_path)
+        ctx_content  = self._read_file_safe(context_path)
+        req_content  = self._read_file_safe(req_path)
+
+        sandbox = create_sandbox(self.task.task_dir, self.task.project_path or self.state.working_dir)
+        executor = ToolExecutor(working_dir=wd, cache=self.state.cache, sandbox=sandbox)
+        msg = (
+            f"spec.md:\n{spec_content}\n\n"
+            f"context.json:\n{ctx_content}\n\n"
+            f"requirements.json:\n{req_content}\n\n"
+            f"Write implementation_plan.json to: {os.path.relpath(plan_path, wd)}\n\n"
+            "Create subtasks that match the spec EXACTLY. "
+            "Every file listed in 'Files to Create' needs at least one subtask. "
+            "Each subtask must have: id, title, description (specific class/function names), "
+            "files_to_create or files_to_modify (at least one), "
+            "completion_without_ollama (checkable by reading files), "
+            "completion_with_ollama (quality check), status='pending'."
+        )
+
+        def validate():
+            return _validate_impl_plan(plan_path)
+
+        return self.run_loop(
+            "1.5 Impl Plan", "p5_impl_plan.md",
+            PLANNING_TOOLS, executor, msg, validate, model,
+        )
+
+    # ── 1.6 Load subtasks ─────────────────────────────────────────
+    def _step6_load_subtasks(self, _model: str) -> bool:
+        """Convert implementation_plan.json → task.subtasks."""
+        plan_path = os.path.join(self.task.task_dir, "implementation_plan.json")
+        ok, data, err = _read_json(plan_path)
         if not ok:
-            errors.append(f"subtasks: {msg}")
-
-        for err in errors:
-            self.log(f"  [VALIDATE ERR] {err}", "error")
-        if errors:
+            self.log(f"  Cannot load plan: {err}", "error")
             return False
 
-        self.log("  Non-Ollama validation passed ✓", "ok")
-        wd = self.task.project_path or self.state.working_dir
-        executor = ToolExecutor(working_dir=wd, cache=self.state.cache)
-        msg = (
-            "Validate these planning files for text quality and consistency:\n"
-            f"1. {os.path.relpath(self.task.task_json_path, wd)}\n"
-            f"2. {os.path.relpath(assessment_path, wd)}\n"
-            f"3. {os.path.relpath(subtasks_path, wd)}\n\n"
-            "Read each, fix issues with write_file/modify_file, then report."
-        )
+        subtasks = []
+        for phase in data.get("phases", []):
+            for s in phase.get("subtasks", []):
+                subtasks.append({
+                    "id": s["id"],
+                    "title": s["title"],
+                    "description": s.get("description", ""),
+                    "completion_with_ollama":    s.get("completion_with_ollama", ""),
+                    "completion_without_ollama": s.get("completion_without_ollama", ""),
+                    "files_to_create": s.get("files_to_create", []),
+                    "files_to_modify": s.get("files_to_modify", []),
+                    "patterns_from":   s.get("patterns_from", []),
+                    "status": "pending",
+                })
 
-        def revalidate():
-            ok1, _ = validate_task_info(self.task.task_json_path)
-            ok2, _ = validate_assessment(assessment_path)
-            ok3, _ = validate_subtasks(subtasks_path, expected_min=min_tasks)
-            if ok1 and ok2 and ok3:
-                return True, "OK"
-            return False, "Still failing after Ollama pass"
+        self.task.subtasks = subtasks
+        self.state.save_subtasks_for_task(self.task)
+        self.log(f"  Loaded {len(subtasks)} subtasks from implementation_plan.json", "ok")
 
-        return self.run_loop(
-            "1.4 Validate", "04_validation.md", PLANNING_TOOLS, executor, msg,
-            revalidate, model, max_outer_iterations=5,
-        )
+        try:
+            import eel
+            eel.task_updated(self.task.to_dict())
+        except Exception:
+            pass
+        return True
+
+    # ── Helpers ───────────────────────────────────────────────────
+    def _read_file_safe(self, path: str) -> str:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return f.read()
+        except Exception:
+            return "(file not found)"

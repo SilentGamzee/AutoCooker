@@ -4,6 +4,7 @@ import json
 import os
 from typing import Callable, Optional
 
+import core
 from core.sandbox import create_sandbox
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -179,12 +180,15 @@ class ToolExecutor:
         cache,                     # FileCache
         on_task_confirmed: Optional[Callable[[str, str], None]] = None,
         on_task_created: Optional[Callable[[dict], None]] = None,
+        on_file_written: Optional[Callable[[str, str], None]] = None,
         sandbox: Optional['core.sandbox.Sandbox'] = None,
     ):
         self.working_dir = os.path.realpath(working_dir)
         self.cache = cache
         self.on_task_confirmed = on_task_confirmed
         self.on_task_created = on_task_created
+        # Called with (rel_path, content) after every write_file or modify_file
+        self.on_file_written = on_file_written
         self.sandbox = sandbox
 
         # Signals from tools back to the phase runner
@@ -226,15 +230,15 @@ class ToolExecutor:
     def _read_file(self, args: dict) -> str:
         path_rel = args.get("path", "")
         abs_path = self._safe_path(path_rel)
-        
-        # Validate path with sandbox
-        validation = self._validate_path(abs_path, "read")
-        if validation != "OK":
-            return validation
-        
         if not os.path.isfile(abs_path):
             return f"ERROR: File not found: {path_rel}"
         try:
+            
+            # Validate path with sandbox
+            validation = self._validate_path(abs_path, "read")
+            if validation != "OK":
+                return validation
+            
             with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
                 content = f.read()
             self.cache.update_content(path_rel, content)
@@ -273,8 +277,9 @@ class ToolExecutor:
         try:
             with open(abs_path, "w", encoding="utf-8") as f:
                 f.write(content)
-            # Update content cache; do NOT update paths cache (per spec)
             self.cache.update_content(path_rel, content)
+            if self.on_file_written:
+                self.on_file_written(path_rel, content)
             return f"OK: written {len(content)} chars to {path_rel}"
         except Exception as e:
             return f"ERROR writing file: {e}"
@@ -295,6 +300,8 @@ class ToolExecutor:
             with open(abs_path, "w", encoding="utf-8") as f:
                 f.write(updated)
             self.cache.update_content(path_rel, updated)
+            if self.on_file_written:
+                self.on_file_written(path_rel, updated)
             return f"OK: replaced text in {path_rel}"
         except Exception as e:
             return f"ERROR modifying file: {e}"

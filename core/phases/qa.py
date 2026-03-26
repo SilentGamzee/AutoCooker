@@ -4,6 +4,7 @@ import os
 import subprocess
 import xml.etree.ElementTree as ET
 
+from core.sandbox import create_sandbox
 from core.state import AppState, KanbanTask
 from core.tools import ToolExecutor, QA_TOOLS
 from core.validator import validate_json_file
@@ -39,6 +40,7 @@ class QAPhase(BasePhase):
     def _step1_check_completion(self, model: str) -> bool:
         self.log("─── Step 3.1: Verify completion ───")
         wd = self.task.project_path or self.state.working_dir
+        
         sandbox = create_sandbox(self.task.task_dir, self.task.project_path or self.state.working_dir)
         executor = ToolExecutor(working_dir=wd, cache=self.state.cache, sandbox=sandbox)
         detail = "\n".join(
@@ -80,7 +82,6 @@ class QAPhase(BasePhase):
     def _step3_validate_files(self, model: str) -> bool:
         self.log("─── Step 3.3: Validate files ───")
         wd = self.task.project_path or self.state.working_dir
-        sandbox = create_sandbox(self.task.task_dir, self.task.project_path or self.state.working_dir)
         errors: list[str] = []
 
         for root_dir in [self.task.task_dir, wd]:
@@ -88,16 +89,13 @@ class QAPhase(BasePhase):
                 continue
             for fname in os.listdir(root_dir):
                 if fname.endswith(".json"):
-                    # Skip files from other tasks
-                    if root_dir != self.task.task_dir:
-                        continue
                     ok, msg = validate_json_file(os.path.join(root_dir, fname))
                     symbol = "✓" if ok else "✗"
                     self.log(f"  {symbol} {fname}", "ok" if ok else "error")
                     if not ok:
                         errors.append(f"{fname}: {msg}")
 
-        for dirpath, _, files in os.walk(self.task.task_dir):
+        for dirpath, _, files in os.walk(wd):
             for fname in files:
                 if fname.endswith((".xml", ".svg")):
                     try:
@@ -110,6 +108,7 @@ class QAPhase(BasePhase):
         if not errors:
             return True
 
+        sandbox = create_sandbox(self.task.task_dir, self.task.project_path or self.state.working_dir)
         executor = ToolExecutor(working_dir=wd, cache=self.state.cache, sandbox=sandbox)
         msg = (
             "Fix these structural errors:\n"
@@ -124,7 +123,6 @@ class QAPhase(BasePhase):
     def _step4_validate_text(self, model: str) -> bool:
         self.log("─── Step 3.4: Text quality ───")
         wd = self.task.project_path or self.state.working_dir
-        sandbox = create_sandbox(self.task.task_dir, self.task.project_path or self.state.working_dir)
         text_files: list[str] = []
         for dirpath, _, files in os.walk(self.task.task_dir):
             for fname in files:
@@ -138,6 +136,7 @@ class QAPhase(BasePhase):
             self.log("  No text files", "info")
             return True
 
+        sandbox = create_sandbox(self.task.task_dir, self.task.project_path or self.state.working_dir)
         executor = ToolExecutor(working_dir=wd, cache=self.state.cache, sandbox=sandbox)
         msg = (
             "Review these files for spelling/grammar:\n"
