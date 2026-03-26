@@ -368,7 +368,7 @@ function toggleSubtask(row) {
 // #log-entries-panel. switchLogPhase() shows/hides buckets.
 // appendLogEntry() adds to the right bucket + "all" bucket.
 
-const LOG_PHASES = ['all', 'planning', 'coding', 'qa', 'system'];
+const LOG_PHASES = ['all', 'planning', 'coding', 'qa'];
 
 function getOrCreateBucket(phase) {
   const panel = document.getElementById('log-entries-panel');
@@ -408,7 +408,7 @@ function renderLogs(logs) {
   // Populate
   const counts = {};
   logs.forEach(entry => {
-    const ph = entry.phase || 'system';
+    const ph = entry.phase || 'all';
     counts[ph] = (counts[ph] || 0) + 1;
     counts['all'] = (counts['all'] || 0) + 1;
     buildLogEntry(entry, getOrCreateBucket(ph));
@@ -496,7 +496,7 @@ function buildLogEntry(entry, container) {
 }
 
 function appendLogEntry(entry) {
-  const phase = entry.phase || 'system';
+  const phase = entry.phase || 'all';
 
   // Add to the phase-specific bucket and the "all" bucket
   buildLogEntry(entry, getOrCreateBucket(phase));
