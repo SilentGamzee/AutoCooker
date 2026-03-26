@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Ollama Project Planner</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+
+<!-- ═══════════════ TOPBAR ═══════════════════════════════════════ -->
+<header class="topbar" id="topbar">
+  <div class="topbar-left">
+    <div class="project-icon">⬡</div>
+    <div class="project-info">
+      <div class="project-name" id="project-name">ollama_planner</div>
+      <div class="project-dir" id="project-dir">No directory set</div>
+    </div>
+    <button class="btn-dir" onclick="showDirModal()">Change Dir</button>
+  </div>
+  <div class="topbar-right">
+    <div class="model-badge" id="model-badge">
+      <span class="model-dot"></span>
+      <span id="model-label">Ollama</span>
+    </div>
+    <button class="topbar-btn" onclick="refreshBoard()">↻ Refresh Tasks</button>
+  </div>
+</header>
+
+<!-- ═══════════════ KANBAN BOARD ═════════════════════════════════ -->
+<div class="board" id="board">
+
+  <!-- Column template is cloned by JS -->
+  <div class="col" data-col="planning" data-color="#666">
+    <div class="col-header">
+      <button class="col-arrow" onclick="toggleCol(this)">‹</button>
+      <div class="col-dot" style="background:#888"></div>
+      <span class="col-title">Planning</span>
+      <span class="col-count" id="count-planning">0</span>
+      <div class="col-actions">
+        <button class="col-btn" title="Add task" onclick="showNewTaskModal()">+</button>
+      </div>
+    </div>
+    <div class="col-body" id="col-planning"></div>
+  </div>
+
+  <div class="col" data-col="queue" data-color="#3b82f6">
+    <div class="col-header">
+      <button class="col-arrow" onclick="toggleCol(this)">‹</button>
+      <div class="col-dot" style="background:#3b82f6"></div>
+      <span class="col-title">Queue</span>
+      <span class="col-count" id="count-queue">0</span>
+      <div class="col-actions"></div>
+    </div>
+    <div class="col-body" id="col-queue"></div>
+  </div>
+
+  <div class="col" data-col="in_progress" data-color="#60a5fa">
+    <div class="col-header">
+      <button class="col-arrow" onclick="toggleCol(this)">‹</button>
+      <div class="col-dot" style="background:#60a5fa"></div>
+      <span class="col-title">In Progress</span>
+      <span class="col-count" id="count-in_progress">0</span>
+      <div class="col-actions"></div>
+    </div>
+    <div class="col-body" id="col-in_progress"></div>
+  </div>
+
+  <div class="col" data-col="ai_review" data-color="#f59e0b">
+    <div class="col-header">
+      <button class="col-arrow" onclick="toggleCol(this)">‹</button>
+      <div class="col-dot" style="background:#f59e0b"></div>
+      <span class="col-title">AI Review</span>
+      <span class="col-count" id="count-ai_review">0</span>
+      <div class="col-actions"></div>
+    </div>
+    <div class="col-body" id="col-ai_review"></div>
+  </div>
+
+  <div class="col" data-col="human_review" data-color="#a855f7">
+    <div class="col-header">
+      <button class="col-arrow" onclick="toggleCol(this)">‹</button>
+      <div class="col-dot" style="background:#a855f7"></div>
+      <span class="col-title">Human Review</span>
+      <span class="col-count" id="count-human_review">0</span>
+      <div class="col-actions"></div>
+    </div>
+    <div class="col-body" id="col-human_review"></div>
+  </div>
+
+  <div class="col" data-col="done" data-color="#10b981">
+    <div class="col-header">
+      <button class="col-arrow" onclick="toggleCol(this)">‹</button>
+      <div class="col-dot" style="background:#10b981"></div>
+      <span class="col-title">Done</span>
+      <span class="col-count" id="count-done">0</span>
+      <div class="col-actions">
+        <button class="col-btn" title="Archive all">⊟</button>
+      </div>
+    </div>
+    <div class="col-body" id="col-done"></div>
+  </div>
+
+</div>
+
+<!-- ═══════════════ NEW TASK MODAL ═══════════════════════════════ -->
+<div class="overlay" id="overlay-new" onclick="if(event.target===this)closeNewTaskModal()">
+  <div class="modal-new">
+    <div class="modal-new-header">
+      <h2>New Task</h2>
+      <button class="modal-close" onclick="closeNewTaskModal()">✕</button>
+    </div>
+    <div class="modal-new-body">
+      <label class="field-label">Title</label>
+      <input type="text" id="new-title" class="inp" placeholder="Implement JWT authentication" />
+
+      <label class="field-label mt">Description</label>
+      <textarea id="new-desc" class="inp inp-area" rows="4"
+        placeholder="Detailed description of what needs to be done…"></textarea>
+
+      <label class="field-label mt">Project path</label>
+      <div class="dir-row">
+        <input type="text" id="new-dir" class="inp" placeholder="Leave blank to use current working dir" />
+      </div>
+
+      <label class="field-label mt">Git branch</label>
+      <input type="text" id="new-branch" class="inp" value="main" />
+
+      <div class="model-row">
+        <div class="model-field">
+          <label class="field-label">Planning model</label>
+          <select id="new-planning-model" class="inp inp-sel"></select>
+        </div>
+        <div class="model-field">
+          <label class="field-label">Coding model</label>
+          <select id="new-coding-model" class="inp inp-sel"></select>
+        </div>
+        <div class="model-field">
+          <label class="field-label">QA model</label>
+          <select id="new-qa-model" class="inp inp-sel"></select>
+        </div>
+      </div>
+
+      <div class="phase-picks">
+        <label class="field-label">Phases to run</label>
+        <div class="phase-row">
+          <label class="phase-chk"><input type="checkbox" value="planning" checked /> Planning</label>
+          <label class="phase-chk"><input type="checkbox" value="coding" checked /> Coding</label>
+          <label class="phase-chk"><input type="checkbox" value="qa" checked /> QA</label>
+        </div>
+      </div>
+    </div>
+    <div class="modal-new-footer">
+      <button class="btn-ghost" onclick="closeNewTaskModal()">Cancel</button>
+      <button class="btn-primary" onclick="createTask()">Create Task</button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════ TASK DETAIL MODAL ════════════════════════════ -->
+<div class="overlay" id="overlay-task" onclick="if(event.target===this)closeTaskModal()">
+  <div class="modal-task" id="modal-task">
+
+    <!-- Header -->
+    <div class="mt-header">
+      <div class="mt-title-row">
+        <h2 class="mt-title" id="mt-title">Task Title</h2>
+        <div class="mt-header-actions">
+          <button class="mt-ico-btn" title="Edit">✎</button>
+          <button class="mt-ico-btn" onclick="closeTaskModal()" title="Close">✕</button>
+        </div>
+      </div>
+      <div class="mt-meta">
+        <span class="mt-slug" id="mt-slug"></span>
+        <span class="mt-status-tag" id="mt-col-tag"></span>
+        <span class="tag-err hidden" id="mt-err-tag">Has Errors</span>
+        <span class="mt-subtask-count hidden" id="mt-subtask-count"></span>
+      </div>
+    </div>
+
+    <!-- Progress bar -->
+    <div class="mt-progress hidden" id="mt-progress-wrap">
+      <div class="mt-progress-bar">
+        <div class="mt-progress-fill" id="mt-progress-fill"></div>
+      </div>
+      <span class="mt-progress-pct" id="mt-progress-pct">0%</span>
+    </div>
+
+    <!-- Tabs -->
+    <div class="mt-tabs">
+      <button class="mt-tab active" data-mtab="overview" onclick="switchMTab(this,'overview')">Overview</button>
+      <button class="mt-tab" data-mtab="subtasks" onclick="switchMTab(this,'subtasks')">
+        Subtasks <span class="tab-badge" id="mtab-subtasks-count"></span>
+      </button>
+      <button class="mt-tab" data-mtab="logs" onclick="switchMTab(this,'logs')">Logs</button>
+      <button class="mt-tab" data-mtab="files" onclick="switchMTab(this,'files')">Files</button>
+    </div>
+
+    <!-- Tab bodies -->
+    <div class="mt-body">
+
+      <!-- Overview -->
+      <div class="mt-pane active" id="mtpane-overview">
+        <div class="overview-grid">
+          <div class="ov-row"><span class="ov-label">Description</span><span class="ov-val" id="ov-desc"></span></div>
+          <div class="ov-row"><span class="ov-label">Git branch</span><span class="ov-val mono" id="ov-branch"></span></div>
+          <div class="ov-row"><span class="ov-label">Project path</span><span class="ov-val mono" id="ov-path"></span></div>
+          <div class="ov-row"><span class="ov-label">Models</span>
+            <span class="ov-val mono" id="ov-models"></span>
+          </div>
+          <div class="ov-row"><span class="ov-label">Created</span><span class="ov-val" id="ov-created"></span></div>
+          <div class="ov-row"><span class="ov-label">Updated</span><span class="ov-val" id="ov-updated"></span></div>
+        </div>
+        <div class="ov-actions">
+          <button class="btn-primary" id="btn-run" onclick="runActiveTask()">▶ Run Pipeline</button>
+          <button class="btn-danger hidden" id="btn-abort" onclick="abortActiveTask()">■ Abort</button>
+          <button class="btn-secondary" onclick="moveTaskModal('queue')">→ Queue</button>
+          <button class="btn-secondary" onclick="moveTaskModal('done')">→ Done</button>
+        </div>
+      </div>
+
+      <!-- Subtasks -->
+      <div class="mt-pane" id="mtpane-subtasks">
+        <div class="subtasks-wrap" id="subtasks-list"></div>
+      </div>
+
+      <!-- Logs -->
+      <div class="mt-pane logs-pane" id="mtpane-logs">
+        <!-- Left vertical phase tabs -->
+        <div class="log-phase-tabs" id="log-phase-tabs">
+          <button class="log-phase-tab active" data-phase="all" onclick="switchLogPhase(this,'all')">
+            <div class="lpt-row"><span class="lpt-dot" style="background:#888"></span><span class="lpt-label">All</span></div>
+            <span class="lpt-count" id="lpt-count-all">0</span>
+          </button>
+          <button class="log-phase-tab" data-phase="planning" onclick="switchLogPhase(this,'planning')">
+            <div class="lpt-row"><span class="lpt-dot" style="background:#3b82f6"></span><span class="lpt-label">Planning</span></div>
+            <span class="lpt-count" id="lpt-count-planning">0</span>
+            <span class="lpt-status" id="lpt-status-planning"></span>
+          </button>
+          <button class="log-phase-tab" data-phase="coding" onclick="switchLogPhase(this,'coding')">
+            <div class="lpt-row"><span class="lpt-dot" style="background:#a855f7"></span><span class="lpt-label">Coding</span></div>
+            <span class="lpt-count" id="lpt-count-coding">0</span>
+            <span class="lpt-status" id="lpt-status-coding"></span>
+          </button>
+          <button class="log-phase-tab" data-phase="qa" onclick="switchLogPhase(this,'qa')">
+            <div class="lpt-row"><span class="lpt-dot" style="background:#10b981"></span><span class="lpt-label">QA</span></div>
+            <span class="lpt-count" id="lpt-count-qa">0</span>
+            <span class="lpt-status" id="lpt-status-qa"></span>
+          </button>
+          <button class="log-phase-tab" data-phase="system" onclick="switchLogPhase(this,'system')">
+            <div class="lpt-row"><span class="lpt-dot" style="background:#555"></span><span class="lpt-label">System</span></div>
+            <span class="lpt-count" id="lpt-count-system">0</span>
+          </button>
+        </div>
+        <!-- Right scrollable entries panel -->
+        <div class="log-entries-panel" id="log-entries-panel"></div>
+      </div>
+
+      <!-- Files -->
+      <div class="mt-pane" id="mtpane-files">
+        <div class="files-toolbar">
+          <span class="files-count" id="files-count">0 files</span>
+          <button class="btn-ghost btn-sm" onclick="refreshTaskFiles()">↻ Refresh</button>
+        </div>
+        <div class="file-tree" id="file-tree"></div>
+      </div>
+
+    </div>
+
+    <!-- Footer -->
+    <div class="mt-footer">
+      <button class="btn-danger-ghost" onclick="deleteActiveTask()">🗑 Delete Task</button>
+      <button class="btn-ghost" onclick="closeTaskModal()">Close</button>
+    </div>
+
+  </div>
+</div>
+
+<!-- ═══════════════ DIR MODAL ════════════════════════════════════ -->
+<div class="overlay" id="overlay-dir" onclick="if(event.target===this)closeDirModal()">
+  <div class="modal-dir">
+    <div class="modal-new-header">
+      <h2>Working Directory</h2>
+      <button class="modal-close" onclick="closeDirModal()">✕</button>
+    </div>
+    <div class="modal-new-body">
+      <label class="field-label">Project root directory</label>
+      <div class="dir-row">
+        <input type="text" id="dir-input" class="inp" placeholder="/home/user/my-project" />
+        <button class="btn-primary" onclick="applyDir()">Set</button>
+      </div>
+      <div class="dir-feedback" id="dir-feedback"></div>
+    </div>
+  </div>
+</div>
+
+<script src="/eel.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>
