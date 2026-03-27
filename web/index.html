@@ -255,12 +255,29 @@
       </div>
 
       <!-- Files -->
-      <div class="mt-pane" id="mtpane-files">
-        <div class="files-toolbar">
-          <span class="files-count" id="files-count">0 files</span>
-          <button class="btn-ghost btn-sm" onclick="refreshTaskFiles()">↻ Refresh</button>
+      <div class="mt-pane files-pane" id="mtpane-files">
+        <!-- Left: file tree sidebar -->
+        <div class="files-sidebar">
+          <div class="files-toolbar">
+            <span class="files-count" id="files-count">0 files</span>
+            <button class="btn-ghost btn-sm" onclick="refreshTaskFiles()">↻</button>
+          </div>
+          <div class="file-tree" id="file-tree"></div>
         </div>
-        <div class="file-tree" id="file-tree"></div>
+        <!-- Right: content viewer -->
+        <div class="file-content-panel" id="file-content-panel">
+          <div class="file-content-header">
+            <span class="file-content-icon" id="file-content-icon">📄</span>
+            <span class="file-content-name" id="file-content-name">Выберите файл</span>
+            <span class="file-content-badge" id="file-content-badge"></span>
+          </div>
+          <div class="file-content-empty" id="file-content-empty">
+            <div class="fce-icon">📂</div>
+            <div class="fce-title">Кэш файлов</div>
+            <div class="fce-sub">Нажмите на файл в дереве слева,<br>чтобы посмотреть его кэшированное содержимое</div>
+          </div>
+          <pre class="file-content-body hidden" id="file-content-body"></pre>
+        </div>
       </div>
 
     </div>

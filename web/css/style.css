@@ -1023,11 +1023,33 @@ html, body {
 .log-phase-bucket.visible { display: flex; }
 
 /* ── FILES PANE ──────────────────────────────────────── */
+.files-pane {
+  padding: 0 !important;
+  display: flex !important;
+  flex-direction: row !important;
+  height: 100%;
+  overflow: hidden;
+}
+
+/* Left sidebar */
+.files-sidebar {
+  width: 220px;
+  min-width: 140px;
+  max-width: 320px;
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  flex-shrink: 0;
+  background: var(--bg2);
+}
+
 .files-toolbar {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-bottom: 12px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
   flex-shrink: 0;
 }
 
@@ -1036,8 +1058,94 @@ html, body {
 .file-tree {
   font-family: var(--mono);
   font-size: 11px;
+  flex: 1;
+  overflow-y: auto;
+  padding: 6px 4px;
 }
 
+.file-tree::-webkit-scrollbar { width: 4px; }
+.file-tree::-webkit-scrollbar-track { background: transparent; }
+.file-tree::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 2px; }
+
+/* Right content panel */
+.file-content-panel {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  min-width: 0;
+}
+
+.file-content-header {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 14px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+  background: var(--bg2);
+  min-height: 34px;
+}
+
+.file-content-icon { font-size: 13px; flex-shrink: 0; }
+
+.file-content-name {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text2);
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-content-badge {
+  font-size: 9px;
+  font-weight: 600;
+  padding: 2px 7px;
+  border-radius: 8px;
+  flex-shrink: 0;
+}
+.file-content-badge.cached  { background: rgba(16,185,129,.18); color: var(--green); }
+.file-content-badge.no-cache { background: rgba(100,100,100,.18); color: var(--text3); }
+
+/* Empty state */
+.file-content-empty {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: var(--text3);
+  text-align: center;
+  padding: 20px;
+}
+.fce-icon  { font-size: 32px; opacity: .4; }
+.fce-title { font-size: 13px; font-weight: 500; color: var(--text2); }
+.fce-sub   { font-size: 11px; line-height: 1.6; }
+
+/* File content viewer */
+.file-content-body {
+  flex: 1;
+  overflow: auto;
+  padding: 14px 16px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text);
+  white-space: pre;
+  line-height: 1.65;
+  background: var(--bg);
+  margin: 0;
+  border: none;
+  outline: none;
+  counter-reset: line;
+}
+.file-content-body::-webkit-scrollbar { width: 5px; height: 5px; }
+.file-content-body::-webkit-scrollbar-track { background: transparent; }
+.file-content-body::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 3px; }
+
+/* Tree nodes */
 .ftree-dir, .ftree-file {
   display: flex;
   align-items: center;
@@ -1050,10 +1158,18 @@ html, body {
   overflow: hidden;
   text-overflow: ellipsis;
   transition: background 0.1s;
+  user-select: none;
 }
-.ftree-dir:hover, .ftree-file:hover { background: var(--bg3); }
+.ftree-dir:hover, .ftree-file:hover { background: var(--bg3); color: var(--text); }
 
-.ftree-dir { color: var(--text); font-weight: 500; }
+.ftree-dir  { color: var(--text); font-weight: 500; }
+.ftree-file { color: var(--text2); }
+
+.ftree-file.selected {
+  background: rgba(59,130,246,.15);
+  color: var(--accent);
+}
+.ftree-file.selected:hover { background: rgba(59,130,246,.2); }
 
 .ftree-arrow {
   font-size: 9px;
@@ -1061,16 +1177,18 @@ html, body {
   transition: transform 0.15s;
   width: 12px;
   flex-shrink: 0;
+  text-align: center;
 }
 .ftree-dir.open > .ftree-arrow { transform: rotate(90deg); }
 
 .ftree-icon { flex-shrink: 0; font-size: 12px; }
 .ftree-name { overflow: hidden; text-overflow: ellipsis; }
+.ftree-name.has-cache { color: var(--text); }
 
 .ftree-children {
-  padding-left: 16px;
+  padding-left: 14px;
   border-left: 1px solid var(--border);
-  margin-left: 6px;
+  margin-left: 7px;
   display: none;
 }
 .ftree-dir.open + .ftree-children { display: block; }

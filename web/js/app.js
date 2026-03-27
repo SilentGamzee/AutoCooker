@@ -532,31 +532,38 @@ function scrollLogsToBottom() {
 }
 
 // ─── Files Tab ───────────────────────────────────────────────────
+let _cacheContents = {};  // rel_path -> content
+
 async function refreshTaskFiles() {
-  if (!activeTaskId) return;
-  const paths = await eel.get_task_files(activeTaskId)();
-  renderFileTree(paths);
+  const data = await eel.get_cache_tree()();
+  _cacheContents = data.contents || {};
+  renderFileTree(data.paths || [], _cacheContents);
 }
 
-function renderFileTree(paths) {
+function renderFileTree(paths, contents) {
   const container = document.getElementById('file-tree');
   const countEl   = document.getElementById('files-count');
   container.innerHTML = '';
-  countEl.textContent = `${paths.length} files`;
 
-  if (!paths.length) {
-    container.innerHTML = '<div style="color:var(--text3);font-size:11px;padding:10px 0">No files cached</div>';
+  const total   = paths.length;
+  const cached  = Object.keys(contents).length;
+  countEl.textContent = cached > 0
+    ? `${total} файлов · ${cached} в кэше`
+    : `${total} файлов`;
+
+  if (!total) {
+    container.innerHTML = '<div style="color:var(--text3);font-size:11px;padding:10px 6px">Кэш пуст</div>';
     return;
   }
 
-  // Build tree object
+  // Build tree object; mark which paths have cached content
   const tree = {};
   paths.forEach(p => {
     const parts = p.replace(/\\/g, '/').split('/');
     let node = tree;
     parts.forEach((part, i) => {
       if (i === parts.length - 1) {
-        node[part] = null;  // file
+        node[part] = null;  // leaf = file
       } else {
         if (!node[part]) node[part] = {};
         node = node[part];
@@ -564,41 +571,88 @@ function renderFileTree(paths) {
     });
   });
 
-  renderTreeNode(tree, container);
+  renderTreeNode(tree, container, '', contents);
 }
 
-function renderTreeNode(node, parent) {
+function renderTreeNode(node, parent, prefix, contents) {
   const entries = Object.entries(node).sort(([a, av], [b, bv]) => {
-    // Dirs first
-    const aIsDir = av !== null;
-    const bIsDir = bv !== null;
-    if (aIsDir !== bIsDir) return aIsDir ? -1 : 1;
+    const aDir = av !== null;
+    const bDir = bv !== null;
+    if (aDir !== bDir) return aDir ? -1 : 1;
     return a.localeCompare(b);
   });
 
   entries.forEach(([name, children]) => {
     const isDir = children !== null;
+    const relPath = prefix ? `${prefix}/${name}` : name;
 
     const el = document.createElement('div');
     el.className = isDir ? 'ftree-dir' : 'ftree-file';
 
     if (isDir) {
-      el.innerHTML = `<span class="ftree-arrow">▶</span><span class="ftree-icon">📁</span><span class="ftree-name">${esc(name)}</span>`;
+      el.innerHTML = `
+        <span class="ftree-arrow">▶</span>
+        <span class="ftree-icon">📁</span>
+        <span class="ftree-name">${esc(name)}</span>`;
       const childWrap = document.createElement('div');
       childWrap.className = 'ftree-children';
       el.onclick = (e) => {
         e.stopPropagation();
         el.classList.toggle('open');
       };
-      renderTreeNode(children, childWrap);
+      renderTreeNode(children, childWrap, relPath, contents);
       parent.appendChild(el);
       parent.appendChild(childWrap);
     } else {
       const icon = fileIcon(name);
-      el.innerHTML = `<span class="ftree-arrow" style="opacity:0">▶</span><span class="ftree-icon">${icon}</span><span class="ftree-name">${esc(name)}</span>`;
+      const hasCached = Object.prototype.hasOwnProperty.call(contents, relPath);
+      const nameClass = hasCached ? 'ftree-name has-cache' : 'ftree-name';
+      el.innerHTML = `
+        <span class="ftree-arrow" style="opacity:0">▶</span>
+        <span class="ftree-icon">${icon}</span>
+        <span class="${nameClass}">${esc(name)}</span>`;
+      el.title = relPath;
+      el.dataset.path = relPath;
+      el.onclick = (e) => {
+        e.stopPropagation();
+        openFileContent(relPath, name, hasCached, el);
+      };
       parent.appendChild(el);
     }
   });
+}
+
+function openFileContent(relPath, name, hasCached, el) {
+  // Highlight selected
+  document.querySelectorAll('.ftree-file.selected').forEach(f => f.classList.remove('selected'));
+  el.classList.add('selected');
+
+  const icon    = document.getElementById('file-content-icon');
+  const nameEl  = document.getElementById('file-content-name');
+  const badge   = document.getElementById('file-content-badge');
+  const empty   = document.getElementById('file-content-empty');
+  const body    = document.getElementById('file-content-body');
+
+  icon.textContent  = fileIcon(name);
+  nameEl.textContent = relPath;
+
+  if (hasCached) {
+    const content = _cacheContents[relPath] || '';
+    badge.textContent  = 'кэш';
+    badge.className    = 'file-content-badge cached';
+    empty.classList.add('hidden');
+    body.classList.remove('hidden');
+    body.textContent   = content || '(пустой файл)';
+  } else {
+    badge.textContent  = 'нет кэша';
+    badge.className    = 'file-content-badge no-cache';
+    body.classList.add('hidden');
+    empty.classList.remove('hidden');
+    document.querySelector('.fce-icon').textContent  = '🔍';
+    document.querySelector('.fce-title').textContent = 'Файл не закэширован';
+    document.querySelector('.fce-sub').textContent   =
+      'Этот файл есть в индексе, но его содержимое\nещё не было прочитано агентом.';
+  }
 }
 
 function fileIcon(name) {
@@ -620,7 +674,7 @@ function switchMTab(btn, tab) {
   if (pane) pane.classList.add('active');
 
   // Lazy load files when switching to files tab
-  if (tab === 'files' && activeTaskId) {
+  if (tab === 'files') {
     refreshTaskFiles();
   }
   // Scroll logs to bottom when opening

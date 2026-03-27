@@ -313,6 +313,21 @@ def refresh_file_cache() -> dict:
     return {"ok": True, "count": len(STATE.cache.file_paths)}
 
 
+@eel.expose
+def get_cache_tree() -> dict:
+    """Return all cached file paths and their contents."""
+    return {
+        "paths": STATE.cache.file_paths,
+        "contents": STATE.cache.file_contents,
+    }
+
+
+@eel.expose
+def get_cached_file_content(rel_path: str) -> str | None:
+    """Return cached content of a single file."""
+    return STATE.cache.get_content(rel_path)
+
+
 # ─── Launch ───────────────────────────────────────────────────────
 
 if __name__ == "__main__":
