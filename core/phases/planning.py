@@ -4,6 +4,7 @@ import json
 import os
 import time
 
+from core.sandbox import create_sandbox
 from core.state import AppState, KanbanTask
 from core.tools import ToolExecutor, PLANNING_TOOLS
 from core.validator import (

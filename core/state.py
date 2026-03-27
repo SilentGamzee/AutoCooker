@@ -154,10 +154,12 @@ class KanbanTask:
     def add_log(self, msg: str, phase: str = "system", log_type: Optional[str] = None):
         ts = time.strftime("%H:%M:%S")
         t = log_type or LogEntry.classify(msg)
-        self.logs.append({"ts": ts, "phase": phase, "type": t, "msg": msg})
+        log_data = {"ts": ts, "phase": phase, "type": t, "msg": msg}
+        self.logs.append(log_data)
         self.updated_at = time.strftime("%Y-%m-%dT%H:%M:%S")
+        print(f"[{ts}][{t}][{phase}]: {msg}")
         # Save logs to task directory
-        self.state.save_task_logs(self)
+        #self.state.save_task_logs(self)
 
     def subtask_progress(self) -> int:
         if not self.subtasks:
@@ -187,6 +189,7 @@ class AppState:
         return self.get_task(self.active_task_id)
 
     def add_task(self, task: KanbanTask):
+        task.state = self
         self.kanban_tasks.append(task)
         self._save_kanban()
         # Save logs to task directory
