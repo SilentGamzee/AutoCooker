@@ -13,7 +13,7 @@ import traceback
 
 import eel
 
-from core.state import AppState, KanbanTask, COLUMNS
+from core.state import AppState, KanbanTask, COLUMNS, TaskAbortedError
 from core.ollama_client import OllamaClient
 from core.phases.planning import PlanningPhase
 from core.phases.coding import CodingPhase
@@ -194,6 +194,10 @@ def start_task(task_id: str) -> dict:
                 task.tags.append("Complete")
                 task.progress = 100
 
+        except TaskAbortedError:
+            task.add_log("■ Task aborted by user", "system", "warn")
+            task.column = "human_review"
+            task.tags = list(set(task.tags + ["Aborted"]))
         except Exception:
             err = traceback.format_exc()
             task.add_log(f"[PIPELINE ERROR]\n{err}", "system", "error")
@@ -211,14 +215,8 @@ def start_task(task_id: str) -> dict:
 
 @eel.expose
 def abort_task(task_id: str) -> dict:
-    if STATE.active_task_id == task_id:
-        STATE.active_task_id = ""
-    task = STATE.get_task(task_id)
-    if task:
-        task.column = "human_review"
-        task.tags = list(set(task.tags + ["Aborted"]))
-        _push_task(task)
-        _push_board()
+    STATE.request_abort(task_id)   # sets abort flag + clears active_task_id
+    # UI state is updated by the pipeline thread when it catches TaskAbortedError
     return {"ok": True}
 
 

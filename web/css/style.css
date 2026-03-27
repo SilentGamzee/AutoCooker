@@ -927,6 +927,8 @@ html, body {
 /* ── LOGS PANE ───────────────────────────────────────── */
 .logs-pane {
   padding: 0 !important;
+}
+.logs-pane.active {
   display: flex !important;
   flex-direction: row !important;
   height: 100%;
@@ -1025,6 +1027,8 @@ html, body {
 /* ── FILES PANE ──────────────────────────────────────── */
 .files-pane {
   padding: 0 !important;
+}
+.files-pane.active {
   display: flex !important;
   flex-direction: row !important;
   height: 100%;

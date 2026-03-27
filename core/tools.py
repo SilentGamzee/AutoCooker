@@ -191,6 +191,41 @@ PLANNING_WRITE_FILE = {
     },
 }
 
+SUBMIT_QA_VERDICT = {
+    "type": "function",
+    "function": {
+        "name": "submit_qa_verdict",
+        "description": (
+            "Call this tool ONCE when you have finished reviewing ALL subtasks. "
+            "Pass 'PASS' if everything meets the acceptance criteria, or 'FAIL' with "
+            "a list of specific issues that must be fixed."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "verdict": {
+                    "type": "string",
+                    "enum": ["PASS", "FAIL"],
+                    "description": "Overall verdict for the QA review.",
+                },
+                "issues": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "List of specific issues to fix (empty if PASS). "
+                        "Each issue must name the file and describe exactly what is wrong."
+                    ),
+                },
+                "summary": {
+                    "type": "string",
+                    "description": "Brief summary of the review (1-3 sentences).",
+                },
+            },
+            "required": ["verdict", "issues", "summary"],
+        },
+    },
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Tool sets per phase
 # ─────────────────────────────────────────────────────────────────────────────
@@ -199,7 +234,17 @@ PLANNING_WRITE_FILE = {
 # MODIFY_FILE is intentionally excluded — no reason to modify project files during planning.
 PLANNING_TOOLS = [READ_FILE, LIST_DIRECTORY, PLANNING_WRITE_FILE, CREATE_TASK]
 CODING_TOOLS   = [READ_FILE, LIST_DIRECTORY, WRITE_FILE, MODIFY_FILE, CONFIRM_TASK_DONE]
-QA_TOOLS       = [READ_FILE, LIST_DIRECTORY, WRITE_FILE, MODIFY_FILE]
+
+# QA Reviewer: strictly read-only — it evaluates, never writes project files.
+# Uses SUBMIT_QA_VERDICT to signal the result.
+QA_REVIEWER_TOOLS = [READ_FILE, LIST_DIRECTORY, SUBMIT_QA_VERDICT]
+
+# QA Fixer: write access to fix issues found by the reviewer.
+# Does NOT have SUBMIT_QA_VERDICT — only the reviewer emits verdicts.
+QA_FIXER_TOOLS = [READ_FILE, LIST_DIRECTORY, WRITE_FILE, MODIFY_FILE]
+
+# Legacy alias kept for any external references
+QA_TOOLS = QA_REVIEWER_TOOLS
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -229,16 +274,21 @@ class ToolExecutor:
         # Signals from tools back to the phase runner
         self.last_confirmed_task_id: Optional[str] = None
         self.last_created_tasks: list[dict] = []
+        # QA verdict (set by submit_qa_verdict tool)
+        self.qa_verdict: Optional[str] = None
+        self.qa_verdict_issues: list[str] = []
+        self.qa_verdict_summary: str = ""
 
     # ------------------------------------------------------------------
     def __call__(self, tool_name: str, args: dict) -> str:
         dispatch = {
-            "read_file":        self._read_file,
-            "list_directory":   self._list_directory,
-            "write_file":       self._write_file,
-            "modify_file":      self._modify_file,
+            "read_file":         self._read_file,
+            "list_directory":    self._list_directory,
+            "write_file":        self._write_file,
+            "modify_file":       self._modify_file,
             "confirm_task_done": self._confirm_task_done,
-            "create_task":      self._create_task,
+            "create_task":       self._create_task,
+            "submit_qa_verdict": self._submit_qa_verdict,
         }
         fn = dispatch.get(tool_name)
         if fn is None:
@@ -360,3 +410,13 @@ class ToolExecutor:
         if self.on_task_created:
             self.on_task_created(args)
         return f"OK: task {args.get('id', '?')} queued for creation."
+
+    def _submit_qa_verdict(self, args: dict) -> str:
+        verdict = args.get("verdict", "FAIL")
+        issues  = args.get("issues", [])
+        summary = args.get("summary", "")
+        # Store on executor so run_loop can read it
+        self.qa_verdict         = verdict
+        self.qa_verdict_issues  = issues
+        self.qa_verdict_summary = summary
+        return f"QA verdict recorded: {verdict}. Issues: {len(issues)}."

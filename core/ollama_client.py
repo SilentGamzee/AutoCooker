@@ -27,15 +27,24 @@ class OllamaClient:
         tools: list[dict],
         tool_executor: Callable[[str, dict], str],
         log_fn: Optional[Callable[[str], None]] = None,
+        is_aborted: Optional[Callable[[], bool]] = None,
         max_tool_rounds: int = 40,
     ) -> tuple[list[dict], str]:
         """
         Run a multi-turn chat with tool calling.
         Returns (full_messages, final_text_response).
+
+        is_aborted: optional callable that returns True when the task
+                    has been aborted — checked before every tool round
+                    and before every tool execution.
         """
         history = list(messages)
 
         for _round in range(max_tool_rounds):
+            # ── Abort check before each round ─────────────────────
+            if is_aborted and is_aborted():
+                raise RuntimeError("__ABORTED__")
+
             payload: dict = {
                 "model": model,
                 "messages": history,
@@ -78,6 +87,10 @@ class OllamaClient:
 
             # Execute each tool call and feed results back
             for tc in tool_calls:
+                # ── Abort check between tool executions ───────────
+                if is_aborted and is_aborted():
+                    raise RuntimeError("__ABORTED__")
+
                 fn = tc.get("function", {})
                 tool_name: str = fn.get("name", "")
                 raw_args = fn.get("arguments", {})

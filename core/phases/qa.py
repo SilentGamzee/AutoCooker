@@ -1,149 +1,201 @@
-"""QA phase: steps 3.1 – 3.4."""
+"""QA phase: read-only review → targeted fix → re-review. Max 2 cycles."""
 from __future__ import annotations
 import os
 import subprocess
-import xml.etree.ElementTree as ET
 
 from core.sandbox import create_sandbox
 from core.state import AppState, KanbanTask
-from core.tools import ToolExecutor, QA_TOOLS
-from core.validator import validate_json_file
+from core.tools import ToolExecutor, QA_REVIEWER_TOOLS, QA_FIXER_TOOLS
 from core.phases.base import BasePhase
+
+# Hard caps — prevent runaway loops
+MAX_REVIEW_FIX_CYCLES  = 2  # reviewer → fixer → reviewer → ... → stop
+MAX_REVIEWER_ITERATIONS = 2  # outer loops inside run_loop for the reviewer
+MAX_FIXER_ITERATIONS    = 3  # outer loops inside run_loop for the fixer
 
 
 class QAPhase(BasePhase):
     def __init__(self, state: AppState, task: KanbanTask):
         super().__init__(state, task, "qa")
 
+    # ── Entry ─────────────────────────────────────────────────────────
     def run(self) -> bool:
         self.log("═══ QA PHASE START ═══")
         model = self.task.models.get("qa") or "llama3.1"
-        self.state.cache.update_file_paths(self.task.project_path or self.state.working_dir)
 
-        results = {
-            "3.1 Completion": self._step1_check_completion(model),
-            "3.2 Tests":      self._step2_tests(),
-            "3.3 Files":      self._step3_validate_files(model),
-            "3.4 Text":       self._step4_validate_text(model),
-        }
+        # Run tests before any LLM calls (fast, deterministic)
+        tests_ok = self._run_tests()
+        if not tests_ok:
+            self.task.has_errors = True
 
-        self.log("\n─── QA Summary ───")
-        all_ok = True
-        for step, ok in results.items():
-            self.log(f"  {'✓' if ok else '✗'}  {step}", "ok" if ok else "error")
-            if not ok:
-                all_ok = False
-                self.task.has_errors = True
-        self.log("═══ QA PHASE COMPLETE ═══")
-        return all_ok
+        # Scope = only files this task created/modified
+        scope_summary = self._build_scope_summary()
+        self.log(f"  Scope: {len(self.task.subtasks)} subtasks", "info")
 
-    def _step1_check_completion(self, model: str) -> bool:
-        self.log("─── Step 3.1: Verify completion ───")
+        issues: list[str] = []
+        passed = False
+
+        for cycle in range(1, MAX_REVIEW_FIX_CYCLES + 2):
+            # ── Reviewer ──────────────────────────────────────────────
+            self.log(f"─── QA Review (cycle {cycle}/{MAX_REVIEW_FIX_CYCLES + 1}) ───")
+            verdict, new_issues, summary = self._review(model, scope_summary, issues)
+            self.log(
+                f"  Verdict: {verdict} — {summary}",
+                "ok" if verdict == "PASS" else "warn",
+            )
+
+            if verdict == "PASS" or not new_issues:
+                passed = True
+                break
+
+            issues = new_issues
+
+            if cycle > MAX_REVIEW_FIX_CYCLES:
+                self.log(
+                    f"  QA could not resolve {len(issues)} issue(s) after "
+                    f"{MAX_REVIEW_FIX_CYCLES} fix cycle(s). Marking for human review.",
+                    "error",
+                )
+                break
+
+            # ── Fixer ─────────────────────────────────────────────────
+            self.log(f"─── QA Fix (cycle {cycle}/{MAX_REVIEW_FIX_CYCLES}) ───")
+            self._fix(model, issues)
+
+        if passed:
+            self.log("═══ QA PHASE COMPLETE — PASSED ═══", "ok")
+        else:
+            self.log("═══ QA PHASE COMPLETE — FAILED ═══", "error")
+            self.task.has_errors = True
+
+        return passed
+
+    # ── Review ────────────────────────────────────────────────────────
+    def _review(
+        self, model: str, scope_summary: str, prior_issues: list[str]
+    ) -> tuple[str, list[str], str]:
         wd = self.task.project_path or self.state.working_dir
-        
-        sandbox = create_sandbox(self.task.task_dir, self.task.project_path or self.state.working_dir)
-        executor = ToolExecutor(working_dir=wd, cache=self.state.cache, sandbox=sandbox)
-        detail = "\n".join(
-            f"[{t.get('status')}] {t.get('id')}: {t.get('title')}\n"
-            f"  Structural: {t.get('completion_without_ollama')}\n"
-            f"  Quality:    {t.get('completion_with_ollama')}"
+        executor = ToolExecutor(
+            working_dir=wd,
+            cache=self.state.cache,
+            sandbox=create_sandbox(self.task.task_dir, wd),
+        )
+
+        subtask_detail = "\n".join(
+            f"[{t.get('status','?')}] {t.get('id')}: {t.get('title')}\n"
+            f"  Condition: {t.get('completion_without_ollama','')}"
             for t in self.task.subtasks
         )
+
+        prior_note = (
+            "\n\nPrevious fix cycle addressed these — verify they are resolved:\n"
+            + "\n".join(f"  - {i}" for i in prior_issues)
+        ) if prior_issues else ""
+
         msg = (
-            f"Review each subtask and verify completion conditions.\n\n{detail}\n\n"
-            "For each task read relevant files and check conditions. "
-            "End with: PASS or FAIL per task."
-        )
-        failed = [t.get("id") for t in self.task.subtasks if t.get("status") != "done"]
-        return self.run_loop(
-            "3.1 Completion", "08_qa_check.md", QA_TOOLS, executor, msg,
-            lambda: (True, "OK") if not failed else (False, f"Not done: {failed}"),
-            model, max_outer_iterations=5,
+            f"Task: {self.task.title}\n"
+            f"Description: {self.task.description}\n\n"
+            f"Files in scope (ONLY read these):\n{scope_summary}\n\n"
+            f"Subtasks to verify:\n{subtask_detail}"
+            f"{prior_note}\n\n"
+            "Instructions:\n"
+            "1. Use read_file on the files listed in scope above.\n"
+            "2. Check each subtask's completion condition against actual file content.\n"
+            "3. Do NOT read files outside the scope — those belong to other tasks.\n"
+            "4. Call submit_qa_verdict ONCE with PASS or FAIL.\n"
+            "   PASS: all conditions met.\n"
+            "   FAIL: list specific issues — file + what is wrong + what is expected."
         )
 
-    def _step2_tests(self) -> bool:
-        self.log("─── Step 3.2: Run tests ───")
+        def validate_fn() -> tuple[bool, str]:
+            return (True, "OK") if executor.qa_verdict is not None \
+                else (False, "submit_qa_verdict not yet called")
+
+        self.run_loop(
+            "QA Review", "p8_qa_check.md",
+            QA_REVIEWER_TOOLS, executor, msg, validate_fn, model,
+            max_outer_iterations=MAX_REVIEWER_ITERATIONS,
+        )
+
+        verdict = executor.qa_verdict or "FAIL"
+        issues  = executor.qa_verdict_issues or []
+        summary = executor.qa_verdict_summary or "(no summary)"
+        for issue in issues:
+            self.log(f"  ✗ {issue}", "warn")
+        return verdict, issues, summary
+
+    # ── Fix ───────────────────────────────────────────────────────────
+    def _fix(self, model: str, issues: list[str]):
+        wd = self.task.project_path or self.state.working_dir
+        executor = ToolExecutor(
+            working_dir=wd,
+            cache=self.state.cache,
+            sandbox=create_sandbox(self.task.task_dir, wd),
+        )
+
+        scope_summary = self._build_scope_summary()
+        issue_list = "\n".join(f"  {i+1}. {iss}" for i, iss in enumerate(issues))
+
+        msg = (
+            f"Task: {self.task.title}\n\n"
+            f"Files in scope (only edit these):\n{scope_summary}\n\n"
+            f"Issues to fix ({len(issues)}):\n{issue_list}\n\n"
+            "Instructions:\n"
+            "1. Fix each issue — nothing else.\n"
+            "2. Only edit files that are in scope.\n"
+            "3. Make minimal, targeted changes.\n"
+            "4. Verify with read_file after each write."
+        )
+
+        self.run_loop(
+            "QA Fix", "p8_qa_check.md",
+            QA_FIXER_TOOLS, executor, msg,
+            lambda: (True, "OK"),
+            model,
+            max_outer_iterations=MAX_FIXER_ITERATIONS,
+        )
+
+    # ── Scope builder ─────────────────────────────────────────────────
+    def _build_scope_summary(self) -> str:
+        wd = self.task.project_path or self.state.working_dir
+        lines: list[str] = []
+        seen: set[str] = set()
+
+        for subtask in self.task.subtasks:
+            for path in (subtask.get("files_to_create") or []) + \
+                        (subtask.get("files_to_modify") or []):
+                if path and path not in seen:
+                    seen.add(path)
+                    exists = "✓" if os.path.isfile(os.path.join(wd, path)) else "✗ MISSING"
+                    lines.append(f"  {exists}  {path}")
+
+        return "\n".join(lines) if lines else \
+            "(no file scope defined — review task directory only)"
+
+    # ── Tests ─────────────────────────────────────────────────────────
+    def _run_tests(self) -> bool:
+        self.log("─── QA: Run tests ───")
         root = self.task.project_path or self.state.working_dir
-        if os.path.isfile(os.path.join(root, "pytest.ini")) or \
-           any(f.startswith("test_") for f in os.listdir(root) if f.endswith(".py")):
+
+        has_pytest = (
+            os.path.isfile(os.path.join(root, "pytest.ini"))
+            or os.path.isfile(os.path.join(root, "pyproject.toml"))
+            or any(f.startswith("test_") for f in os.listdir(root) if f.endswith(".py"))
+        )
+
+        if not has_pytest:
+            self.log("  No test suite — skipping", "info")
+            return True
+
+        try:
             result = subprocess.run(
                 ["python", "-m", "pytest", "--tb=short", "-q"],
                 cwd=root, capture_output=True, text=True, timeout=120,
             )
-            self.log(result.stdout[-2000:], "tool_result")
-            if result.returncode != 0:
-                self.log("  ✗ Tests failed", "error")
-                return False
-            self.log("  ✓ Tests passed", "ok")
-            return True
-        self.log("  No test suite detected", "info")
-        return True
-
-    def _step3_validate_files(self, model: str) -> bool:
-        self.log("─── Step 3.3: Validate files ───")
-        wd = self.task.project_path or self.state.working_dir
-        errors: list[str] = []
-
-        for root_dir in [self.task.task_dir, wd]:
-            if not root_dir or not os.path.isdir(root_dir):
-                continue
-            for fname in os.listdir(root_dir):
-                if fname.endswith(".json"):
-                    ok, msg = validate_json_file(os.path.join(root_dir, fname))
-                    symbol = "✓" if ok else "✗"
-                    self.log(f"  {symbol} {fname}", "ok" if ok else "error")
-                    if not ok:
-                        errors.append(f"{fname}: {msg}")
-
-        for dirpath, _, files in os.walk(wd):
-            for fname in files:
-                if fname.endswith((".xml", ".svg")):
-                    try:
-                        ET.parse(os.path.join(dirpath, fname))
-                        self.log(f"  ✓ {fname} (XML)", "ok")
-                    except ET.ParseError as e:
-                        errors.append(f"{fname}: {e}")
-                        self.log(f"  ✗ {fname}: {e}", "error")
-
-        if not errors:
-            return True
-
-        sandbox = create_sandbox(self.task.task_dir, self.task.project_path or self.state.working_dir)
-        executor = ToolExecutor(working_dir=wd, cache=self.state.cache, sandbox=sandbox)
-        msg = (
-            "Fix these structural errors:\n"
-            + "\n".join(f"- {e}" for e in errors)
-            + "\n\nRead each file and fix the issues."
-        )
-        return self.run_loop(
-            "3.3 Fix files", "10_qa_validation.md", QA_TOOLS, executor, msg,
-            lambda: (True, "OK"), model, max_outer_iterations=5,
-        )
-
-    def _step4_validate_text(self, model: str) -> bool:
-        self.log("─── Step 3.4: Text quality ───")
-        wd = self.task.project_path or self.state.working_dir
-        text_files: list[str] = []
-        for dirpath, _, files in os.walk(self.task.task_dir):
-            for fname in files:
-                if fname.endswith((".md", ".txt", ".rst")):
-                    # Skip files from other tasks
-                    if dirpath != self.task.task_dir:
-                        continue
-                    text_files.append(os.path.relpath(os.path.join(dirpath, fname), self.task.task_dir))
-
-        if not text_files:
-            self.log("  No text files", "info")
-            return True
-
-        sandbox = create_sandbox(self.task.task_dir, self.task.project_path or self.state.working_dir)
-        executor = ToolExecutor(working_dir=wd, cache=self.state.cache, sandbox=sandbox)
-        msg = (
-            "Review these files for spelling/grammar:\n"
-            + "\n".join(f"- {p}" for p in text_files[:20])
-            + "\n\nFix errors with modify_file."
-        )
-        return self.run_loop(
-            "3.4 Text", "11_qa_text.md", QA_TOOLS, executor, msg,
-            lambda: (True, "OK"), model, max_outer_iterations=3,
-        )
+            self.log(result.stdout[-2000:] or "(no output)", "tool_result")
+            ok = result.returncode == 0
+            self.log(f"  {'✓' if ok else '✗'} pytest {'passed' if ok else 'failed'}", "ok" if ok else "error")
+            return ok
+        except subprocess.TimeoutExpired:
+            self.log("  ✗ Tests timed out (120 s)", "error")
+            return False

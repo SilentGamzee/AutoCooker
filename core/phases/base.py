@@ -5,7 +5,7 @@ from typing import Callable, Optional
 
 import eel
 
-from core.state import AppState, KanbanTask
+from core.state import AppState, KanbanTask, TaskAbortedError
 from core.ollama_client import OllamaClient
 
 PROMPTS_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "prompts")
@@ -29,6 +29,8 @@ class BasePhase:
     # ── Logging ──────────────────────────────────────────────────
     def log(self, msg: str, log_type: Optional[str] = None):
         self.task.add_log(msg, phase=self.phase_name, log_type=log_type)
+        self.state.logs.append(msg)
+        self.state._save_kanban()
         try:
             eel.task_log_added(self.task.id, self.task.logs[-1])
         except Exception:
@@ -42,6 +44,7 @@ class BasePhase:
 
     def push_task(self):
         """Push full task state to UI."""
+        self.state._save_kanban()
         try:
             eel.task_updated(self.task.to_dict())
         except Exception:
@@ -86,6 +89,9 @@ class BasePhase:
         messages = [{"role": "user", "content": initial_user_message}]
 
         for outer in range(max_outer_iterations):
+            # ── Abort checkpoint ──────────────────────────────────
+            self.state.check_abort(self.task.id)
+
             self.log(f"  [Loop {outer+1}/{max_outer_iterations}] → Ollama…", "info")
             try:
                 # chat_with_tools returns the FULL accumulated history
@@ -98,8 +104,13 @@ class BasePhase:
                     tools=tools,
                     tool_executor=executor,
                     log_fn=self.log,
+                    is_aborted=lambda: self.task.id in self.state.abort_requested,
                 )
-            except Exception as e:
+            except RuntimeError as e:
+                if "__ABORTED__" in str(e):
+                    # Propagate as TaskAbortedError so the pipeline handler catches it
+                    self.state.abort_requested.discard(self.task.id)
+                    raise TaskAbortedError(self.task.id)
                 self.log(f"  [ERROR] Ollama: {e}", "error")
                 continue
 

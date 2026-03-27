@@ -145,7 +145,7 @@ class KanbanTask:
             "task_dir": self.task_dir, "task_json_path": self.task_json_path,
             "task_number": self.task_number,
             "created_at": self.created_at, "updated_at": self.updated_at,
-            "subtasks": self.subtasks,
+            "subtasks": self.subtasks, "logs": self.logs,
             "files": self.files, "progress": self.progress,
             "has_errors": self.has_errors, "tags": self.tags,
             "phases_selected": self.phases_selected,
@@ -154,12 +154,8 @@ class KanbanTask:
     def add_log(self, msg: str, phase: str = "system", log_type: Optional[str] = None):
         ts = time.strftime("%H:%M:%S")
         t = log_type or LogEntry.classify(msg)
-        log_data = {"ts": ts, "phase": phase, "type": t, "msg": msg}
-        self.logs.append(log_data)
+        self.logs.append({"ts": ts, "phase": phase, "type": t, "msg": msg})
         self.updated_at = time.strftime("%Y-%m-%dT%H:%M:%S")
-        print(f"[{ts}][{t}][{phase}]: {msg}")
-        # Save logs to task directory
-        #self.state.save_task_logs(self)
 
     def subtask_progress(self) -> int:
         if not self.subtasks:
@@ -169,14 +165,30 @@ class KanbanTask:
 
 
 # ─── App state ────────────────────────────────────────────────────
+class TaskAbortedError(Exception):
+    """Raised when a task is aborted by the user mid-execution."""
+
+
 class AppState:
     def __init__(self):
         self.working_dir: str = ""
         self.kanban_tasks: list[KanbanTask] = []
         self.active_task_id: str = ""
+        self.abort_requested: set[str] = set()   # task IDs pending abort
         self.cache = FileCache()
         # Legacy compat for phases that call state.logs
         self.logs: list[str] = []
+
+    def request_abort(self, task_id: str):
+        """Signal that a task should stop at the next checkpoint."""
+        self.abort_requested.add(task_id)
+        self.active_task_id = ""
+
+    def check_abort(self, task_id: str):
+        """Raise TaskAbortedError if abort was requested for this task."""
+        if task_id in self.abort_requested:
+            self.abort_requested.discard(task_id)
+            raise TaskAbortedError(task_id)
 
     # ── Task lookup ──────────────────────────────────────────────
     def get_task(self, task_id: str) -> Optional[KanbanTask]:
@@ -189,17 +201,14 @@ class AppState:
         return self.get_task(self.active_task_id)
 
     def add_task(self, task: KanbanTask):
-        task.state = self
         self.kanban_tasks.append(task)
         self._save_kanban()
-        # Save logs to task directory
-        self.save_task_logs(task)
 
     # ── Persistence ──────────────────────────────────────────────
     def _kanban_path(self) -> str:
         if not self.working_dir:
             return ""
-        p = os.path.join(self.working_dir, "tasks")
+        p = os.path.join(self.working_dir, ".tasks")
         os.makedirs(p, exist_ok=True)
         return os.path.join(p, "kanban.json")
 
@@ -234,47 +243,21 @@ class AppState:
                     created_at=d.get("created_at", ""),
                     updated_at=d.get("updated_at", ""),
                     subtasks=d.get("subtasks", []),
+                    logs=d.get("logs", []),
                     files=d.get("files", []),
                     progress=d.get("progress", 0),
                     has_errors=d.get("has_errors", False),
                     tags=d.get("tags", []),
                     phases_selected=d.get("phases_selected", ["planning", "coding", "qa"]),
                 )
-                # Load logs from task directory
-                self.load_task_logs(t)
                 self.kanban_tasks.append(t)
-        except Exception:
-            pass
-
-    # ── Task logs ─────────────────────────────────────────────────────
-    def save_task_logs(self, task: KanbanTask):
-        """Save task logs to task_dir/logs.json."""
-        if not task.task_dir:
-            return
-        path = os.path.join(task.task_dir, "logs.json")
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(task.logs, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
-
-    def load_task_logs(self, task: KanbanTask):
-        """Load task logs from task_dir/logs.json."""
-        if not task.task_dir:
-            return
-        path = os.path.join(task.task_dir, "logs.json")
-        if not os.path.isfile(path):
-            return
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                task.logs = json.load(f)
         except Exception:
             pass
 
     # ── Task dir init ────────────────────────────────────────────
     def init_task_dir(self, task: KanbanTask):
         root = task.project_path or self.working_dir
-        tasks_root = os.path.join(root, "tasks")
+        tasks_root = os.path.join(root, ".tasks")
         os.makedirs(tasks_root, exist_ok=True)
         n = 1
         while os.path.exists(os.path.join(tasks_root, f"task_{n:03d}.json")):
@@ -283,10 +266,6 @@ class AppState:
         task.task_json_path = os.path.join(tasks_root, f"task_{n:03d}.json")
         task.task_dir = os.path.join(tasks_root, f"task_{n:03d}")
         os.makedirs(task.task_dir, exist_ok=True)
-        # Initialize logs.json file
-        logs_path = os.path.join(task.task_dir, "logs.json")
-        with open(logs_path, "w", encoding="utf-8") as f:
-            json.dump([], f, ensure_ascii=False, indent=2)
         self._save_kanban()
 
     # ── Subtask helpers ──────────────────────────────────────────
