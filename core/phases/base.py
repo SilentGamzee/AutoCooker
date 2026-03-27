@@ -64,6 +64,33 @@ class BasePhase:
             parts.append("\n\n---\n## Cached file contents\n" + cache.contents_summary())
         return "\n".join(parts)
 
+    # ── Executor factory ─────────────────────────────────────────
+    def _make_executor(self, wd: str, **kwargs) -> "ToolExecutor":
+        """
+        Create a ToolExecutor pre-wired with:
+        - the global FileCache (path index)
+        - on_content_cached → updates task.file_contents (per-task cache)
+        - log_fn → self.log (so auto-reads appear as log entries)
+        - sandbox for the current task
+        Extra kwargs are forwarded as-is (e.g. on_task_confirmed).
+        """
+        from core.tools import ToolExecutor
+        from core.sandbox import create_sandbox
+
+        task = self.task
+
+        def _cache_content(rel_path: str, content: str):
+            task.cache_content(rel_path, content)
+
+        return ToolExecutor(
+            working_dir=wd,
+            cache=self.state.cache,
+            on_content_cached=_cache_content,
+            log_fn=self.log,
+            sandbox=create_sandbox(task.task_dir, task.project_path or self.state.working_dir),
+            **kwargs,
+        )
+
     # ── Ollama outer loop ────────────────────────────────────────
     def run_loop(
         self,

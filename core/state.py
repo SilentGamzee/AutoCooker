@@ -132,6 +132,8 @@ class KanbanTask:
     subtasks: list[dict] = field(default_factory=list)
     logs: list[dict] = field(default_factory=list)
     files: list[str] = field(default_factory=list)
+    # Per-task file cache: rel_path → content (persisted, rebuilt as agent reads/writes)
+    file_contents: dict = field(default_factory=dict)
     progress: int = 0
     has_errors: bool = False
     tags: list[str] = field(default_factory=list)
@@ -146,10 +148,15 @@ class KanbanTask:
             "task_number": self.task_number,
             "created_at": self.created_at, "updated_at": self.updated_at,
             "subtasks": self.subtasks, "logs": self.logs,
-            "files": self.files, "progress": self.progress,
+            "files": self.files, "file_contents": self.file_contents,
+            "progress": self.progress,
             "has_errors": self.has_errors, "tags": self.tags,
             "phases_selected": self.phases_selected,
         }
+
+    def cache_content(self, rel_path: str, content: str):
+        """Store file content in this task's per-task cache."""
+        self.file_contents[rel_path] = content
 
     def add_log(self, msg: str, phase: str = "system", log_type: Optional[str] = None):
         ts = time.strftime("%H:%M:%S")
@@ -245,6 +252,7 @@ class AppState:
                     subtasks=d.get("subtasks", []),
                     logs=d.get("logs", []),
                     files=d.get("files", []),
+                    file_contents=d.get("file_contents", {}),
                     progress=d.get("progress", 0),
                     has_errors=d.get("has_errors", False),
                     tags=d.get("tags", []),

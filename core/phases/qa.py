@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 import subprocess
 
-from core.sandbox import create_sandbox
 from core.state import AppState, KanbanTask
 from core.tools import ToolExecutor, QA_REVIEWER_TOOLS, QA_FIXER_TOOLS
 from core.phases.base import BasePhase
@@ -75,11 +74,7 @@ class QAPhase(BasePhase):
         self, model: str, scope_summary: str, prior_issues: list[str]
     ) -> tuple[str, list[str], str]:
         wd = self.task.project_path or self.state.working_dir
-        executor = ToolExecutor(
-            working_dir=wd,
-            cache=self.state.cache,
-            sandbox=create_sandbox(self.task.task_dir, wd),
-        )
+        executor = self._make_executor(wd)
 
         subtask_detail = "\n".join(
             f"[{t.get('status','?')}] {t.get('id')}: {t.get('title')}\n"
@@ -127,11 +122,7 @@ class QAPhase(BasePhase):
     # ── Fix ───────────────────────────────────────────────────────────
     def _fix(self, model: str, issues: list[str]):
         wd = self.task.project_path or self.state.working_dir
-        executor = ToolExecutor(
-            working_dir=wd,
-            cache=self.state.cache,
-            sandbox=create_sandbox(self.task.task_dir, wd),
-        )
+        executor = self._make_executor(wd)
 
         scope_summary = self._build_scope_summary()
         issue_list = "\n".join(f"  {i+1}. {iss}" for i, iss in enumerate(issues))

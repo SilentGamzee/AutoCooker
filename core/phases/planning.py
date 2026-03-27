@@ -4,7 +4,6 @@ import json
 import os
 import time
 
-from core.sandbox import create_sandbox
 from core.state import AppState, KanbanTask
 from core.tools import ToolExecutor, PLANNING_TOOLS
 from core.validator import (
@@ -131,11 +130,10 @@ class PlanningPhase(BasePhase):
     # ── 1.1 Discovery ─────────────────────────────────────────────
     def _step1_discovery(self, model: str) -> bool:
         wd = self.task.project_path or self.state.working_dir
-        proj_index_path = os.path.join(wd, "project_index.json")
-        context_path    = os.path.join(wd, "context.json")
+        proj_index_path = os.path.join(self.task.task_dir, "project_index.json")
+        context_path    = os.path.join(self.task.task_dir, "context.json")
 
-        sandbox = create_sandbox(self.task.task_dir, self.task.project_path or self.state.working_dir)
-        executor = ToolExecutor(working_dir=wd, cache=self.state.cache, sandbox=sandbox)
+        executor = self._make_executor(wd)
         msg = (
             f"Investigate the project at: {wd}\n"
             f"Task to implement: {self.task.title}\n"
@@ -164,15 +162,14 @@ class PlanningPhase(BasePhase):
     def _step2_requirements(self, model: str) -> bool:
         wd = self.task.project_path or self.state.working_dir
         req_path     = os.path.join(self.task.task_dir, "requirements.json")
-        proj_idx_path = os.path.join(wd, "project_index.json")
-        context_path  = os.path.join(wd, "context.json")
+        proj_idx_path = os.path.join(self.task.task_dir, "project_index.json")
+        context_path  = os.path.join(self.task.task_dir, "context.json")
 
         # Provide prior output as context
         proj_idx = self._read_file_safe(proj_idx_path)
         ctx      = self._read_file_safe(context_path)
         
-        sandbox = create_sandbox(self.task.task_dir, self.task.project_path or self.state.working_dir)
-        executor = ToolExecutor(working_dir=wd, cache=self.state.cache, sandbox=sandbox)
+        executor = self._make_executor(wd)
         msg = (
             f"Task name: {self.task.title}\n"
             f"Task description: {self.task.description}\n\n"
@@ -197,13 +194,12 @@ class PlanningPhase(BasePhase):
         wd          = self.task.project_path or self.state.working_dir
         spec_path   = os.path.join(self.task.task_dir, "spec.md")
         req_path    = os.path.join(self.task.task_dir, "requirements.json")
-        context_path = os.path.join(wd, "context.json")
+        context_path = os.path.join(self.task.task_dir, "context.json")
 
         req_content = self._read_file_safe(req_path)
         ctx_content = self._read_file_safe(context_path)
         
-        sandbox = create_sandbox(self.task.task_dir, self.task.project_path or self.state.working_dir)
-        executor = ToolExecutor(working_dir=wd, cache=self.state.cache, sandbox=sandbox)
+        executor = self._make_executor(wd)
         msg = (
             f"requirements.json:\n{req_content}\n\n"
             f"context.json:\n{ctx_content}\n\n"
@@ -226,15 +222,14 @@ class PlanningPhase(BasePhase):
         wd            = self.task.project_path or self.state.working_dir
         spec_path     = os.path.join(self.task.task_dir, "spec.md")
         req_path      = os.path.join(self.task.task_dir, "requirements.json")
-        context_path  = os.path.join(wd, "context.json")
+        context_path  = os.path.join(self.task.task_dir, "context.json")
         critique_path = os.path.join(self.task.task_dir, "critique_report.json")
 
         spec_content = self._read_file_safe(spec_path)
         req_content  = self._read_file_safe(req_path)
         ctx_content  = self._read_file_safe(context_path)
 
-        sandbox = create_sandbox(self.task.task_dir, self.task.project_path or self.state.working_dir)
-        executor = ToolExecutor(working_dir=wd, cache=self.state.cache, sandbox=sandbox)
+        executor = self._make_executor(wd)
         msg = (
             f"spec.md:\n{spec_content}\n\n"
             f"requirements.json:\n{req_content}\n\n"
@@ -263,15 +258,14 @@ class PlanningPhase(BasePhase):
         wd          = self.task.project_path or self.state.working_dir
         plan_path   = os.path.join(self.task.task_dir, "implementation_plan.json")
         spec_path   = os.path.join(self.task.task_dir, "spec.md")
-        context_path = os.path.join(wd, "context.json")
+        context_path = os.path.join(self.task.task_dir, "context.json")
         req_path    = os.path.join(self.task.task_dir, "requirements.json")
 
         spec_content = self._read_file_safe(spec_path)
         ctx_content  = self._read_file_safe(context_path)
         req_content  = self._read_file_safe(req_path)
 
-        sandbox = create_sandbox(self.task.task_dir, self.task.project_path or self.state.working_dir)
-        executor = ToolExecutor(working_dir=wd, cache=self.state.cache, sandbox=sandbox)
+        executor = self._make_executor(wd)
         msg = (
             f"spec.md:\n{spec_content}\n\n"
             f"context.json:\n{ctx_content}\n\n"

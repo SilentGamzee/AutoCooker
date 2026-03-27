@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 import subprocess
 
-from core.sandbox import create_sandbox
 from core.state import AppState, KanbanTask
 from core.tools import ToolExecutor, CODING_TOOLS
 from core.validator import validate_readme
@@ -105,13 +104,10 @@ class CodingPhase(BasePhase):
                 confirmed["summary"] = summary
                 self.log(f"    ✓ confirm_task_done: {summary[:120]}", "confirm")
 
-        sandbox = create_sandbox(self.task.task_dir, self.task.project_path or self.state.working_dir)
-        executor = ToolExecutor(
-            working_dir=wd,
-            cache=self.state.cache,
+        executor = self._make_executor(
+            wd,
             on_task_confirmed=on_confirmed,
             on_file_written=on_write_made,
-            sandbox=sandbox,
         )
 
         files_to_create = subtask_dict.get("files_to_create") or []
@@ -239,8 +235,7 @@ class CodingPhase(BasePhase):
         self.log("─── Step 2.3: README ───")
         wd = self.task.project_path or self.state.working_dir
         readme_path = os.path.join(wd, "README.md")
-        sandbox = create_sandbox(self.task.task_dir, self.task.project_path or self.state.working_dir)
-        executor = ToolExecutor(working_dir=wd, cache=self.state.cache, sandbox=sandbox)
+        executor = self._make_executor(wd)
 
         summary = "\n".join(
             f"- [{s.get('status','?').upper()}] {s.get('id')}: {s.get('title','')}"

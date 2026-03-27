@@ -312,17 +312,21 @@ def refresh_file_cache() -> dict:
 
 
 @eel.expose
-def get_cache_tree() -> dict:
-    """Return all cached file paths and their contents."""
-    return {
-        "paths": STATE.cache.file_paths,
-        "contents": STATE.cache.file_contents,
-    }
+def get_cache_tree(task_id: str = "") -> dict:
+    """Return cached file paths and per-task file contents."""
+    task = STATE.get_task(task_id) if task_id else None
+    contents = task.file_contents if task else {}
+    # paths: union of global index (all known paths) filtered to task scope if possible
+    paths = STATE.cache.file_paths
+    return {"paths": paths, "contents": contents}
 
 
 @eel.expose
-def get_cached_file_content(rel_path: str) -> str | None:
-    """Return cached content of a single file."""
+def get_cached_file_content(task_id: str, rel_path: str) -> str | None:
+    """Return cached content of a single file for a specific task."""
+    task = STATE.get_task(task_id)
+    if task:
+        return task.file_contents.get(rel_path)
     return STATE.cache.get_content(rel_path)
 
 

@@ -261,6 +261,8 @@ class ToolExecutor:
         on_task_confirmed: Optional[Callable[[str, str], None]] = None,
         on_task_created: Optional[Callable[[dict], None]] = None,
         on_file_written: Optional[Callable[[str, str], None]] = None,
+        on_content_cached: Optional[Callable[[str, str], None]] = None,
+        log_fn: Optional[Callable[[str, str], None]] = None,
         sandbox: Optional['core.sandbox.Sandbox'] = None,
     ):
         self.working_dir = os.path.realpath(working_dir)
@@ -269,6 +271,10 @@ class ToolExecutor:
         self.on_task_created = on_task_created
         # Called with (rel_path, content) after every write_file or modify_file
         self.on_file_written = on_file_written
+        # Called with (rel_path, content) whenever content is cached (read OR write)
+        self.on_content_cached = on_content_cached
+        # Logger: log_fn(msg, log_type) — used for auto-read entries after writes
+        self.log_fn = log_fn
         self.sandbox = sandbox
 
         # Signals from tools back to the phase runner
@@ -327,6 +333,8 @@ class ToolExecutor:
             with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
                 content = f.read()
             self.cache.update_content(path_rel, content)
+            if self.on_content_cached:
+                self.on_content_cached(path_rel, content)
             return content
         except Exception as e:
             return f"ERROR reading file: {e}"
@@ -363,8 +371,12 @@ class ToolExecutor:
             with open(abs_path, "w", encoding="utf-8") as f:
                 f.write(content)
             self.cache.update_content(path_rel, content)
+            if self.on_content_cached:
+                self.on_content_cached(path_rel, content)
             if self.on_file_written:
                 self.on_file_written(path_rel, content)
+            # Auto-read: log as a separate read entry so the cache is confirmed
+            self._log_auto_read(path_rel, content)
             return f"OK: written {len(content)} chars to {path_rel}"
         except Exception as e:
             return f"ERROR writing file: {e}"
@@ -391,11 +403,23 @@ class ToolExecutor:
             with open(abs_path, "w", encoding="utf-8") as f:
                 f.write(updated)
             self.cache.update_content(path_rel, updated)
+            if self.on_content_cached:
+                self.on_content_cached(path_rel, updated)
             if self.on_file_written:
                 self.on_file_written(path_rel, updated)
+            # Auto-read: log as a separate read entry so the cache is confirmed
+            self._log_auto_read(path_rel, updated)
             return f"OK: replaced text in {path_rel}"
         except Exception as e:
             return f"ERROR modifying file: {e}"
+
+    def _log_auto_read(self, path_rel: str, content: str):
+        """Emit a read_file log entry after a write so the cache refresh is visible."""
+        if not self.log_fn:
+            return
+        preview = content[:300] + ("…" if len(content) > 300 else "")
+        self.log_fn('[Tool ►] read_file({"path": "' + path_rel + '"})', "tool_read")
+        self.log_fn(f"[Tool ◄] {preview}", "tool_result")
 
     def _confirm_task_done(self, args: dict) -> str:
         task_id = args.get("task_id", "")
