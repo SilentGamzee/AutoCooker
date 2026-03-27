@@ -130,8 +130,8 @@ class PlanningPhase(BasePhase):
     # ── 1.1 Discovery ─────────────────────────────────────────────
     def _step1_discovery(self, model: str) -> bool:
         wd = self.task.project_path or self.state.working_dir
-        proj_index_path = os.path.join(self.task.task_dir, "project_index.json")
-        context_path    = os.path.join(self.task.task_dir, "context.json")
+        proj_index_path = os.path.join(wd, "project_index.json")
+        context_path    = os.path.join(wd, "context.json")
 
         sandbox = create_sandbox(self.task.task_dir, self.task.project_path or self.state.working_dir)
         executor = ToolExecutor(working_dir=wd, cache=self.state.cache, sandbox=sandbox)
@@ -163,8 +163,8 @@ class PlanningPhase(BasePhase):
     def _step2_requirements(self, model: str) -> bool:
         wd = self.task.project_path or self.state.working_dir
         req_path     = os.path.join(self.task.task_dir, "requirements.json")
-        proj_idx_path = os.path.join(self.task.task_dir, "project_index.json")
-        context_path  = os.path.join(self.task.task_dir, "context.json")
+        proj_idx_path = os.path.join(wd, "project_index.json")
+        context_path  = os.path.join(wd, "context.json")
 
         # Provide prior output as context
         proj_idx = self._read_file_safe(proj_idx_path)
@@ -196,7 +196,7 @@ class PlanningPhase(BasePhase):
         wd          = self.task.project_path or self.state.working_dir
         spec_path   = os.path.join(self.task.task_dir, "spec.md")
         req_path    = os.path.join(self.task.task_dir, "requirements.json")
-        context_path = os.path.join(self.task.task_dir, "context.json")
+        context_path = os.path.join(wd, "context.json")
 
         req_content = self._read_file_safe(req_path)
         ctx_content = self._read_file_safe(context_path)
@@ -225,7 +225,7 @@ class PlanningPhase(BasePhase):
         wd            = self.task.project_path or self.state.working_dir
         spec_path     = os.path.join(self.task.task_dir, "spec.md")
         req_path      = os.path.join(self.task.task_dir, "requirements.json")
-        context_path  = os.path.join(self.task.task_dir, "context.json")
+        context_path  = os.path.join(wd, "context.json")
         critique_path = os.path.join(self.task.task_dir, "critique_report.json")
 
         spec_content = self._read_file_safe(spec_path)
@@ -262,7 +262,7 @@ class PlanningPhase(BasePhase):
         wd          = self.task.project_path or self.state.working_dir
         plan_path   = os.path.join(self.task.task_dir, "implementation_plan.json")
         spec_path   = os.path.join(self.task.task_dir, "spec.md")
-        context_path = os.path.join(self.task.task_dir, "context.json")
+        context_path = os.path.join(wd, "context.json")
         req_path    = os.path.join(self.task.task_dir, "requirements.json")
 
         spec_content = self._read_file_safe(spec_path)

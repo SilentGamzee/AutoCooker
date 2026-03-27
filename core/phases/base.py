@@ -29,8 +29,6 @@ class BasePhase:
     # ── Logging ──────────────────────────────────────────────────
     def log(self, msg: str, log_type: Optional[str] = None):
         self.task.add_log(msg, phase=self.phase_name, log_type=log_type)
-        self.state.logs.append(msg)
-        self.state._save_kanban()
         try:
             eel.task_log_added(self.task.id, self.task.logs[-1])
         except Exception:
@@ -44,7 +42,6 @@ class BasePhase:
 
     def push_task(self):
         """Push full task state to UI."""
-        self.state._save_kanban()
         try:
             eel.task_updated(self.task.to_dict())
         except Exception:
