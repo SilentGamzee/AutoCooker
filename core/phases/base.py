@@ -30,7 +30,8 @@ class BasePhase:
     def log(self, msg: str, log_type: Optional[str] = None):
         self.task.add_log(msg, phase=self.phase_name, log_type=log_type)
         self.state.logs.append(msg)
-        self.state._save_kanban()
+        # Persist log entry to task_dir/logs.json immediately
+        self.state.save_logs_for_task(self.task)
         try:
             eel.task_log_added(self.task.id, self.task.logs[-1])
         except Exception:

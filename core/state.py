@@ -147,7 +147,7 @@ class KanbanTask:
             "task_dir": self.task_dir, "task_json_path": self.task_json_path,
             "task_number": self.task_number,
             "created_at": self.created_at, "updated_at": self.updated_at,
-            "subtasks": self.subtasks, "logs": self.logs,
+            "subtasks": self.subtasks,
             "files": self.files, "file_contents": self.file_contents,
             "progress": self.progress,
             "has_errors": self.has_errors, "tags": self.tags,
@@ -224,8 +224,14 @@ class AppState:
         if not path:
             return
         try:
+            rows = []
+            for t in self.kanban_tasks:
+                d = t.to_dict()
+                rows.append(d)
+                # Persist full logs to dedicated file
+                self.save_logs_for_task(t)
             with open(path, "w", encoding="utf-8") as f:
-                json.dump([t.to_dict() for t in self.kanban_tasks], f, ensure_ascii=False, indent=2)
+                json.dump(rows, f, ensure_ascii=False, indent=2)
         except Exception:
             pass
 
@@ -250,7 +256,6 @@ class AppState:
                     created_at=d.get("created_at", ""),
                     updated_at=d.get("updated_at", ""),
                     subtasks=d.get("subtasks", []),
-                    logs=d.get("logs", []),
                     files=d.get("files", []),
                     file_contents=d.get("file_contents", {}),
                     progress=d.get("progress", 0),
@@ -258,6 +263,7 @@ class AppState:
                     tags=d.get("tags", []),
                     phases_selected=d.get("phases_selected", ["planning", "coding", "qa"]),
                 )
+                self.load_logs_for_task(t)
                 self.kanban_tasks.append(t)
         except Exception:
             pass
@@ -297,6 +303,32 @@ class AppState:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(task.subtasks, f, ensure_ascii=False, indent=2)
         self._save_kanban()
+
+    # ── Log helpers ─────────────────────────────────────────────
+    def save_logs_for_task(self, task: "KanbanTask"):
+        """Write task.logs to task_dir/logs.json (append-friendly full dump)."""
+        if not task.task_dir:
+            return
+        path = os.path.join(task.task_dir, "logs.json")
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(task.logs, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def load_logs_for_task(self, task: "KanbanTask") -> bool:
+        """Load logs from task_dir/logs.json into task.logs. Returns True if loaded."""
+        if not task.task_dir:
+            return False
+        path = os.path.join(task.task_dir, "logs.json")
+        if not os.path.isfile(path):
+            return False
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                task.logs = json.load(f)
+            return True
+        except Exception:
+            return False
 
     # ── Board view ───────────────────────────────────────────────
     def kanban_board(self) -> dict:

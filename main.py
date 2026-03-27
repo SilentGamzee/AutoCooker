@@ -223,7 +223,11 @@ def abort_task(task_id: str) -> dict:
 @eel.expose
 def get_task(task_id: str) -> dict | None:
     task = STATE.get_task(task_id)
-    return task.to_dict() if task else None
+    if not task:
+        return None
+    # Always load the freshest logs from disk before sending to UI
+    STATE.load_logs_for_task(task)
+    return task.to_dict()
 
 
 @eel.expose
