@@ -199,7 +199,7 @@ class AppState:
     def _kanban_path(self) -> str:
         if not self.working_dir:
             return ""
-        p = os.path.join(self.working_dir, ".tasks")
+        p = os.path.join(self.working_dir, "tasks")
         os.makedirs(p, exist_ok=True)
         return os.path.join(p, "kanban.json")
 
@@ -274,7 +274,7 @@ class AppState:
     # ── Task dir init ────────────────────────────────────────────
     def init_task_dir(self, task: KanbanTask):
         root = task.project_path or self.working_dir
-        tasks_root = os.path.join(root, ".tasks")
+        tasks_root = os.path.join(root, "tasks")
         os.makedirs(tasks_root, exist_ok=True)
         n = 1
         while os.path.exists(os.path.join(tasks_root, f"task_{n:03d}.json")):

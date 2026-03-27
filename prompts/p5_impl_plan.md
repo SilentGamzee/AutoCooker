@@ -18,7 +18,7 @@ Each subtask must represent a concrete, verifiable piece of implementation. A su
 A subtask IS:
 - "Create `src/services/cache.py` with `CacheService` class implementing Redis get/set/delete with TTL"
 - "Modify `src/routes/items.py` to call `CacheService.get()` before database query, and `CacheService.set()` after"
-- "Add `CACHE_TTL_SECONDS` to `src/config.py` with default value 300"
+- "Add `CACHE_TTL_SECONDS` to `src/config.py` with default value 900"
 
 ---
 
@@ -65,7 +65,7 @@ The description must answer ALL of these:
         {
           "id": "T-001",
           "title": "Create CacheService class",
-          "description": "Create src/services/cache.py with class CacheService. Must implement: __init__(self, redis_url: str), get(key: str) -> Optional[str], set(key: str, value: str, ttl: int = 300) -> None, delete(key: str) -> None. Follow the pattern in src/services/auth.py for the class structure and error handling. Do NOT add stub methods — implement the actual Redis logic using the `redis` package already in requirements.txt.",
+          "description": "Create src/services/cache.py with class CacheService. Must implement: __init__(self, redis_url: str), get(key: str) -> Optional[str], set(key: str, value: str, ttl: int = 900) -> None, delete(key: str) -> None. Follow the pattern in src/services/auth.py for the class structure and error handling. Do NOT add stub methods — implement the actual Redis logic using the `redis` package already in requirements.txt.",
           "service": "backend",
           "files_to_create": ["src/services/cache.py"],
           "files_to_modify": [],
@@ -77,7 +77,7 @@ The description must answer ALL of these:
         {
           "id": "T-002",
           "title": "Add CACHE_TTL_SECONDS to config",
-          "description": "Modify src/config.py to add CACHE_TTL_SECONDS: int = int(os.getenv('CACHE_TTL_SECONDS', '300')). Find the existing env var section (search for other os.getenv calls) and add it there. Do NOT create a new config file.",
+          "description": "Modify src/config.py to add CACHE_TTL_SECONDS: int = int(os.getenv('CACHE_TTL_SECONDS', '900')). Find the existing env var section (search for other os.getenv calls) and add it there. Do NOT create a new config file.",
           "service": "backend",
           "files_to_create": [],
           "files_to_modify": ["src/config.py"],

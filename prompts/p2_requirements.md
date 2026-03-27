@@ -57,7 +57,7 @@ Using context.json, specify the exact files. If the file doesn't exist yet, it g
   "acceptance_criteria": [
     "File src/services/cache.py exists with class CacheService",
     "GET /api/items response includes X-Cache-Hit header",
-    "CACHE_TTL_SECONDS env var controls expiry (default 300)",
+    "CACHE_TTL_SECONDS env var controls expiry (default 900)",
     "Existing tests in tests/ still pass"
   ],
   "constraints": [

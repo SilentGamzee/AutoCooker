@@ -54,11 +54,11 @@ class OllamaClient:
                 resp = requests.post(
                     f"{self.base_url}/api/chat",
                     json=payload,
-                    timeout=300,
+                    timeout=900,
                 )
                 resp.raise_for_status()
             except requests.Timeout:
-                raise RuntimeError("Ollama request timed out (300 s)")
+                raise RuntimeError("Ollama request timed out (900 s)")
             except requests.RequestException as e:
                 raise RuntimeError(f"Ollama request failed: {e}")
 
