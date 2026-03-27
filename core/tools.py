@@ -158,11 +158,46 @@ CREATE_TASK = {
     },
 }
 
+PLANNING_WRITE_FILE = {
+    "type": "function",
+    "function": {
+        "name": "write_file",
+        "description": (
+            "Write a planning artifact file. "
+            "ONLY use this to write files inside the task planning directory "
+            "(project_index.json, context.json, requirements.json, spec.md, "
+            "critique_report.json, implementation_plan.json). "
+            "DO NOT write to any project source files — that is strictly forbidden "
+            "during the planning phase. Source code changes are made only in the coding phase."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": (
+                        "Relative path from the working directory root. "
+                        "Must point to a file inside the task directory (e.g. .tasks/task_001/spec.md). "
+                        "Never use paths that point to project source files."
+                    ),
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Full content to write to the planning artifact file.",
+                },
+            },
+            "required": ["path", "content"],
+        },
+    },
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Tool sets per phase
 # ─────────────────────────────────────────────────────────────────────────────
 
-PLANNING_TOOLS = [READ_FILE, LIST_DIRECTORY, WRITE_FILE, MODIFY_FILE, CREATE_TASK]
+# Planning: read-only access to project + write ONLY to task planning directory.
+# MODIFY_FILE is intentionally excluded — no reason to modify project files during planning.
+PLANNING_TOOLS = [READ_FILE, LIST_DIRECTORY, PLANNING_WRITE_FILE, CREATE_TASK]
 CODING_TOOLS   = [READ_FILE, LIST_DIRECTORY, WRITE_FILE, MODIFY_FILE, CONFIRM_TASK_DONE]
 QA_TOOLS       = [READ_FILE, LIST_DIRECTORY, WRITE_FILE, MODIFY_FILE]
 
@@ -267,12 +302,12 @@ class ToolExecutor:
         path_rel = args.get("path", "")
         content  = args.get("content", "")
         abs_path = self._safe_path(path_rel)
-        
+
         # Validate path with sandbox
         validation = self._validate_path(abs_path, "write")
         if validation != "OK":
             return validation
-        
+
         os.makedirs(os.path.dirname(abs_path), exist_ok=True)
         try:
             with open(abs_path, "w", encoding="utf-8") as f:
@@ -291,6 +326,12 @@ class ToolExecutor:
         abs_path = self._safe_path(path_rel)
         if not os.path.isfile(abs_path):
             return f"ERROR: File not found: {path_rel}"
+
+        # Validate path with sandbox (was missing — direct bypass of write protection)
+        validation = self._validate_path(abs_path, "write")
+        if validation != "OK":
+            return validation
+
         try:
             with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
                 current = f.read()

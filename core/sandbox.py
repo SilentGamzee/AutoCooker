@@ -118,41 +118,31 @@ class Sandbox:
     def should_allow_write(self, target_path: str) -> tuple[bool, str]:
         """
         Check if a write operation should be allowed.
-        
+
         Args:
             target_path: Absolute path where file will be written
-            
+
         Returns:
             Tuple of (allowed, reason)
         """
         if not self._enabled:
             return True, "Sandbox disabled"
-        
-        # Normalize paths
-        target_abs = os.path.abspath(target_path)
+
+        # Guard against sandbox with no valid task_dir (would allow everything)
+        if not self.task_dir or self.task_dir in ("", ".", "/"):
+            return False, "Sandbox misconfigured: task_dir is not set"
+
         task_abs = os.path.abspath(self.task_dir)
-        project_abs = os.path.abspath(self.project_path)
-        
-        # Rule 2: Task files must be in task folder
-        if target_path.endswith('.json') and 'task_' not in target_path:
-            return False, f"Task file must be in task folder: {target_path}"
-        
-        # Rule 3: README must be in task folder
-        if target_path.endswith('README.md'):
-            if not target_path.startswith(task_abs):
-                return False, f"README must be in task folder: {target_path}"
-        
-        # Rule 4: Writes outside task folder should be interrupted
-        if not target_path.startswith(task_abs):
-            return False, f"Write outside task folder not allowed: {target_path}"
-        
-        # Rule 5: Files modified from project folder should have same relative path
-        if target_path.startswith(project_abs):
-            relative = target_path[len(project_abs):].lstrip('/')
-            expected = os.path.join(task_abs, relative)
-            if target_path != expected:
-                return False, f"Path mismatch: expected {expected}, got {target_path}"
-        
+        target_abs = os.path.abspath(target_path)
+
+        # Only allow writes inside the task directory
+        if not target_abs.startswith(task_abs + os.sep) and target_abs != task_abs:
+            return False, (
+                f"Write blocked: '{target_path}' is outside the task directory. "
+                f"During planning, only task artifacts may be written "
+                f"(e.g. project_index.json, spec.md, implementation_plan.json)."
+            )
+
         return True, "OK"
     
     def should_allow_read(self, target_path: str) -> tuple[bool, str]:
@@ -169,8 +159,6 @@ class Sandbox:
             return True, "Sandbox disabled"
         
         # Normalize paths
-        target_abs = os.path.abspath(target_path)
-        task_abs = os.path.abspath(self.task_dir)
         project_abs = os.path.abspath(self.project_path)
         
         # Rule 6: Ignore files from other tasks
