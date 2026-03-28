@@ -328,18 +328,6 @@ class ToolExecutor:
             rel = os.path.basename(abs_path)
         return rel.replace("\\", "/")
 
-    def _resolve_read_path(self, abs_project_path: str) -> str:
-        """
-        Return the best path to READ a file from:
-        prefer the workdir copy if it exists (it contains our latest changes),
-        fall back to the original project path.
-        """
-        if self.sandbox:
-            workdir_copy = self.sandbox.redirect_write(abs_project_path)
-            if os.path.isfile(workdir_copy):
-                return workdir_copy
-        return abs_project_path
-
     def _validate_path(self, path: str, operation: str) -> str:
         """Validate path using sandbox if enabled."""
         if self.sandbox:
@@ -357,12 +345,10 @@ class ToolExecutor:
         if validation != "OK":
             return validation
 
-        # Prefer workdir copy (contains our latest changes) over project original
-        read_src = self._resolve_read_path(abs_path)
-        if not os.path.isfile(read_src):
+        if not os.path.isfile(abs_path):
             return f"ERROR: File not found: {path_raw}"
         try:
-            with open(read_src, "r", encoding="utf-8", errors="replace") as f:
+            with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
                 content = f.read()
             path_rel = self._to_rel(abs_path)
             self.cache.update_content(path_rel, content)
@@ -399,13 +385,10 @@ class ToolExecutor:
         if validation != "OK":
             return validation
 
-        # Redirect the write to task workdir (keeps project tree clean)
-        write_dest = self.sandbox.redirect_write(abs_path) if self.sandbox else abs_path
-        os.makedirs(os.path.dirname(write_dest), exist_ok=True)
+        os.makedirs(os.path.dirname(abs_path), exist_ok=True)
         try:
-            with open(write_dest, "w", encoding="utf-8") as f:
+            with open(abs_path, "w", encoding="utf-8") as f:
                 f.write(content)
-            # Cache key is always project-relative (src/main.py, not task_001/workdir/src/main.py)
             path_rel = self._to_rel(abs_path)
             self.cache.update_content(path_rel, content)
             if self.on_content_cached:
@@ -431,17 +414,13 @@ class ToolExecutor:
             return validation
 
         try:
-            # Read from wherever the file actually lives (project or workdir)
-            read_src = self._resolve_read_path(abs_path)
-            with open(read_src, "r", encoding="utf-8", errors="replace") as f:
+            with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
                 current = f.read()
             if old_text not in current:
                 return f"ERROR: old_text not found in {path_raw}"
             updated = current.replace(old_text, new_text, 1)
-            # Write to task workdir
-            write_dest = self.sandbox.redirect_write(abs_path) if self.sandbox else abs_path
-            os.makedirs(os.path.dirname(write_dest), exist_ok=True)
-            with open(write_dest, "w", encoding="utf-8") as f:
+            os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+            with open(abs_path, "w", encoding="utf-8") as f:
                 f.write(updated)
             path_rel = self._to_rel(abs_path)
             self.cache.update_content(path_rel, updated)

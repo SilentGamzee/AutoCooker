@@ -73,8 +73,8 @@ class QAPhase(BasePhase):
     def _review(
         self, model: str, scope_summary: str, prior_issues: list[str]
     ) -> tuple[str, list[str], str]:
-        wd = self.task.project_path or self.state.working_dir
-        executor = self._make_executor(wd)
+        workdir = os.path.join(self.task.task_dir, WORKDIR_NAME)
+        executor = self._make_executor(workdir)
 
         subtask_detail = "\n".join(
             f"[{t.get('status','?')}] {t.get('id')}: {t.get('title')}\n"
@@ -121,8 +121,8 @@ class QAPhase(BasePhase):
 
     # ── Fix ───────────────────────────────────────────────────────────
     def _fix(self, model: str, issues: list[str]):
-        wd = self.task.project_path or self.state.working_dir
-        executor = self._make_executor(wd)
+        workdir = os.path.join(self.task.task_dir, WORKDIR_NAME)
+        executor = self._make_executor(workdir)
 
         scope_summary = self._build_scope_summary()
         issue_list = "\n".join(f"  {i+1}. {iss}" for i, iss in enumerate(issues))
@@ -148,7 +148,7 @@ class QAPhase(BasePhase):
 
     # ── Scope builder ─────────────────────────────────────────────────
     def _build_scope_summary(self) -> str:
-        wd = self.task.project_path or self.state.working_dir
+        workdir = os.path.join(self.task.task_dir, WORKDIR_NAME)
         lines: list[str] = []
         seen: set[str] = set()
 
@@ -157,7 +157,7 @@ class QAPhase(BasePhase):
                         (subtask.get("files_to_modify") or []):
                 if path and path not in seen:
                     seen.add(path)
-                    exists = "✓" if os.path.isfile(os.path.join(wd, path)) else "✗ MISSING"
+                    exists = "✓" if os.path.isfile(os.path.join(workdir, path)) else "✗ MISSING"
                     lines.append(f"  {exists}  {path}")
 
         return "\n".join(lines) if lines else \
@@ -166,7 +166,8 @@ class QAPhase(BasePhase):
     # ── Tests ─────────────────────────────────────────────────────────
     def _run_tests(self) -> bool:
         self.log("─── QA: Run tests ───")
-        root = self.task.project_path or self.state.working_dir
+        workdir = os.path.join(self.task.task_dir, WORKDIR_NAME)
+        root = workdir if os.path.isdir(workdir) else                (self.task.project_path or self.state.working_dir)
 
         has_pytest = (
             os.path.isfile(os.path.join(root, "pytest.ini"))

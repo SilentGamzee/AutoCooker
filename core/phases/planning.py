@@ -2,6 +2,7 @@
 from __future__ import annotations
 import json
 import os
+import shutil
 import time
 
 from core.state import AppState, KanbanTask
@@ -111,6 +112,7 @@ class PlanningPhase(BasePhase):
             ("1.4 Critique",        self._step4_critique),
             ("1.5 Impl Plan",       self._step5_impl_plan),
             ("1.6 Load Subtasks",   self._step6_load_subtasks),
+            ("1.7 Prepare Workdir", self._step7_prepare_workdir),
         ]
 
         for name, fn in steps:
@@ -321,6 +323,49 @@ class PlanningPhase(BasePhase):
         except Exception:
             pass
         return True
+
+    # ── 1.7 Prepare workdir ──────────────────────────────────────
+    def _step7_prepare_workdir(self, _model: str) -> bool:
+        """
+        Copy all files that Coding/QA phases will need into task_dir/workdir.
+
+        Sources:
+          - files_to_modify  → need to exist in workdir so the model can read+edit them
+          - patterns_from    → read-only reference files for coding style
+
+        files_to_create are NOT copied (they don't exist yet; model creates them fresh).
+        """
+        project = self.task.project_path or self.state.working_dir
+        workdir = os.path.join(self.task.task_dir, WORKDIR_NAME)
+        os.makedirs(workdir, exist_ok=True)
+
+        to_copy: set[str] = set()
+        for subtask in self.task.subtasks:
+            for path in subtask.get("files_to_modify", []):
+                if path:
+                    to_copy.add(path)
+            for path in subtask.get("patterns_from", []):
+                if path:
+                    to_copy.add(path)
+
+        copied, missing = [], []
+        for rel_path in sorted(to_copy):
+            src_file  = os.path.join(project, rel_path)
+            dest_file = os.path.join(workdir, rel_path)
+            if os.path.isfile(src_file):
+                os.makedirs(os.path.dirname(dest_file), exist_ok=True)
+                shutil.copy2(src_file, dest_file)
+                copied.append(rel_path)
+                self.log(f"  ✓ copied → workdir/{rel_path}", "ok")
+            else:
+                missing.append(rel_path)
+                self.log(f"  ✗ not found in project: {rel_path}", "warn")
+
+        self.log(
+            f"  Workdir ready: {len(copied)} copied, {len(missing)} not found",
+            "ok" if not missing else "warn",
+        )
+        return True   # missing files are warned but don't block coding
 
     # ── Helpers ───────────────────────────────────────────────────
     def _read_file_safe(self, path: str) -> str:

@@ -47,7 +47,7 @@ class BasePhase:
         """Push full task state to UI."""
         self.state._save_kanban()
         try:
-            eel.task_updated(self.task.to_dict())
+            eel.task_updated(self.task.to_dict_ui())
         except Exception:
             pass
 
@@ -96,7 +96,11 @@ class BasePhase:
             cache=self.state.cache,
             on_content_cached=_cache_content,
             log_fn=self.log,
-            sandbox=create_sandbox(task.task_dir, task.project_path or self.state.working_dir),
+            # Sandbox always anchored to task_dir; project_path for read-only reference
+            sandbox=create_sandbox(
+                task.task_dir,
+                task.project_path or self.state.working_dir,
+            ),
             **kwargs,
         )
 
@@ -130,18 +134,21 @@ class BasePhase:
 
             self.log(f"  [Loop {outer+1}/{max_outer_iterations}] → Ollama…", "info")
             try:
-                # chat_with_tools returns the FULL accumulated history
-                # (including all tool calls, tool results, and assistant
-                # messages from previous inner rounds in this iteration).
-                messages, final_text = self.ollama.chat_with_tools(
+                # chat_with_tools returns the FULL accumulated history.
+                # We cap history at the last 10 messages before each call to
+                # prevent context window overflow on long-running tasks.
+                capped = messages[-10:] if len(messages) > 10 else messages
+                messages_out, final_text = self.ollama.chat_with_tools(
                     model=model,
                     system=system,
-                    messages=messages,
+                    messages=capped,
                     tools=tools,
                     tool_executor=executor,
                     log_fn=self.log,
                     is_aborted=lambda: self.task.id in self.state.abort_requested,
                 )
+                # Merge: keep messages before the cap + new messages appended
+                messages = messages[:-10] + messages_out if len(messages) > 10 else messages_out
             except RuntimeError as e:
                 if "__ABORTED__" in str(e):
                     # Propagate as TaskAbortedError so the pipeline handler catches it

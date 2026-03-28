@@ -87,9 +87,10 @@ class CodingPhase(BasePhase):
 
     # ── Execute one subtask ────────────────────────────────────────
     def _execute_one_task(self, subtask_dict: dict, model: str) -> bool:
-        sid   = subtask_dict.get("id", "?")
-        wd    = self.task.project_path or self.state.working_dir
-        title = subtask_dict.get("title", "")
+        sid     = subtask_dict.get("id", "?")
+        wd      = self.task.project_path or self.state.working_dir
+        workdir = os.path.join(self.task.task_dir, WORKDIR_NAME)
+        title   = subtask_dict.get("title", "")
 
         # Track whether any file writes actually happened
         writes_made: list[str] = []
@@ -106,7 +107,7 @@ class CodingPhase(BasePhase):
                 self.log(f"    ✓ confirm_task_done: {summary[:120]}", "confirm")
 
         executor = self._make_executor(
-            wd,
+            workdir,                      # model reads/writes ONLY inside workdir
             on_task_confirmed=on_confirmed,
             on_file_written=on_write_made,
         )
@@ -240,9 +241,9 @@ class CodingPhase(BasePhase):
     # ── 2.3 README ────────────────────────────────────────────────
     def _step3_readme(self, model: str) -> bool:
         self.log("─── Step 2.3: README ───")
-        wd = self.task.project_path or self.state.working_dir
-        readme_path = os.path.join(wd, "README.md")
-        executor = self._make_executor(wd)
+        workdir = os.path.join(self.task.task_dir, WORKDIR_NAME)
+        readme_path = os.path.join(workdir, "README.md")
+        executor = self._make_executor(workdir)
 
         summary = "\n".join(
             f"- [{s.get('status','?').upper()}] {s.get('id')}: {s.get('title','')}"
