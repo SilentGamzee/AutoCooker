@@ -148,6 +148,8 @@ class KanbanTask:
             "task_number": self.task_number,
             "created_at": self.created_at, "updated_at": self.updated_at,
             "subtasks": self.subtasks,
+            # logs included for UI pushes — stripped from kanban.json in _save_kanban
+            "logs": self.logs,
             "files": self.files, "file_contents": self.file_contents,
             "progress": self.progress,
             "has_errors": self.has_errors, "tags": self.tags,
@@ -227,6 +229,7 @@ class AppState:
             rows = []
             for t in self.kanban_tasks:
                 d = t.to_dict()
+                d.pop("logs", None)   # logs live in task_dir/logs.json, not kanban.json
                 rows.append(d)
                 # Persist full logs to dedicated file
                 self.save_logs_for_task(t)

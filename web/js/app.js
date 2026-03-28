@@ -538,11 +538,8 @@ async function refreshTaskFiles() {
   if (!activeTaskId) return;
   const data = await eel.get_cache_tree(activeTaskId)();
   _cacheContents = data.contents || {};
-  // For the tree we use only paths that are either cached OR explicitly in task scope.
-  // If contents exist, show those paths; otherwise fall back to all paths.
-  const paths = Object.keys(_cacheContents).length > 0
-    ? data.paths || []
-    : data.paths || [];
+  // Show ONLY files that have cached content for this task
+  const paths = Object.keys(_cacheContents);
   renderFileTree(paths, _cacheContents);
 }
 
@@ -551,21 +548,12 @@ function renderFileTree(paths, contents) {
   const countEl   = document.getElementById('files-count');
   container.innerHTML = '';
 
-  // Use union of known paths + cached content keys so nothing is lost
-  const allPaths = [...new Set([...paths, ...Object.keys(contents)])];
-  const cached   = Object.keys(contents).length;
+  countEl.textContent = `${paths.length} файлов в кэше`;
 
-  countEl.textContent = cached > 0
-    ? `${allPaths.length} файлов · ${cached} в кэше`
-    : `${allPaths.length} файлов`;
-
-  if (!allPaths.length) {
+  if (!paths.length) {
     container.innerHTML = '<div style="color:var(--text3);font-size:11px;padding:10px 6px">Кэш пуст</div>';
     return;
   }
-
-  // Replace paths with merged set
-  paths = allPaths;
 
   // Build tree object; mark which paths have cached content
   const tree = {};

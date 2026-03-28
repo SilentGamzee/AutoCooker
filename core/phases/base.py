@@ -63,6 +63,14 @@ class BasePhase:
             )
         if cache.file_contents:
             parts.append("\n\n---\n## Cached file contents\n" + cache.contents_summary())
+        # Include only last 10 task logs so the context doesn't grow unboundedly
+        recent_logs = self.task.logs[-10:]
+        if recent_logs:
+            log_lines = "\n".join(
+                f"[{e.get('ts','')}][{e.get('phase','')}] {e.get('msg','')}"
+                for e in recent_logs
+            )
+            parts.append("\n\n---\n## Recent task logs (last 10)\n```\n" + log_lines + "\n```")
         return "\n".join(parts)
 
     # ── Executor factory ─────────────────────────────────────────

@@ -4,6 +4,7 @@ import os
 import subprocess
 
 from core.state import AppState, KanbanTask
+from core.sandbox import WORKDIR_NAME
 from core.tools import ToolExecutor, CODING_TOOLS
 from core.validator import validate_readme
 from core.phases.base import BasePhase
@@ -128,25 +129,30 @@ class CodingPhase(BasePhase):
             + f"\n\nCompletion condition (structural, checkable by reading files):\n  {completion_cond}\n\n"
             f"Quality condition:\n  {subtask_dict.get('completion_with_ollama', '')}\n\n"
             "Procedure:\n"
-            "1. Call read_file on every file in patterns_from to understand the code style\n"
-            "2. Call read_file on every file in files_to_modify to understand current state\n"
-            "3. Implement the required changes — real logic, not stubs or validation-only code\n"
-            "4. Call read_file to verify your writes before confirming\n"
-            f"5. Call confirm_task_done with task_id='{sid}' when done"
+            "1. Call read_file on every file in patterns_from to understand the code style.\n"
+            "2. Call read_file on every file in files_to_modify to understand current state.\n"
+            "3. Implement the required changes using write_file or modify_file.\n"
+            "   Use the SAME relative paths shown above (e.g. src/main.py).\n"
+            "   Files are automatically saved to the task sandbox — do NOT invent\n"
+            "   alternative paths or write to locations not listed above.\n"
+            "4. Call read_file to verify your writes before confirming.\n"
+            f"5. Call confirm_task_done with task_id='{sid}' when done."
         )
+
+        workdir = os.path.join(self.task.task_dir, WORKDIR_NAME)
 
         def validate_fn() -> tuple[bool, str]:
             # Check 1: confirm_task_done must have been called
             if not confirmed["done"]:
                 return False, "confirm_task_done not yet called"
 
-            # Check 2: every file_to_create must now exist
+            # Check 2: every file_to_create must now exist in workdir
             for f in files_to_create:
-                full = os.path.join(wd, f)
+                full = os.path.join(workdir, f)
                 if not os.path.isfile(full):
-                    return False, f"File was supposed to be created but doesn't exist: {f}"
+                    return False, f"File not found in task workdir: {f}"
 
-            # Check 3: at least one write happened (unless nothing was supposed to change)
+            # Check 3: at least one write happened
             expected_changes = len(files_to_create) + len(files_to_modify)
             if expected_changes > 0 and len(writes_made) == 0:
                 return (
@@ -155,10 +161,11 @@ class CodingPhase(BasePhase):
                     "The task requires actual file changes.",
                 )
 
-            # Check 4: structural completion condition via keyword search
+            # Check 4: structural completion condition — check workdir first, then project
             if completion_cond:
+                check_dir = workdir if os.path.isdir(workdir) else wd
                 cond_ok, cond_msg = self._check_completion_condition(
-                    completion_cond, wd
+                    completion_cond, check_dir
                 )
                 if not cond_ok:
                     return False, f"Structural condition not met: {cond_msg}"
