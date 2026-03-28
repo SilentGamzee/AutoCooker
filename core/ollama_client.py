@@ -39,15 +39,30 @@ class OllamaClient:
                     and before every tool execution.
         """
         history = list(messages)
+        # Always keep the first message (original user task) + last N messages.
+        # This prevents the model from getting lost in a long repetitive history
+        # while still knowing what it was asked to do.
+        HISTORY_CAP = 10
+
+        # Repetition detector: tracks (tool_name, args_key) → consecutive count
+        _last_call: tuple[str, str] = ("", "")
+        _repeat_count: int = 0
+        REPEAT_LIMIT = 3   # break inner loop after this many identical calls in a row
 
         for _round in range(max_tool_rounds):
             # ── Abort check before each round ─────────────────────
             if is_aborted and is_aborted():
                 raise RuntimeError("__ABORTED__")
 
+            # ── Cap history: first message + last (HISTORY_CAP-1) messages ──
+            if len(history) > HISTORY_CAP:
+                capped_history = history[:1] + history[-(HISTORY_CAP - 1):]
+            else:
+                capped_history = history
+
             payload: dict = {
                 "model": model,
-                "messages": history,
+                "messages": capped_history,
                 "stream": False,
                 "options": {"temperature": 0.2},
             }
@@ -116,5 +131,33 @@ class OllamaClient:
                     "role": "tool",
                     "content": str(result),
                 })
+
+                # ── Repetition detection ───────────────────────────
+                call_key = (tool_name, json.dumps(raw_args, sort_keys=True))
+                if call_key == _last_call:
+                    _repeat_count += 1
+                else:
+                    _last_call = call_key
+                    _repeat_count = 1
+
+                if _repeat_count >= REPEAT_LIMIT:
+                    if log_fn:
+                        log_fn(
+                            f"[WARN] Tool '{tool_name}' called {_repeat_count}× in a row "
+                            f"with identical args — breaking inner loop to force re-evaluation.",
+                            "warn",
+                        )
+                    # Inject a nudge so the model knows it's stuck
+                    history.append({
+                        "role": "user",
+                        "content": (
+                            f"You have called '{tool_name}' {_repeat_count} times in a row "
+                            f"with the same arguments and received the same result each time. "
+                            f"Reading this file again will not help. "
+                            f"You must now call write_file to make progress, or call "
+                            f"submit_qa_verdict / confirm_task_done to signal completion."
+                        ),
+                    })
+                    return history, ""
 
         raise RuntimeError(f"Tool loop exceeded {max_tool_rounds} rounds without finishing")

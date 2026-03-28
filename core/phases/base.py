@@ -73,6 +73,38 @@ class BasePhase:
             parts.append("\n\n---\n## Recent task logs (last 10)\n```\n" + log_lines + "\n```")
         return "\n".join(parts)
 
+    # ── File snapshot helper ─────────────────────────────────────
+    def _snapshot_written_files(self, executor) -> str:
+        """
+        Return a compact view of every cached file so the model can see the actual
+        on-disk state. For JSON files also shows the top-level keys so the model
+        immediately sees which required fields are present or missing.
+        """
+        import json as _json
+        contents = getattr(executor, "cache", None)
+        if contents is None:
+            return ""
+        file_contents = getattr(contents, "file_contents", {})
+        if not file_contents:
+            return ""
+        parts = []
+        for path, content in list(file_contents.items())[:5]:
+            header = f"=== {path} ==="
+            # For JSON files, show top-level keys prominently
+            if path.endswith(".json"):
+                try:
+                    parsed = _json.loads(content)
+                    if isinstance(parsed, dict):
+                        keys_line = f"  Top-level keys: {list(parsed.keys())}"
+                        snippet = content[:800] + ("…(truncated)" if len(content) > 800 else "")
+                        parts.append(f"{header}\n{keys_line}\n{snippet}")
+                        continue
+                except Exception:
+                    pass
+            snippet = content[:600] + ("…(truncated)" if len(content) > 600 else "")
+            parts.append(f"{header}\n{snippet}")
+        return "\n\n".join(parts)
+
     # ── Executor factory ─────────────────────────────────────────
     def _make_executor(self, wd: str, **kwargs) -> "ToolExecutor":
         """
@@ -134,21 +166,15 @@ class BasePhase:
 
             self.log(f"  [Loop {outer+1}/{max_outer_iterations}] → Ollama…", "info")
             try:
-                # chat_with_tools returns the FULL accumulated history.
-                # We cap history at the last 10 messages before each call to
-                # prevent context window overflow on long-running tasks.
-                capped = messages[-10:] if len(messages) > 10 else messages
-                messages_out, final_text = self.ollama.chat_with_tools(
+                messages, final_text = self.ollama.chat_with_tools(
                     model=model,
                     system=system,
-                    messages=capped,
+                    messages=messages,
                     tools=tools,
                     tool_executor=executor,
                     log_fn=self.log,
                     is_aborted=lambda: self.task.id in self.state.abort_requested,
                 )
-                # Merge: keep messages before the cap + new messages appended
-                messages = messages[:-10] + messages_out if len(messages) > 10 else messages_out
             except RuntimeError as e:
                 if "__ABORTED__" in str(e):
                     # Propagate as TaskAbortedError so the pipeline handler catches it
@@ -163,17 +189,27 @@ class BasePhase:
                 return True
             else:
                 self.log(f"  ✗ Validation failed: {reason}", "warn")
-                # Append the failure reason as a new user turn so the
-                # model understands what still needs to be fixed — the
-                # full prior conversation context remains intact.
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        f"Output validation failed:\n{reason}\n\n"
-                        "Please review what you have already done above "
-                        "and fix only what is missing or incorrect."
-                    ),
-                })
+
+                # Show actual file contents so model can see what is really on disk
+                file_snapshot = self._snapshot_written_files(executor)
+
+                # Explicit instruction: must call write_file, not just describe
+                retry_msg = f"VALIDATION FAILED: {reason}\n\n"
+                if file_snapshot:
+                    retry_msg += (
+                        f"ACTUAL FILE CONTENTS ON DISK RIGHT NOW "
+                        f"(check the top-level keys carefully):\n"
+                        f"{file_snapshot}\n\n"
+                    )
+                else:
+                    retry_msg += "No files have been written to disk yet.\n\n"
+                retry_msg += (
+                    "ACTION REQUIRED: Call write_file with the COMPLETE corrected content "
+                    "that fixes ALL issues listed above in one single write. "
+                    "Do NOT just describe the fix — call the tool. "
+                    "Do NOT write a partial file — include every required field."
+                )
+                messages.append({"role": "user", "content": retry_msg})
 
         self.log(
             f"  [WARN] Step '{step_name}' exhausted {max_outer_iterations} iterations",

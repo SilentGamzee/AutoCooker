@@ -38,8 +38,20 @@ class Sandbox:
         if target_abs.startswith(task_abs + os.sep) or target_abs == task_abs:
             return True, "OK"
 
+        # Show the correct task_dir path using just the filename
+        try:
+            filename = os.path.basename(target_abs)
+            correct  = os.path.join(self.task_dir, filename).replace("\\", "/")
+            task_rel = self.task_dir.replace("\\", "/")
+        except Exception:
+            correct  = self.task_dir
+            task_rel = self.task_dir
+
         return False, (
-            f"Write blocked: '{target_path}' is outside the task directory."
+            f"Write blocked: path is outside the task directory. "
+            f"You must write inside: '{task_rel}/' — "
+            f"e.g. use path: '{correct}'. "
+            f"Always use paths relative to the working directory."
         )
 
     # ── Read guard ────────────────────────────────────────────────────

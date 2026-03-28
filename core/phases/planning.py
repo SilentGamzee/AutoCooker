@@ -41,9 +41,15 @@ def _validate_requirements(path: str) -> tuple[bool, str]:
     ok, data, err = _read_json(path)
     if not ok:
         return False, err
-    for key in ("task_description", "workflow_type", "acceptance_criteria"):
-        if key not in data:
-            return False, f"Missing '{key}'"
+    required = ("task_description", "workflow_type", "acceptance_criteria")
+    missing = [k for k in required if k not in data]
+    if missing:
+        present = [k for k in required if k in data]
+        return False, (
+            f"Missing fields: {missing}. "
+            f"Present fields: {present}. "
+            f"Top-level keys in file: {list(data.keys())[:15]}"
+        )
     if not data.get("task_description", "").strip():
         return False, "task_description is empty"
     return True, "OK"
@@ -71,22 +77,34 @@ def _validate_impl_plan(path: str) -> tuple[bool, str]:
     if not data["phases"]:
         return False, "'phases' is empty"
     all_subtasks = []
-    for phase in data["phases"]:
+    errors = []
+    for i, phase in enumerate(data["phases"]):
+        if not isinstance(phase, dict):
+            errors.append(f"phases[{i}] must be an object, got {type(phase).__name__}: {str(phase)[:60]}")
+            continue
         subs = phase.get("subtasks", [])
         if not isinstance(subs, list) or len(subs) == 0:
-            return False, f"Phase '{phase.get('id','?')}' has no subtasks"
-        for s in subs:
+            errors.append(f"Phase '{phase.get('id','?')}' has no subtasks")
+            continue
+        for j, s in enumerate(subs):
+            if not isinstance(s, dict):
+                errors.append(f"phases[{i}].subtasks[{j}] must be object, got {type(s).__name__}")
+                continue
+            sub_errors = []
             if not s.get("id") or not s.get("title") or not s.get("description"):
-                return False, f"Subtask missing id/title/description: {s}"
+                sub_errors.append("missing id/title/description")
             if not s.get("completion_without_ollama", "").strip():
-                return False, f"Subtask {s['id']} missing 'completion_without_ollama'"
-            # Must reference at least one file
-            has_files = s.get("files_to_create") or s.get("files_to_modify")
-            if not has_files:
-                return False, f"Subtask {s['id']} has no files_to_create or files_to_modify"
-            all_subtasks.append(s)
+                sub_errors.append("missing 'completion_without_ollama'")
+            if not (s.get("files_to_create") or s.get("files_to_modify")):
+                sub_errors.append("no files_to_create or files_to_modify")
+            if sub_errors:
+                errors.append(f"Subtask {s.get('id','?')}: {', '.join(sub_errors)}")
+            else:
+                all_subtasks.append(s)
+    if errors:
+        return False, f"{len(errors)} issue(s): " + "; ".join(errors[:5])
     if not all_subtasks:
-        return False, "No subtasks found in any phase"
+        return False, "No valid subtasks found in any phase"
     return True, "OK"
 
 
@@ -140,8 +158,8 @@ class PlanningPhase(BasePhase):
             f"Investigate the project at: {wd}\n"
             f"Task to implement: {self.task.title}\n"
             f"Task description: {self.task.description}\n\n"
-            f"Write project_index.json to: {os.path.relpath(proj_index_path, wd)}\n"
-            f"Write context.json to: {os.path.relpath(context_path, wd)}\n\n"
+            f"Write project_index.json to this EXACT path (copy it verbatim): {self._rel(proj_index_path)}\n"
+            f"Write context.json to this EXACT path (copy it verbatim): {self._rel(context_path)}\n\n"
             "Use list_directory and read_file extensively to understand the project. "
             "Read at least 3 source files that implement similar functionality to this task."
         )
@@ -177,7 +195,7 @@ class PlanningPhase(BasePhase):
             f"Task description: {self.task.description}\n\n"
             f"project_index.json:\n{proj_idx}\n\n"
             f"context.json:\n{ctx}\n\n"
-            f"Write requirements.json to: {os.path.relpath(req_path, wd)}\n\n"
+            f"Write requirements.json to this EXACT path (copy it verbatim): {self._rel(req_path)}\n\n"
             "Create a structured requirements.json that derives concrete acceptance criteria "
             "from the task description. Every acceptance criterion must be verifiable by "
             "reading a file — not by subjective judgment."
@@ -205,7 +223,7 @@ class PlanningPhase(BasePhase):
         msg = (
             f"requirements.json:\n{req_content}\n\n"
             f"context.json:\n{ctx_content}\n\n"
-            f"Write spec.md to: {os.path.relpath(spec_path, wd)}\n\n"
+            f"Write spec.md to: {self._rel(spec_path)}\n\n"
             "Read the reference files listed in context.json before writing the spec. "
             "Include actual code snippets from those files in the Patterns section. "
             "The acceptance criteria section must be copied verbatim from requirements.json."
@@ -236,8 +254,8 @@ class PlanningPhase(BasePhase):
             f"spec.md:\n{spec_content}\n\n"
             f"requirements.json:\n{req_content}\n\n"
             f"context.json:\n{ctx_content}\n\n"
-            f"Write critique_report.json to: {os.path.relpath(critique_path, wd)}\n"
-            f"If you fix issues, rewrite spec.md at: {os.path.relpath(spec_path, wd)}\n\n"
+            f"Write critique_report.json to: {self._rel(critique_path)}\n"
+            f"If you fix issues, rewrite spec.md at: {self._rel(spec_path)}\n\n"
             "Focus on: validation drift (requirements that describe only verification, "
             "not actual implementation), unverifiable acceptance criteria, and invented file paths."
         )
@@ -272,7 +290,7 @@ class PlanningPhase(BasePhase):
             f"spec.md:\n{spec_content}\n\n"
             f"context.json:\n{ctx_content}\n\n"
             f"requirements.json:\n{req_content}\n\n"
-            f"Write implementation_plan.json to: {os.path.relpath(plan_path, wd)}\n\n"
+            f"Write implementation_plan.json to: {self._rel(plan_path)}\n\n"
             "Create subtasks that match the spec EXACTLY. "
             "Every file listed in 'Files to Create' needs at least one subtask. "
             "Each subtask must have: id, title, description (specific class/function names), "
@@ -368,6 +386,16 @@ class PlanningPhase(BasePhase):
         return True   # missing files are warned but don't block coding
 
     # ── Helpers ───────────────────────────────────────────────────
+    def _rel(self, abs_path: str) -> str:
+        """
+        Return a forward-slash relative path from the working directory.
+        Using os.path.relpath on Windows gives backslashes which models
+        misread or reproduce with typos (e.g. 'tasks/' instead of '.tasks/').
+        """
+        wd = self.task.project_path or self.state.working_dir
+        rel = os.path.relpath(abs_path, wd)
+        return rel.replace("\\", "/")
+
     def _read_file_safe(self, path: str) -> str:
         try:
             with open(path, "r", encoding="utf-8") as f:
