@@ -63,9 +63,13 @@ def _validate_spec_md(path: str) -> tuple[bool, str]:
         content = f.read()
     if len(content.strip()) < 200:
         return False, "spec.md is too short (< 200 chars)"
-    for heading in ("## Overview", "## Task Scope", "## Acceptance Criteria"):
-        if heading not in content:
-            return False, f"Missing section: {heading}"
+    # Accept both H1 (# Heading) and H2 (## Heading) — model often writes H1
+    for heading in ("Overview", "Task Scope", "Acceptance Criteria"):
+        if f"## {heading}" not in content and f"# {heading}" not in content:
+            return False, (
+                f"Missing section '{heading}'. "
+                f"Add '## {heading}' or '# {heading}' to the file."
+            )
     return True, "OK"
 
 
@@ -180,15 +184,27 @@ class PlanningPhase(BasePhase):
         proj_index_path = os.path.join(self.task.task_dir, "project_index.json")
         context_path    = os.path.join(self.task.task_dir, "context.json")
 
-        executor = self._make_executor(wd)
+        executor = self._make_planning_executor(wd)
+
+        # Provide upfront file list so model doesn't spend rounds listing directories
+        known_paths = "\n".join(
+            f"  {p}" for p in self.state.cache.file_paths[:50]
+            if not p.startswith(".tasks") and not p.startswith(".git")
+        ) or "  (none scanned yet)"
+
         msg = (
-            f"Investigate the project at: {wd}\n"
-            f"Task to implement: {self.task.title}\n"
+            f"Project directory: {wd}\n"
+            f"Task: {self.task.title}\n"
             f"Task description: {self.task.description}\n\n"
-            f"Write project_index.json to this EXACT path (copy it verbatim): {self._rel(proj_index_path)}\n"
-            f"Write context.json to this EXACT path (copy it verbatim): {self._rel(context_path)}\n\n"
-            "Use list_directory and read_file extensively to understand the project. "
-            "Read at least 3 source files that implement similar functionality to this task."
+            f"Project files (read them directly — no need to list_directory):\n"
+            f"{known_paths}\n\n"
+            f"IMPORTANT: Do NOT explore the .tasks/ directory — it contains "
+            f"other tasks' planning artifacts unrelated to this task.\n\n"
+            f"Write project_index.json to this EXACT path: {self._rel(proj_index_path)}\n"
+            f"Write context.json to this EXACT path: {self._rel(context_path)}\n\n"
+            "Read 3-5 source files most relevant to the task description, "
+            "then write both output files immediately. "
+            "Do not read every file — focus only on what is relevant."
         )
 
         def validate():
@@ -216,7 +232,7 @@ class PlanningPhase(BasePhase):
         proj_idx = self._read_file_safe(proj_idx_path)
         ctx      = self._read_file_safe(context_path)
         
-        executor = self._make_executor(wd)
+        executor = self._make_planning_executor(wd)
         msg = (
             f"Task name: {self.task.title}\n"
             f"Task description: {self.task.description}\n\n"
@@ -246,7 +262,7 @@ class PlanningPhase(BasePhase):
         req_content = self._read_file_safe(req_path)
         ctx_content = self._read_file_safe(context_path)
         
-        executor = self._make_executor(wd)
+        executor = self._make_planning_executor(wd)
         msg = (
             f"requirements.json:\n{req_content}\n\n"
             f"context.json:\n{ctx_content}\n\n"
@@ -276,7 +292,7 @@ class PlanningPhase(BasePhase):
         req_content  = self._read_file_safe(req_path)
         ctx_content  = self._read_file_safe(context_path)
 
-        executor = self._make_executor(wd)
+        executor = self._make_planning_executor(wd)
         msg = (
             f"spec.md:\n{spec_content}\n\n"
             f"requirements.json:\n{req_content}\n\n"
@@ -312,7 +328,7 @@ class PlanningPhase(BasePhase):
         ctx_content  = self._read_file_safe(context_path)
         req_content  = self._read_file_safe(req_path)
 
-        executor = self._make_executor(wd)
+        executor = self._make_planning_executor(wd)
         msg = (
             f"spec.md:\n{spec_content}\n\n"
             f"context.json:\n{ctx_content}\n\n"
@@ -418,6 +434,13 @@ class PlanningPhase(BasePhase):
         return True   # missing files are warned but don't block coding
 
     # ── Helpers ───────────────────────────────────────────────────
+    def _make_planning_executor(self, wd: str, **kw):
+        """Executor for planning phase — hides .tasks dir from list_directory
+        so the model doesn't waste rounds reading other tasks' artifacts."""
+        ex = self._make_executor(wd, **kw)
+        ex.hidden_dirs = {".tasks", ".git", "__pycache__", "node_modules"}
+        return ex
+
     def _rel(self, abs_path: str) -> str:
         """
         Return a forward-slash relative path from the working directory.

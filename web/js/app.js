@@ -313,6 +313,17 @@ function populateModal(task) {
   document.getElementById('btn-run').classList.toggle('hidden', isRunning);
   document.getElementById('btn-abort').classList.toggle('hidden', !isRunning);
 
+  // Git merge actions — show after coding phase completed (not in_progress/planning)
+  const codingDone = ['ai_review','human_review','done'].includes(task.column) ||
+    (task.column === 'in_progress' && (task.phases_selected || []).includes('coding') &&
+     (task.subtasks || []).length > 0);
+  const hasWorkdir = task.task_dir && (task.phases_selected || []).includes('coding');
+  const gitActionsEl = document.getElementById('ov-git-actions');
+  gitActionsEl.classList.toggle('hidden', !(hasWorkdir && codingDone));
+  if (task.git_branch) {
+    document.getElementById('ov-git-branch').textContent = task.git_branch;
+  }
+
   // Subtasks tab
   renderSubtasks(task.subtasks || []);
 
@@ -808,3 +819,79 @@ init();
 async function loadPromptStep(step) { return await eel.load_prompt_file(step)(); }
 async function savePromptStep(step, c) { return await eel.save_prompt_file(step, c)(); }
 async function refreshCacheGlobal() { return await eel.refresh_file_cache()(); }
+
+// ─── Git Diff & Merge ─────────────────────────────────────────────
+let _diffData = [];
+
+async function showDiff() {
+  if (!activeTaskId) return;
+  const res = await eel.get_workdir_diff(activeTaskId)();
+  if (!res.ok) { alert('Error: ' + res.error); return; }
+
+  _diffData = res.files || [];
+  document.getElementById('diff-subtitle').textContent =
+    `${res.total} file${res.total !== 1 ? 's' : ''} changed`;
+
+  const fileList = document.getElementById('diff-file-list');
+  fileList.innerHTML = '';
+
+  if (!_diffData.length) {
+    fileList.innerHTML = '<div class="diff-no-changes">No changes — workdir matches project</div>';
+    document.getElementById('diff-viewer').innerHTML =
+      '<div class="diff-empty">Workdir is identical to project</div>';
+  } else {
+    _diffData.forEach((f, i) => {
+      const item = document.createElement('div');
+      item.className = 'diff-file-item' + (i === 0 ? ' active' : '');
+      const isNew = f.label.startsWith('new file');
+      item.innerHTML =
+        `<span class="diff-file-badge ${isNew ? 'badge-new' : 'badge-mod'}">${isNew ? 'NEW' : 'MOD'}</span>` +
+        `<span class="diff-file-name">${esc(f.rel)}</span>`;
+      item.onclick = () => {
+        fileList.querySelectorAll('.diff-file-item').forEach((el, j) =>
+          el.classList.toggle('active', j === i));
+        renderDiff(_diffData[i].diff);
+      };
+      fileList.appendChild(item);
+    });
+    renderDiff(_diffData[0].diff);
+  }
+
+  document.getElementById('overlay-diff').classList.add('open');
+}
+
+function renderDiff(diffText) {
+  const viewer = document.getElementById('diff-viewer');
+  if (!diffText) {
+    viewer.innerHTML = '<div class="diff-empty">No textual diff available</div>';
+    return;
+  }
+  const lines = diffText.split('\n');
+  const html = lines.map(line => {
+    let cls = 'diff-line';
+    if      (line.startsWith('+') && !line.startsWith('+++')) cls += ' diff-add';
+    else if (line.startsWith('-') && !line.startsWith('---')) cls += ' diff-del';
+    else if (line.startsWith('@@'))                           cls += ' diff-hunk';
+    else if (line.startsWith('+++') || line.startsWith('---')) cls += ' diff-header';
+    return `<div class="${cls}">${esc(line) || '\u00a0'}</div>`;
+  }).join('');
+  viewer.innerHTML = `<div class="diff-content">${html}</div>`;
+}
+
+function closeDiffModal() {
+  document.getElementById('overlay-diff').classList.remove('open');
+}
+
+async function mergeWorkdir() {
+  if (!activeTaskId) return;
+  const task = await eel.get_task(activeTaskId)();
+  const branch = task?.git_branch || 'main';
+  if (!confirm(`Merge workdir into branch "${branch}" and create a commit?`)) return;
+
+  const res = await eel.merge_workdir(activeTaskId)();
+  if (res.ok) {
+    alert(`✓ Merged ${res.files.length} file(s) into branch "${res.branch}"`);
+  } else {
+    alert('Merge failed: ' + res.error);
+  }
+}

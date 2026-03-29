@@ -284,7 +284,14 @@ class AppState:
         tasks_root = os.path.join(root, ".tasks")
         os.makedirs(tasks_root, exist_ok=True)
         n = 1
-        while os.path.exists(os.path.join(tasks_root, f"task_{n:03d}.json")):
+        # Check both the directory and any in-memory tasks to avoid collisions
+        existing_dirs = {
+            t.task_dir for t in self.kanban_tasks if t.task_dir
+        }
+        while (
+            os.path.exists(os.path.join(tasks_root, f"task_{n:03d}"))
+            or os.path.join(tasks_root, f"task_{n:03d}") in existing_dirs
+        ):
             n += 1
         task.task_number = n
         task.task_json_path = os.path.join(tasks_root, f"task_{n:03d}.json")

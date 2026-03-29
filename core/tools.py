@@ -277,6 +277,9 @@ class ToolExecutor:
         self.log_fn = log_fn
         self.sandbox = sandbox
 
+        # Directories to hide from list_directory output (e.g. .tasks during planning)
+        self.hidden_dirs: set[str] = set()
+
         # Signals from tools back to the phase runner
         self.last_confirmed_task_id: Optional[str] = None
         self.last_created_tasks: list[dict] = []
@@ -365,6 +368,9 @@ class ToolExecutor:
             return f"ERROR: Directory not found: {path_rel or '.'}"
         entries = []
         for name in sorted(os.listdir(abs_path)):
+            # Skip directories the phase has asked to hide (e.g. .tasks in planning)
+            if name in self.hidden_dirs and os.path.isdir(os.path.join(abs_path, name)):
+                continue
             full = os.path.join(abs_path, name)
             kind = "DIR " if os.path.isdir(full) else "FILE"
             entries.append(f"{kind}  {name}")

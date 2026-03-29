@@ -1211,3 +1211,205 @@ html, body {
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 3px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--text3); }
+
+/* ── GIT ACTIONS (overview pane) ──────────────────────────────── */
+.ov-git-actions {
+  margin-top: 16px;
+  padding: 12px 14px;
+  background: rgba(16,185,129,.07);
+  border: 1px solid rgba(16,185,129,.2);
+  border-radius: var(--r6);
+}
+
+.ov-git-label {
+  font-size: 11px;
+  color: var(--text2);
+  margin-bottom: 10px;
+}
+.ov-git-label code {
+  font-family: var(--mono);
+  color: var(--green);
+  background: rgba(16,185,129,.12);
+  padding: 1px 6px;
+  border-radius: 3px;
+}
+
+.ov-git-btns {
+  display: flex;
+  gap: 8px;
+}
+
+.btn-diff {
+  background: transparent;
+  border: 1px solid var(--border2);
+  color: var(--text2);
+  font: 12px var(--font);
+  font-weight: 500;
+  padding: 6px 14px;
+  border-radius: var(--r6);
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.btn-diff:hover { background: var(--bg3); color: var(--text); border-color: var(--text3); }
+
+.btn-merge {
+  background: rgba(16,185,129,.15);
+  border: 1px solid rgba(16,185,129,.35);
+  color: var(--green);
+  font: 12px var(--font);
+  font-weight: 600;
+  padding: 6px 14px;
+  border-radius: var(--r6);
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.btn-merge:hover { background: rgba(16,185,129,.25); border-color: var(--green); }
+
+/* ── DIFF MODAL ─────────────────────────────────────────────────── */
+.modal-diff {
+  background: var(--bg2);
+  border: 1px solid var(--border2);
+  border-radius: 10px;
+  width: 90vw;
+  max-width: 1100px;
+  height: 80vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.diff-file-list {
+  width: 220px;
+  min-width: 180px;
+  border-right: 1px solid var(--border);
+  overflow-y: auto;
+  padding: 6px;
+  background: var(--bg2);
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.modal-diff .modal-new-header {
+  flex-shrink: 0;
+}
+
+.modal-diff .modal-new-footer {
+  flex-shrink: 0;
+}
+
+/* Override modal-diff to be a flex column with the body as a row */
+.modal-diff > .modal-new-header,
+.modal-diff > .modal-new-footer {
+  flex-shrink: 0;
+}
+
+.modal-diff-body {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+}
+
+/* Patch: make the file list and viewer sit inside a flex row */
+.modal-diff .diff-file-list,
+.modal-diff .diff-viewer {
+  flex-shrink: 0;
+}
+
+/* Restructure: the list and viewer are siblings after the header */
+.modal-diff { flex-direction: column; }
+
+/* Flex row container for list + viewer */
+.diff-body-row {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}
+
+.diff-file-list {
+  width: 220px;
+  min-width: 160px;
+  border-right: 1px solid var(--border);
+  overflow-y: auto;
+  padding: 6px 4px;
+  background: var(--bg2);
+  flex-shrink: 0;
+}
+
+.diff-file-list::-webkit-scrollbar { width: 4px; }
+.diff-file-list::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 2px; }
+
+.diff-file-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border-radius: var(--r3);
+  cursor: pointer;
+  transition: background 0.1s;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text2);
+}
+.diff-file-item:hover { background: var(--bg3); }
+.diff-file-item.active { background: var(--bg4); color: var(--text); }
+
+.diff-file-badge {
+  font-size: 8px;
+  font-weight: 700;
+  padding: 1px 4px;
+  border-radius: 3px;
+  flex-shrink: 0;
+}
+.badge-new { background: rgba(16,185,129,.2); color: var(--green); }
+.badge-mod { background: rgba(59,130,246,.2); color: var(--accent); }
+
+.diff-file-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.diff-viewer {
+  flex: 1;
+  overflow: auto;
+  background: var(--bg);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.diff-viewer::-webkit-scrollbar { width: 5px; height: 5px; }
+.diff-viewer::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 3px; }
+
+.diff-content { padding: 8px 0; }
+
+.diff-line {
+  padding: 0 16px;
+  line-height: 1.7;
+  white-space: pre;
+  min-height: 1.7em;
+}
+.diff-add    { background: rgba(16,185,129,.12); color: #6ee7b7; }
+.diff-del    { background: rgba(239,68,68,.12);  color: #fca5a5; }
+.diff-hunk   { background: rgba(59,130,246,.1);  color: var(--accent); }
+.diff-header { color: var(--text3); }
+
+.diff-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: var(--text3);
+  font-size: 12px;
+}
+
+.diff-no-changes {
+  padding: 16px;
+  color: var(--green);
+  font-size: 12px;
+  text-align: center;
+}
+

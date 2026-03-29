@@ -219,6 +219,13 @@
           <button class="btn-secondary" onclick="moveTaskModal('queue')">→ Queue</button>
           <button class="btn-secondary" onclick="moveTaskModal('done')">→ Done</button>
         </div>
+        <div class="ov-git-actions hidden" id="ov-git-actions">
+          <div class="ov-git-label">Workdir ready to merge into <code id="ov-git-branch">main</code></div>
+          <div class="ov-git-btns">
+            <button class="btn-diff" onclick="showDiff()">⊟ View Diff</button>
+            <button class="btn-merge" onclick="mergeWorkdir()">⇥ Merge to Branch</button>
+          </div>
+        </div>
       </div>
 
       <!-- Subtasks -->
@@ -305,6 +312,30 @@
         <button class="btn-primary" onclick="applyDir()">Set</button>
       </div>
       <div class="dir-feedback" id="dir-feedback"></div>
+    </div>
+  </div>
+</div>
+
+
+<!-- ═══════════════ DIFF MODAL ══════════════════════════════════ -->
+<div class="overlay" id="overlay-diff" onclick="if(event.target===this)closeDiffModal()">
+  <div class="modal-diff">
+    <div class="modal-new-header">
+      <div>
+        <h2>Workdir Changes</h2>
+        <div id="diff-subtitle" style="font-size:11px;color:var(--text3);margin-top:2px"></div>
+      </div>
+      <button class="modal-close" onclick="closeDiffModal()">✕</button>
+    </div>
+    <div class="diff-body-row">
+      <div class="diff-file-list" id="diff-file-list"></div>
+      <div class="diff-viewer" id="diff-viewer">
+        <div class="diff-empty">Select a file on the left to view changes</div>
+      </div>
+    </div>
+    <div class="modal-new-footer">
+      <button class="btn-ghost" onclick="closeDiffModal()">Close</button>
+      <button class="btn-merge" onclick="closeDiffModal();mergeWorkdir()">⇥ Merge to Branch</button>
     </div>
   </div>
 </div>
