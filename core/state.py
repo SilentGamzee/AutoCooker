@@ -156,6 +156,12 @@ class KanbanTask:
             "phases_selected": self.phases_selected,
         }
 
+    def to_dict_ui(self) -> dict:
+        """Lightweight dict for UI pushes — excludes file_contents (fetched separately)."""
+        d = self.to_dict()
+        d.pop("file_contents", None)
+        return d
+
     def cache_content(self, rel_path: str, content: str):
         """Store file content in this task's per-task cache."""
         self.file_contents[rel_path] = content
@@ -235,8 +241,9 @@ class AppState:
                 self.save_logs_for_task(t)
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(rows, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
+        except Exception as _e:
+            import traceback; traceback.print_exc(file=__import__('sys').stdout)
+            print(f"[ERROR] _save_kanban failed: {_e}", flush=True)
 
     def load_kanban(self):
         path = self._kanban_path()
@@ -316,8 +323,8 @@ class AppState:
         try:
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(task.logs, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
+        except Exception as _e:
+            print(f"[ERROR] save_logs_for_task({task.id}): {_e}", flush=True)
 
     def load_logs_for_task(self, task: "KanbanTask") -> bool:
         """Load logs from task_dir/logs.json into task.logs. Returns True if loaded."""

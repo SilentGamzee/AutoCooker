@@ -5,6 +5,7 @@ import subprocess
 
 from core.state import AppState, KanbanTask
 from core.tools import ToolExecutor, QA_REVIEWER_TOOLS, QA_FIXER_TOOLS
+from core.sandbox import WORKDIR_NAME
 from core.phases.base import BasePhase
 
 # Hard caps — prevent runaway loops

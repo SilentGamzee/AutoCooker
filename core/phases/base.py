@@ -34,14 +34,15 @@ class BasePhase:
         self.state.save_logs_for_task(self.task)
         try:
             eel.task_log_added(self.task.id, self.task.logs[-1])
-        except Exception:
-            pass
+        except Exception as _e:
+            if "eel" not in type(_e).__module__.lower():
+                print(f"[WARN] task_log_added: {_e}", flush=True)
 
     def set_step(self, step: str):
         try:
             eel.task_step_changed(self.task.id, self.phase_name, step)
         except Exception:
-            pass
+            pass  # eel disconnect is normal
 
     def push_task(self):
         """Push full task state to UI."""
@@ -49,7 +50,7 @@ class BasePhase:
         try:
             eel.task_updated(self.task.to_dict_ui())
         except Exception:
-            pass
+            pass  # eel disconnect is normal
 
     # ── System prompt ────────────────────────────────────────────
     def build_system(self, prompt_file: str) -> str:
@@ -165,8 +166,9 @@ class BasePhase:
             self.state.check_abort(self.task.id)
 
             self.log(f"  [Loop {outer+1}/{max_outer_iterations}] → Ollama…", "info")
+            tool_calls_made = 0   # reset each outer iteration
             try:
-                messages, final_text = self.ollama.chat_with_tools(
+                messages, final_text, tool_calls_made = self.ollama.chat_with_tools(
                     model=model,
                     system=system,
                     messages=messages,
@@ -190,24 +192,28 @@ class BasePhase:
             else:
                 self.log(f"  ✗ Validation failed: {reason}", "warn")
 
-                # Show actual file contents so model can see what is really on disk
                 file_snapshot = self._snapshot_written_files(executor)
 
-                # Explicit instruction: must call write_file, not just describe
                 retry_msg = f"VALIDATION FAILED: {reason}\n\n"
+
+                if tool_calls_made == 0:
+                    retry_msg += (
+                        "WARNING: You responded with text but called NO tools. "
+                        "The file on disk was NOT changed.\n\n"
+                    )
+
                 if file_snapshot:
                     retry_msg += (
-                        f"ACTUAL FILE CONTENTS ON DISK RIGHT NOW "
-                        f"(check the top-level keys carefully):\n"
+                        "CURRENT FILE ON DISK (top-level keys show what fields exist):\n"
                         f"{file_snapshot}\n\n"
                     )
                 else:
-                    retry_msg += "No files have been written to disk yet.\n\n"
+                    retry_msg += "No files written to disk yet.\n\n"
+
                 retry_msg += (
-                    "ACTION REQUIRED: Call write_file with the COMPLETE corrected content "
-                    "that fixes ALL issues listed above in one single write. "
-                    "Do NOT just describe the fix — call the tool. "
-                    "Do NOT write a partial file — include every required field."
+                    "ACTION REQUIRED: Call write_file now with the COMPLETE corrected "
+                    "content that includes ALL required fields in one single write. "
+                    "Describing the fix in text does nothing — you must call the tool."
                 )
                 messages.append({"role": "user", "content": retry_msg})
 

@@ -252,7 +252,7 @@ class CodingPhase(BasePhase):
         msg = (
             f"Write a comprehensive README.md for the project.\n"
             f"Task: {self.task.title}\n\nChanges:\n{summary}\n\n"
-            f"Write to: {os.path.relpath(readme_path, wd)}"
+            f"Write to: {os.path.relpath(readme_path, workdir)}"
         )
         return self.run_loop(
             "2.3 README", "p7_readme.md",

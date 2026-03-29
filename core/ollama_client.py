@@ -48,6 +48,12 @@ class OllamaClient:
         _last_call: tuple[str, str] = ("", "")
         _repeat_count: int = 0
         REPEAT_LIMIT = 3   # break inner loop after this many identical calls in a row
+        _tool_calls_made: int = 0  # total tool invocations across all rounds
+
+        # Track files already read this session to detect re-read loops
+        _files_read: set[str] = set()
+        _rounds_without_write: int = 0
+        MAX_ROUNDS_WITHOUT_WRITE = 8  # inject nudge if model reads without writing
 
         for _round in range(max_tool_rounds):
             # ── Abort check before each round ─────────────────────
@@ -59,6 +65,17 @@ class OllamaClient:
                 capped_history = history[:1] + history[-(HISTORY_CAP - 1):]
             else:
                 capped_history = history
+
+            # ── Inject "write now" nudge if model has been reading too long ──
+            if _rounds_without_write >= MAX_ROUNDS_WITHOUT_WRITE:
+                already_read = sorted(_files_read)[:10]
+                nudge = (
+                    f"You have read {len(_files_read)} files across {_round} rounds without writing anything. "
+                    f"You already have: {already_read}. "
+                    "Stop reading — write the required output file NOW using write_file."
+                )
+                capped_history = capped_history + [{"role": "user", "content": nudge}]
+                _rounds_without_write = 0   # reset so nudge isn't repeated every round
 
             payload: dict = {
                 "model": model,
@@ -98,7 +115,7 @@ class OllamaClient:
 
             if not tool_calls:
                 # Final answer – no more tool calls
-                return history, content
+                return history, content, _tool_calls_made
 
             # Execute each tool call and feed results back
             for tc in tool_calls:
@@ -115,8 +132,18 @@ class OllamaClient:
                     except json.JSONDecodeError:
                         raw_args = {}
 
+                _tool_calls_made += 1
                 if log_fn:
                     log_fn(f"[Tool ►] {tool_name}({json.dumps(raw_args, ensure_ascii=False)[:200]})")
+
+                # Track reads vs writes for the "write now" nudge
+                if tool_name in ("write_file", "modify_file"):
+                    _rounds_without_write = -1   # reset; incremented to 0 after loop
+                elif tool_name == "read_file":
+                    _path_arg = raw_args.get("path", "")
+                    if _path_arg in _files_read and log_fn:
+                        log_fn(f"[WARN] Re-reading already-seen file: {_path_arg}", "warn")
+                    _files_read.add(_path_arg)
 
                 try:
                     result = tool_executor(tool_name, raw_args)
@@ -158,6 +185,8 @@ class OllamaClient:
                             f"submit_qa_verdict / confirm_task_done to signal completion."
                         ),
                     })
-                    return history, ""
+                    return history, "", _tool_calls_made
 
-        raise RuntimeError(f"Tool loop exceeded {max_tool_rounds} rounds without finishing")
+            _rounds_without_write += 1  # one more round done
+
+        return history, "", _tool_calls_made

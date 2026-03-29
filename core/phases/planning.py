@@ -7,6 +7,7 @@ import time
 
 from core.state import AppState, KanbanTask
 from core.tools import ToolExecutor, PLANNING_TOOLS
+from core.sandbox import create_sandbox, WORKDIR_NAME
 from core.validator import (
     validate_task_info,
     validate_json_file,
@@ -73,9 +74,31 @@ def _validate_impl_plan(path: str) -> tuple[bool, str]:
     if not ok:
         return False, err
     if "phases" not in data or not isinstance(data["phases"], list):
-        return False, "Missing 'phases' array"
+        top_keys = list(data.keys()) if isinstance(data, dict) else "not a dict"
+        return False, f"Missing 'phases' array. Top-level keys: {top_keys}"
     if not data["phases"]:
         return False, "'phases' is empty"
+
+    # Show a structural dump of what the phases actually contain
+    def _phase_summary(phases_data: list) -> str:
+        lines = []
+        for i, ph in enumerate(phases_data[:5]):
+            if isinstance(ph, dict):
+                subs = ph.get("subtasks", [])
+                lines.append(
+                    f"  phases[{i}]: id={ph.get('id','?')!r}, "
+                    f"subtasks={len(subs) if isinstance(subs, list) else type(subs).__name__}"
+                )
+                if isinstance(subs, list):
+                    for j, s in enumerate(subs[:2]):
+                        if isinstance(s, dict):
+                            lines.append(f"    subtasks[{j}] keys: {list(s.keys())}")
+                        else:
+                            lines.append(f"    subtasks[{j}]: {type(s).__name__} = {str(s)[:40]}")
+            else:
+                lines.append(f"  phases[{i}]: {type(ph).__name__} = {str(ph)[:60]}")
+        return "\n".join(lines)
+
     all_subtasks = []
     errors = []
     for i, phase in enumerate(data["phases"]):
@@ -84,7 +107,7 @@ def _validate_impl_plan(path: str) -> tuple[bool, str]:
             continue
         subs = phase.get("subtasks", [])
         if not isinstance(subs, list) or len(subs) == 0:
-            errors.append(f"Phase '{phase.get('id','?')}' has no subtasks")
+            errors.append(f"phases[{i}] (id={phase.get('id','?')!r}) has no subtasks array")
             continue
         for j, s in enumerate(subs):
             if not isinstance(s, dict):
@@ -102,7 +125,11 @@ def _validate_impl_plan(path: str) -> tuple[bool, str]:
             else:
                 all_subtasks.append(s)
     if errors:
-        return False, f"{len(errors)} issue(s): " + "; ".join(errors[:5])
+        summary = _phase_summary(data["phases"])
+        return False, (
+            f"{len(errors)} issue(s): " + "; ".join(errors[:5]) +
+            f"\n\nActual phases structure:\n{summary}"
+        )
     if not all_subtasks:
         return False, "No valid subtasks found in any phase"
     return True, "OK"
@@ -296,7 +323,12 @@ class PlanningPhase(BasePhase):
             "Each subtask must have: id, title, description (specific class/function names), "
             "files_to_create or files_to_modify (at least one), "
             "completion_without_ollama (checkable by reading files), "
-            "completion_with_ollama (quality check), status='pending'."
+            "completion_with_ollama (quality check), status='pending'.\n\n"
+            "REQUIRED JSON STRUCTURE (phases must contain subtask objects, NOT strings):\n"
+            '{"phases": [{"id": "phase-1", "title": "...", "subtasks": ['
+            '{"id": "T-001", "title": "...", "description": "...", '
+            '"files_to_create": ["src/x.py"], "completion_without_ollama": "...", '
+            '"completion_with_ollama": "...", "status": "pending"}]}]}'
         )
 
         def validate():
@@ -337,9 +369,9 @@ class PlanningPhase(BasePhase):
 
         try:
             import eel
-            eel.task_updated(self.task.to_dict())
+            eel.task_updated(self.task.to_dict_ui())
         except Exception:
-            pass
+            pass  # eel disconnect is normal
         return True
 
     # ── 1.7 Prepare workdir ──────────────────────────────────────

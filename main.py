@@ -11,6 +11,10 @@ import threading
 import time
 import traceback
 
+# Force unbuffered stdout/stderr so errors appear immediately on Windows
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+
 import eel
 
 from core.state import AppState, KanbanTask, COLUMNS, TaskAbortedError
@@ -18,6 +22,18 @@ from core.ollama_client import OllamaClient
 from core.phases.planning import PlanningPhase
 from core.phases.coding import CodingPhase
 from core.phases.qa import QAPhase
+
+# ─── Global error reporting ──────────────────────────────────────
+import threading
+
+def _thread_excepthook(args):
+    """Print uncaught exceptions from background threads to console."""
+    if args.exc_type is SystemExit:
+        return
+    print("\n[THREAD ERROR] Uncaught exception in background thread:", flush=True)
+    traceback.print_exception(args.exc_type, args.exc_value, args.exc_tb)
+
+threading.excepthook = _thread_excepthook
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 WEB_DIR  = os.path.join(BASE_DIR, "web")
@@ -40,16 +56,16 @@ def _slug(title: str) -> str:
 def _push_board():
     try:
         eel.board_updated(STATE.kanban_board())
-    except Exception:
-        pass
+    except Exception as _e:
+        print(f"[WARN] _push_board: {_e}", flush=True)
 
 
 def _push_task(task: KanbanTask):
     STATE._save_kanban()
     try:
-        eel.task_updated(task.to_dict())
-    except Exception:
-        pass
+        eel.task_updated(task.to_dict_ui())
+    except Exception as _e:
+        print(f"[WARN] _push_task: {_e}", flush=True)
 
 
 # ─── Eel API ──────────────────────────────────────────────────────
@@ -150,6 +166,13 @@ def start_task(task_id: str) -> dict:
         return {"ok": False, "error": "Task already running"}
 
     def run():
+        try:
+            _run_pipeline()
+        except Exception:
+            print("[PIPELINE THREAD] Unexpected top-level error:", flush=True)
+            traceback.print_exc()
+
+    def _run_pipeline():
         STATE.active_task_id = task_id
         task.column = "in_progress"
         task.has_errors = False
@@ -200,13 +223,18 @@ def start_task(task_id: str) -> dict:
             task.tags = list(set(task.tags + ["Aborted"]))
         except Exception:
             err = traceback.format_exc()
+            print(f"\n[PIPELINE ERROR] Task {task_id}:\n{err}", flush=True)
             task.add_log(f"[PIPELINE ERROR]\n{err}", "system", "error")
             task.column = "human_review"
             task.has_errors = True
             task.tags = list(set(task.tags + ["Has Errors"]))
         finally:
-            _push_task(task)
-            _push_board()
+            try:
+                _push_task(task)
+                _push_board()
+            except Exception:
+                print("[PIPELINE FINALLY] push failed:", flush=True)
+                traceback.print_exc()
             STATE.active_task_id = ""
 
     threading.Thread(target=run, daemon=True).start()
