@@ -92,6 +92,11 @@ class CodingPhase(BasePhase):
         workdir = os.path.join(self.task.task_dir, WORKDIR_NAME)
         title   = subtask_dict.get("title", "")
 
+        files_to_create = subtask_dict.get("files_to_create") or []
+        files_to_modify = subtask_dict.get("files_to_modify") or []
+        completion_cond = subtask_dict.get("completion_without_ollama", "").strip()
+        patterns_from   = subtask_dict.get("patterns_from") or []
+
         # Track whether any file writes actually happened
         writes_made: list[str] = []
 
@@ -107,7 +112,7 @@ class CodingPhase(BasePhase):
                 self.log(f"    ✓ confirm_task_done: {summary[:120]}", "confirm")
 
         executor = self._make_executor(
-            workdir,                      # model reads/writes ONLY inside workdir
+            workdir,
             on_task_confirmed=on_confirmed,
             on_file_written=on_write_made,
         )
@@ -115,12 +120,6 @@ class CodingPhase(BasePhase):
         executor.modify_only_files = {
             self._to_rel_workdir(workdir, f) for f in files_to_modify
         }
-
-        files_to_create = subtask_dict.get("files_to_create") or []
-        files_to_modify = subtask_dict.get("files_to_modify") or []
-        completion_cond = subtask_dict.get("completion_without_ollama", "").strip()
-        patterns_from   = subtask_dict.get("patterns_from") or []
-        workdir = os.path.join(self.task.task_dir, WORKDIR_NAME)
 
         # Pre-read files_to_modify so their content is in the prompt
         modify_previews = ""
