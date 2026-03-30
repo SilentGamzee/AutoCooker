@@ -279,6 +279,8 @@ class ToolExecutor:
 
         # Directories to hide from list_directory output (e.g. .tasks during planning)
         self.hidden_dirs: set[str] = set()
+        # Files that must be modified, never fully overwritten (set by coding phase)
+        self.modify_only_files: set[str] = set()
 
         # Signals from tools back to the phase runner
         self.last_confirmed_task_id: Optional[str] = None
@@ -390,6 +392,15 @@ class ToolExecutor:
         validation = self._validate_path(abs_path, "write")
         if validation != "OK":
             return validation
+
+        # Enforce modify-only rule: block write_file for files that must use modify_file
+        path_rel_check = self._to_rel(abs_path)
+        if self.modify_only_files and path_rel_check in self.modify_only_files:
+            return (
+                f"BLOCKED: '{path_rel_check}' is listed under files_to_modify — "
+                f"you must use modify_file (find-and-replace) instead of write_file. "
+                f"Using write_file would destroy all existing code in this file."
+            )
 
         os.makedirs(os.path.dirname(abs_path), exist_ok=True)
         try:

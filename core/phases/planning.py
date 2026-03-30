@@ -73,7 +73,7 @@ def _validate_spec_md(path: str) -> tuple[bool, str]:
     return True, "OK"
 
 
-def _validate_impl_plan(path: str) -> tuple[bool, str]:
+def _validate_impl_plan(path: str, project_path: str = "") -> tuple[bool, str]:
     ok, data, err = _read_json(path)
     if not ok:
         return False, err
@@ -128,6 +128,20 @@ def _validate_impl_plan(path: str) -> tuple[bool, str]:
                 errors.append(f"Subtask {s.get('id','?')}: {', '.join(sub_errors)}")
             else:
                 all_subtasks.append(s)
+    # Check that files_to_modify actually exist in the project
+    if project_path:
+        for s in all_subtasks:
+            for fpath in s.get("files_to_modify", []):
+                if not fpath:
+                    continue
+                full = os.path.join(project_path, fpath)
+                if not os.path.isfile(full):
+                    errors.append(
+                        f"Subtask {s.get('id','?')}: files_to_modify '{fpath}' "
+                        f"does not exist in the project. "
+                        f"If this is a new file, move it to files_to_create instead."
+                    )
+
     if errors:
         summary = _phase_summary(data["phases"])
         return False, (
@@ -329,18 +343,28 @@ class PlanningPhase(BasePhase):
         req_content  = self._read_file_safe(req_path)
 
         executor = self._make_planning_executor(wd)
+        # Show which project files actually exist — LLM must only use these in files_to_modify
+        existing_files = "\n".join(
+            f"  {p}" for p in self.state.cache.file_paths[:60]
+            if not p.startswith(".tasks") and not p.startswith(".git")
+        ) or "  (none scanned)"
+
         msg = (
             f"spec.md:\n{spec_content}\n\n"
             f"context.json:\n{ctx_content}\n\n"
             f"requirements.json:\n{req_content}\n\n"
+            f"Existing project files (ONLY these paths are valid for files_to_modify):\n"
+            f"{existing_files}\n\n"
             f"Write implementation_plan.json to: {self._rel(plan_path)}\n\n"
-            "Create subtasks that match the spec EXACTLY. "
-            "Every file listed in 'Files to Create' needs at least one subtask. "
-            "Each subtask must have: id, title, description (specific class/function names), "
+            "Create subtasks that match the spec EXACTLY.\n"
+            "CRITICAL RULES for file paths:\n"
+            "- files_to_modify: ONLY paths that exist in the project file list above.\n"
+            "  If the file doesn't exist yet, it belongs in files_to_create, NOT files_to_modify.\n"
+            "- files_to_create: paths for brand-new files that don't exist yet.\n"
+            "- Each subtask must have: id, title, description, "
             "files_to_create or files_to_modify (at least one), "
-            "completion_without_ollama (checkable by reading files), "
-            "completion_with_ollama (quality check), status='pending'.\n\n"
-            "REQUIRED JSON STRUCTURE (phases must contain subtask objects, NOT strings):\n"
+            "completion_without_ollama, completion_with_ollama, status='pending'.\n\n"
+            "REQUIRED JSON STRUCTURE:\n"
             '{"phases": [{"id": "phase-1", "title": "...", "subtasks": ['
             '{"id": "T-001", "title": "...", "description": "...", '
             '"files_to_create": ["src/x.py"], "completion_without_ollama": "...", '
@@ -348,7 +372,7 @@ class PlanningPhase(BasePhase):
         )
 
         def validate():
-            return _validate_impl_plan(plan_path)
+            return _validate_impl_plan(plan_path, project_path=wd)
 
         return self.run_loop(
             "1.5 Impl Plan", "p5_impl_plan.md",

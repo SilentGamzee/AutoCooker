@@ -111,36 +111,57 @@ class CodingPhase(BasePhase):
             on_task_confirmed=on_confirmed,
             on_file_written=on_write_made,
         )
+        # Prevent write_file on modify-only files (would destroy existing code)
+        executor.modify_only_files = {
+            self._to_rel_workdir(workdir, f) for f in files_to_modify
+        }
 
         files_to_create = subtask_dict.get("files_to_create") or []
         files_to_modify = subtask_dict.get("files_to_modify") or []
         completion_cond = subtask_dict.get("completion_without_ollama", "").strip()
         patterns_from   = subtask_dict.get("patterns_from") or []
+        workdir = os.path.join(self.task.task_dir, WORKDIR_NAME)
+
+        # Pre-read files_to_modify so their content is in the prompt
+        modify_previews = ""
+        for f in files_to_modify:
+            fpath = os.path.join(workdir, f)
+            if os.path.isfile(fpath):
+                try:
+                    with open(fpath, "r", encoding="utf-8", errors="replace") as _f:
+                        _content = _f.read()
+                    preview = _content[:2000] + ("…(truncated)" if len(_content) > 2000 else "")
+                    modify_previews += f"\n=== CURRENT CONTENT: {f} ===\n{preview}\n"
+                except Exception:
+                    pass
 
         msg = (
             f"Subtask ID: {sid}\n"
             f"Title: {title}\n\n"
             f"Description:\n{subtask_dict.get('description', '')}\n\n"
-            f"Files to CREATE (must be written from scratch):\n"
+            f"Files to CREATE from scratch:\n"
             + ("\n".join(f"  - {f}" for f in files_to_create) if files_to_create else "  (none)")
-            + f"\n\nFiles to MODIFY (read first, then make targeted changes):\n"
+            + f"\n\nFiles to MODIFY (add/change specific parts only):\n"
             + ("\n".join(f"  - {f}" for f in files_to_modify) if files_to_modify else "  (none)")
-            + f"\n\nPattern reference files (read these for coding style):\n"
+            + (f"\n{modify_previews}" if modify_previews else "")
+            + f"\n\nPattern reference files (read for coding style):\n"
             + ("\n".join(f"  - {f}" for f in patterns_from) if patterns_from else "  (none)")
-            + f"\n\nCompletion condition (structural, checkable by reading files):\n  {completion_cond}\n\n"
+            + f"\n\nCompletion condition:\n  {completion_cond}\n\n"
             f"Quality condition:\n  {subtask_dict.get('completion_with_ollama', '')}\n\n"
+            "RULES:\n"
+            "- Files to CREATE: use write_file to create them from scratch.\n"
+            "- Files to MODIFY: you MUST use modify_file (find and replace a specific block).\n"
+            "  NEVER use write_file on a file listed under MODIFY — that destroys existing code.\n"
+            "  Make only the minimal targeted change needed for this subtask.\n"
+            "- Do NOT modify files not listed above.\n\n"
             "Procedure:\n"
-            "1. Call read_file on every file in patterns_from to understand the code style.\n"
-            "2. Call read_file on every file in files_to_modify to understand current state.\n"
-            "3. Implement the required changes using write_file or modify_file.\n"
-            "   Use the SAME relative paths shown above (e.g. src/main.py).\n"
-            "   Files are automatically saved to the task sandbox — do NOT invent\n"
-            "   alternative paths or write to locations not listed above.\n"
-            "4. Call read_file to verify your writes before confirming.\n"
-            f"5. Call confirm_task_done with task_id='{sid}' when done."
+            "1. Read pattern reference files to understand code style.\n"
+            "2. The current content of files_to_modify is shown above — no need to read them again.\n"
+            "3. For MODIFY files: call modify_file with the exact old_text to replace.\n"
+            "4. For CREATE files: call write_file with the full new content.\n"
+            "5. Call read_file to verify, then call confirm_task_done.\n"
+            f"6. Call confirm_task_done with task_id='{sid}' when done."
         )
-
-        workdir = os.path.join(self.task.task_dir, WORKDIR_NAME)
 
         def validate_fn() -> tuple[bool, str]:
             # Check 1: confirm_task_done must have been called
@@ -219,6 +240,10 @@ class CodingPhase(BasePhase):
                 return False, f"Cannot read {fpath}: {e}"
 
         return True, "OK"
+
+    def _to_rel_workdir(self, workdir: str, rel_path: str) -> str:
+        """Normalize a project-relative path to the form used as cache key."""
+        return rel_path.replace("\\", "/")
 
     # ── Structural re-verification for previously done tasks ───────
     def _verify_structural_completion(
