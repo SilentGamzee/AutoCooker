@@ -313,6 +313,16 @@ function populateModal(task) {
   document.getElementById('btn-run').classList.toggle('hidden', isRunning);
   document.getElementById('btn-abort').classList.toggle('hidden', !isRunning);
 
+  // Corrections panel: show when task is done or in human_review
+  const showCorrections = ['done', 'human_review'].includes(task.column);
+  document.getElementById('corrections-panel').classList.toggle('hidden', !showCorrections);
+  if (showCorrections) {
+    const textarea = document.getElementById('corrections-input');
+    if (document.activeElement !== textarea) {
+      textarea.value = task.corrections || '';
+    }
+  }
+
   // Git merge actions — show after coding phase completed (not in_progress/planning)
   const codingDone = ['ai_review','human_review','done'].includes(task.column) ||
     (task.column === 'in_progress' && (task.phases_selected || []).includes('coding') &&
@@ -694,6 +704,19 @@ function switchMTab(btn, tab) {
 }
 
 // ─── Run / Abort ─────────────────────────────────────────────────
+async function saveAndRun() {
+  if (!activeTaskId) return;
+  const corrections = document.getElementById('corrections-input').value.trim();
+  await eel.save_corrections(activeTaskId, corrections)();
+  await runActiveTask();
+}
+
+async function clearCorrections() {
+  if (!activeTaskId) return;
+  document.getElementById('corrections-input').value = '';
+  await eel.save_corrections(activeTaskId, '')();
+}
+
 async function runActiveTask() {
   if (!activeTaskId) return;
   const res = await eel.start_task(activeTaskId)();

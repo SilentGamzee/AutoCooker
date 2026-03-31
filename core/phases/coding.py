@@ -13,6 +13,8 @@ from core.phases.base import BasePhase
 class CodingPhase(BasePhase):
     def __init__(self, state: AppState, task: KanbanTask):
         super().__init__(state, task, "coding")
+        # Accumulated across all subtasks — updated in _execute_one_task
+        self._all_written_files: list[str] = []
 
     # ── Entry ──────────────────────────────────────────────────────
     def run(self) -> bool:
@@ -23,6 +25,7 @@ class CodingPhase(BasePhase):
         overall_ok = self._step2_execute_tasks(model)
         self._step3_readme(model)
         self._step4_tests()
+        self._step5_update_index(model)
 
         self.log("═══ CODING PHASE COMPLETE ═══")
         return overall_ok
@@ -102,6 +105,9 @@ class CodingPhase(BasePhase):
 
         def on_write_made(path: str, _content: str):
             writes_made.append(path)
+            # Track globally for index update
+            if path not in self._all_written_files:
+                self._all_written_files.append(path)
 
         confirmed: dict = {"done": False, "summary": ""}
 
@@ -129,8 +135,31 @@ class CodingPhase(BasePhase):
                 try:
                     with open(fpath, "r", encoding="utf-8", errors="replace") as _f:
                         _content = _f.read()
-                    preview = _content[:2000] + ("…(truncated)" if len(_content) > 2000 else "")
+                    PREVIEW_LIMIT = 8000
+                    if len(_content) > PREVIEW_LIMIT:
+                        preview = (
+                            _content[:PREVIEW_LIMIT]
+                            + f"\n…(TRUNCATED: {len(_content) - PREVIEW_LIMIT} chars hidden."
+                            + f" Call read_file('{f}') to see full content before using modify_file.)"
+                        )
+                    else:
+                        preview = _content
                     modify_previews += f"\n=== CURRENT CONTENT: {f} ===\n{preview}\n"
+                except Exception:
+                    pass
+
+        # Pre-read patterns_from so model sees actual existing structures
+        pattern_previews = ""
+        for f in patterns_from:
+            fpath = os.path.join(workdir, f)
+            if not os.path.isfile(fpath):
+                fpath = os.path.join(wd, f)  # fallback to project
+            if os.path.isfile(fpath):
+                try:
+                    with open(fpath, "r", encoding="utf-8", errors="replace") as _pf:
+                        _pc = _pf.read()
+                    _pp = _pc[:1500] + ("…(truncated)" if len(_pc) > 1500 else "")
+                    pattern_previews += f"\n=== PATTERN: {f} ===\n{_pp}\n"
                 except Exception:
                     pass
 
@@ -143,8 +172,9 @@ class CodingPhase(BasePhase):
             + f"\n\nFiles to MODIFY (add/change specific parts only):\n"
             + ("\n".join(f"  - {f}" for f in files_to_modify) if files_to_modify else "  (none)")
             + (f"\n{modify_previews}" if modify_previews else "")
-            + f"\n\nPattern reference files (read for coding style):\n"
-            + ("\n".join(f"  - {f}" for f in patterns_from) if patterns_from else "  (none)")
+            + f"\n\nExisting code patterns (use ONLY what you see here):\n"
+            + (pattern_previews if pattern_previews else
+               ("\n".join(f"  - {f}" for f in patterns_from) if patterns_from else "  (none)"))
             + f"\n\nCompletion condition:\n  {completion_cond}\n\n"
             f"Quality condition:\n  {subtask_dict.get('completion_with_ollama', '')}\n\n"
             "RULES:\n"
@@ -152,7 +182,11 @@ class CodingPhase(BasePhase):
             "- Files to MODIFY: you MUST use modify_file (find and replace a specific block).\n"
             "  NEVER use write_file on a file listed under MODIFY — that destroys existing code.\n"
             "  Make only the minimal targeted change needed for this subtask.\n"
-            "- Do NOT modify files not listed above.\n\n"
+            "- Do NOT modify files not listed above.\n"
+            "- Do NOT invent new classes, data structures, or API patterns that are not already\n"
+            "  present in the existing code. Only use patterns, classes, and functions you can\n"
+            "  see in the files listed above. If you reference something that does not exist,\n"
+            "  QA will catch it as a NameError/undefined variable.\n\n"
             "Procedure:\n"
             "1. Read pattern reference files to understand code style.\n"
             "2. The current content of files_to_modify is shown above — no need to read them again.\n"
@@ -204,39 +238,39 @@ class CodingPhase(BasePhase):
         self, condition: str, wd: str
     ) -> tuple[bool, str]:
         """
-        Parse simple structural conditions from completion_without_ollama.
+        Parse structural conditions from completion_without_ollama.
         Supports:
           - "File X exists"
           - "File X exists AND contains 'Y'"
           - "File X contains 'Y' AND contains 'Z'"
+          - Multiple AND contains clauses for the same file
         """
         import re
 
-        # Extract all "File X exists" patterns
-        file_exists_matches = re.findall(
-            r"[Ff]ile\s+([\w./\-_]+)\s+exists", condition
-        )
-        for fpath in file_exists_matches:
-            full = os.path.join(wd, fpath)
-            if not os.path.isfile(full):
+        # 1. Check all "File X exists" patterns
+        for fpath in re.findall(r"[Ff]ile\s+([\w./\-_]+)\s+exists", condition):
+            if not os.path.isfile(os.path.join(wd, fpath)):
                 return False, f"File does not exist: {fpath}"
 
-        # Extract all "contains 'X'" or 'contains "X"' patterns
-        contains_matches = re.findall(
-            r"[Ff]ile\s+([\w./\-_]+).*?contains\s+['\"]([^'\"]+)['\"]",
+        # 2. Find each "File X <contains block>" and check ALL needles within it.
+        #    The block captures everything after the filename that has contains clauses,
+        #    so "AND contains 'Z'" chained after the first is also caught.
+        for block in re.finditer(
+            r"[Ff]ile\s+([\w./\-_]+)((?:(?:\s+AND)?\s+contains\s+['\"][^'\"]+['\"])+)",
             condition,
-        )
-        for fpath, needle in contains_matches:
-            full = os.path.join(wd, fpath)
+        ):
+            fpath = block.group(1)
+            full  = os.path.join(wd, fpath)
             if not os.path.isfile(full):
                 return False, f"File does not exist: {fpath}"
             try:
-                with open(full, "r", encoding="utf-8", errors="replace") as f:
-                    content = f.read()
-                if needle not in content:
-                    return False, f"'{needle}' not found in {fpath}"
+                content = open(full, encoding="utf-8", errors="replace").read()
             except Exception as e:
                 return False, f"Cannot read {fpath}: {e}"
+
+            for needle in re.findall(r"contains\s+['\"]([^'\"]+)['\"]", block.group(2)):
+                if needle not in content:
+                    return False, f"'{needle}' not found in {fpath}"
 
         return True, "OK"
 
@@ -262,10 +296,68 @@ class CodingPhase(BasePhase):
 
         return True, "OK (no structural condition)"
 
-    # ── 2.3 README ────────────────────────────────────────────────
+    # ── 2.5 Update project index ───────────────────────────────────
+    def _step5_update_index(self, model: str) -> None:
+        """
+        After coding: re-describe changed/created files in the project index.
+        Works from the workdir copies (same content that will be merged).
+        """
+        self.log("─── Step 2.5: Update project index ───")
+        self.set_step("2.5 Update index")
+
+        if not self._all_written_files:
+            self.log("  No files written — skipping index update", "info")
+            return
+
+        workdir  = os.path.join(self.task.task_dir, WORKDIR_NAME)
+        wd       = self.task.project_path or self.state.working_dir
+
+        # Resolve workdir-relative paths → project-relative paths
+        # (workdir mirrors project structure)
+        project_rel_files: list[str] = []
+        for p in self._all_written_files:
+            abs_in_workdir = os.path.join(workdir, p)
+            if os.path.isfile(abs_in_workdir):
+                project_rel_files.append(p)
+
+        if not project_rel_files:
+            self.log("  No workdir files found for index update", "info")
+            return
+
+        self.log(f"  Updating index for {len(project_rel_files)} file(s)…", "info")
+
+        try:
+            from core.project_index import ProjectIndex
+            idx = ProjectIndex(wd)
+            idx.load()
+            idx.update_files(
+                changed_files=project_rel_files,
+                project_path=workdir,   # read content from workdir
+                ollama=self.ollama,
+                model=model,
+                log_fn=self.log,
+            )
+            # Validate index integrity
+            ok, issues = idx.validate(self.log)
+            if not ok:
+                for issue in issues:
+                    self.log(f"  [WARN] {issue}", "warn")
+            self.log("  ✓ Project index updated", "ok")
+        except Exception as e:
+            import traceback as _tb
+            self.log(f"  [WARN] Index update failed: {e}", "warn")
+            self.log(_tb.format_exc(), "warn")
     def _step3_readme(self, model: str) -> bool:
         self.log("─── Step 2.3: README ───")
+        project = self.task.project_path or self.state.working_dir
         workdir = os.path.join(self.task.task_dir, WORKDIR_NAME)
+
+        # Never overwrite an existing project README — only create a task-specific one
+        project_readme = os.path.join(project, "README.md")
+        if os.path.isfile(project_readme):
+            self.log("  Skipping README — project README already exists", "info")
+            return True
+
         readme_path = os.path.join(workdir, "README.md")
         executor = self._make_executor(workdir)
 
@@ -274,9 +366,11 @@ class CodingPhase(BasePhase):
             for s in self.task.subtasks
         )
         msg = (
-            f"Write a comprehensive README.md for the project.\n"
-            f"Task: {self.task.title}\n\nChanges:\n{summary}\n\n"
-            f"Write to: {os.path.relpath(readme_path, workdir)}"
+            f"Write a task-specific CHANGES.md documenting what this task changed.\n"
+            f"Task: {self.task.title}\n\nChanges made:\n{summary}\n\n"
+            f"Write to: {os.path.relpath(readme_path, workdir)}\n\n"
+            f"IMPORTANT: Do NOT write a full project README. Write only a brief changelog "
+            f"documenting what this task added or changed."
         )
         return self.run_loop(
             "2.3 README", "p7_readme.md",

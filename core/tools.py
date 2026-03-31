@@ -191,6 +191,30 @@ PLANNING_WRITE_FILE = {
     },
 }
 
+LINT_FILE = {
+    "type": "function",
+    "function": {
+        "name": "lint_file",
+        "description": (
+            "Check a file for syntax errors and undefined names. "
+            "Supports: .py (syntax + undefined names via pyflakes), "
+            ".json, .xml, .html, .css, .yaml, .js/.ts. "
+            "Returns 'OK' or a list of errors with line numbers. "
+            "Always call this after writing or modifying a file."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Relative path from the working directory root.",
+                },
+            },
+            "required": ["path"],
+        },
+    },
+}
+
 SUBMIT_QA_VERDICT = {
     "type": "function",
     "function": {
@@ -233,18 +257,12 @@ SUBMIT_QA_VERDICT = {
 # Planning: read-only access to project + write ONLY to task planning directory.
 # MODIFY_FILE is intentionally excluded — no reason to modify project files during planning.
 PLANNING_TOOLS = [READ_FILE, LIST_DIRECTORY, PLANNING_WRITE_FILE, CREATE_TASK]
-CODING_TOOLS   = [READ_FILE, LIST_DIRECTORY, WRITE_FILE, MODIFY_FILE, CONFIRM_TASK_DONE]
+CODING_TOOLS   = [READ_FILE, LIST_DIRECTORY, WRITE_FILE, MODIFY_FILE, LINT_FILE, CONFIRM_TASK_DONE]
 
 # QA Reviewer: strictly read-only — it evaluates, never writes project files.
-# Uses SUBMIT_QA_VERDICT to signal the result.
-QA_REVIEWER_TOOLS = [READ_FILE, LIST_DIRECTORY, SUBMIT_QA_VERDICT]
-
-# QA Fixer: write access to fix issues found by the reviewer.
-# Does NOT have SUBMIT_QA_VERDICT — only the reviewer emits verdicts.
-QA_FIXER_TOOLS = [READ_FILE, LIST_DIRECTORY, WRITE_FILE, MODIFY_FILE]
-
-# Legacy alias kept for any external references
-QA_TOOLS = QA_REVIEWER_TOOLS
+QA_REVIEWER_TOOLS = [READ_FILE, LIST_DIRECTORY, LINT_FILE, SUBMIT_QA_VERDICT]
+QA_FIXER_TOOLS    = [READ_FILE, LIST_DIRECTORY, WRITE_FILE, MODIFY_FILE, LINT_FILE]
+QA_TOOLS          = QA_REVIEWER_TOOLS
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -297,6 +315,7 @@ class ToolExecutor:
             "list_directory":    self._list_directory,
             "write_file":        self._write_file,
             "modify_file":       self._modify_file,
+            "lint_file":         self._lint_file,
             "confirm_task_done": self._confirm_task_done,
             "create_task":       self._create_task,
             "submit_qa_verdict": self._submit_qa_verdict,
@@ -457,6 +476,19 @@ class ToolExecutor:
         preview = content[:300] + ("…" if len(content) > 300 else "")
         self.log_fn('[Tool ►] read_file({"path": "' + path_rel + '"})', "tool_read")
         self.log_fn(f"[Tool ◄] {preview}", "tool_result")
+
+    def _lint_file(self, args: dict) -> str:
+        from core.linter import lint_file
+        path_raw = args.get("path", "")
+        try:
+            abs_path = self._safe_path(path_raw)
+        except PermissionError as e:
+            return f"ERROR: {e}"
+        ok, message = lint_file(abs_path)
+        rel = self._to_rel(abs_path)
+        if ok:
+            return f"lint_file OK: {rel} — {message}"
+        return f"lint_file ERRORS in {rel}:\n{message}"
 
     def _confirm_task_done(self, args: dict) -> str:
         task_id = args.get("task_id", "")

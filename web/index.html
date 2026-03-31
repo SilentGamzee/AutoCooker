@@ -219,6 +219,20 @@
           <button class="btn-secondary" onclick="moveTaskModal('queue')">→ Queue</button>
           <button class="btn-secondary" onclick="moveTaskModal('done')">→ Done</button>
         </div>
+
+        <!-- Corrections panel (shown when task is done or in human_review) -->
+        <div class="corrections-panel hidden" id="corrections-panel">
+          <div class="corrections-label">
+            <span>✏ Правки для следующего запуска</span>
+            <span class="corrections-hint">Опишите что нужно изменить — Planning/Coding выполнится только для указанных правок</span>
+          </div>
+          <textarea id="corrections-input" class="corrections-textarea"
+            placeholder="Например: в файле app.js функция renderCard неправильно считает прогресс, нужно использовать subtask_progress вместо progress…"></textarea>
+          <div class="corrections-actions">
+            <button class="btn-ghost btn-sm" onclick="clearCorrections()">Очистить</button>
+            <button class="btn-primary btn-sm" onclick="saveAndRun()">💾 Сохранить и запустить</button>
+          </div>
+        </div>
         <div class="ov-git-actions hidden" id="ov-git-actions">
           <div class="ov-git-label">Workdir ready to merge into <code id="ov-git-branch">main</code></div>
           <div class="ov-git-btns">

@@ -1,6 +1,8 @@
 """Ollama API client with tool-calling support."""
 from __future__ import annotations
 import json
+import sys
+import traceback
 import requests
 from typing import Callable, Optional
 
@@ -8,6 +10,45 @@ from typing import Callable, Optional
 class OllamaClient:
     def __init__(self, base_url: str = "http://localhost:11434"):
         self.base_url = base_url.rstrip("/")
+
+    # ------------------------------------------------------------------
+    def complete(self, model: str, prompt: str, max_tokens: int = 1500) -> str:
+        """Single-turn completion. Used by ProjectIndex for batch file descriptions."""
+        try:
+            resp = requests.post(
+                f"{self.base_url}/api/generate",
+                json={
+                    "model": model, "prompt": prompt, "stream": False,
+                    "options": {"temperature": 0.1, "num_predict": max_tokens},
+                },
+                timeout=(10, 60),
+            )
+            resp.raise_for_status()
+            return resp.json().get("response", "")
+        except Exception as e:
+            print(f"[OllamaClient.complete] failed: {e}", flush=True)
+            return ""
+
+    def complete_vision(
+        self, model: str, prompt: str,
+        image_b64: str, mime_type: str = "image/png", max_tokens: int = 200,
+    ) -> str:
+        """Vision completion for image description (llava, bakllava, etc.)."""
+        try:
+            resp = requests.post(
+                f"{self.base_url}/api/generate",
+                json={
+                    "model": model, "prompt": prompt, "images": [image_b64],
+                    "stream": False,
+                    "options": {"temperature": 0.1, "num_predict": max_tokens},
+                },
+                timeout=(10, 60),
+            )
+            resp.raise_for_status()
+            return resp.json().get("response", "")
+        except Exception as e:
+            print(f"[OllamaClient.complete_vision] failed: {e}", flush=True)
+            return ""
 
     # ------------------------------------------------------------------
     def list_models(self) -> list[str]:
@@ -92,16 +133,19 @@ class OllamaClient:
                 log_fn(f"[Ollama] Sending request (round {_round + 1})…")
 
             try:
-                resp = requests.post(
+                payload["stream"] = False  # важно для Ollama chat
+                s = requests.Session()
+                s.trust_env = True  # игнорировать HTTP_PROXY / HTTPS_PROXY из окружения
+                resp = s.post(
                     f"{self.base_url}/api/chat",
                     json=payload,
-                    timeout=900,
+                    timeout=(10, 30),  # отдельно connect и read
                 )
                 resp.raise_for_status()
-            except requests.Timeout:
-                raise RuntimeError("Ollama request timed out (900 s)")
-            except requests.RequestException as e:
-                raise RuntimeError(f"Ollama request failed: {e}")
+            except BaseException as e:
+                print(f"\n[Ollama] Request failed ({type(e).__name__}): {e!r}", flush=True)
+                traceback.print_exc(file=sys.stdout)
+                raise
 
             data = resp.json()
             message = data.get("message", {})

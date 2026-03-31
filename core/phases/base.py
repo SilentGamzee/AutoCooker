@@ -63,7 +63,16 @@ class BasePhase:
                 + cache.paths_summary() + "\n```"
             )
         if cache.file_contents:
-            parts.append("\n\n---\n## Cached file contents\n" + cache.contents_summary())
+            summary = cache.contents_summary()
+            # Hard cap: Qwen 9B degrades badly past ~6-8k tokens in context.
+            # Cached file contents can easily exceed that if many files were read.
+            CONTENT_SUMMARY_LIMIT = 4000
+            if len(summary) > CONTENT_SUMMARY_LIMIT:
+                summary = (
+                    summary[:CONTENT_SUMMARY_LIMIT]
+                    + "\n…(truncated — use read_file to see remaining files)"
+                )
+            parts.append("\n\n---\n## Cached file contents\n" + summary)
         # Include only last 10 task logs so the context doesn't grow unboundedly
         recent_logs = self.task.logs[-10:]
         if recent_logs:
@@ -210,11 +219,21 @@ class BasePhase:
                 else:
                     retry_msg += "No files written to disk yet.\n\n"
 
-                retry_msg += (
-                    "ACTION REQUIRED: Call write_file now with the COMPLETE corrected "
-                    "content that includes ALL required fields in one single write. "
-                    "Describing the fix in text does nothing — you must call the tool."
-                )
+                has_modify_only = bool(getattr(executor, "modify_only_files", set()))
+                if has_modify_only:
+                    retry_msg += (
+                        "ACTION REQUIRED: Some files are modify-only — do NOT use write_file "
+                        "on them (it will be blocked). Instead:\n"
+                        "1. Call read_file to see the current full content.\n"
+                        "2. Call modify_file with exact old_text → new_text.\n"
+                        "For new files (files_to_create), use write_file as normal."
+                    )
+                else:
+                    retry_msg += (
+                        "ACTION REQUIRED: Call write_file now with the COMPLETE corrected "
+                        "content that includes ALL required fields in one single write. "
+                        "Describing the fix in text does nothing — you must call the tool."
+                    )
                 messages.append({"role": "user", "content": retry_msg})
 
         self.log(

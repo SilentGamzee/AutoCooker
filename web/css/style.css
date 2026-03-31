@@ -1413,3 +1413,56 @@ html, body {
   text-align: center;
 }
 
+
+/* ── CORRECTIONS PANEL ───────────────────────────────────── */
+.corrections-panel {
+  margin-top: 16px;
+  background: rgba(245,158,11,.06);
+  border: 1px solid rgba(245,158,11,.25);
+  border-radius: var(--r8);
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.corrections-label {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.corrections-label > span:first-child {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--yellow);
+}
+
+.corrections-hint {
+  font-size: 11px !important;
+  color: var(--text3) !important;
+  font-weight: 400 !important;
+}
+
+.corrections-textarea {
+  background: var(--bg3);
+  border: 1px solid var(--border2);
+  border-radius: var(--r6);
+  color: var(--text);
+  font: 12px/1.6 var(--font);
+  padding: 10px 12px;
+  resize: vertical;
+  min-height: 80px;
+  max-height: 200px;
+  width: 100%;
+  outline: none;
+  transition: border-color 0.15s;
+}
+.corrections-textarea:focus { border-color: var(--yellow); }
+.corrections-textarea::placeholder { color: var(--text3); }
+
+.corrections-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}

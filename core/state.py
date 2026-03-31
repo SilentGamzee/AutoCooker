@@ -138,6 +138,12 @@ class KanbanTask:
     has_errors: bool = False
     tags: list[str] = field(default_factory=list)
     phases_selected: list[str] = field(default_factory=lambda: ["planning", "coding", "qa"])
+    # Human corrections for re-run (set from UI when task is done/human_review)
+    corrections: str = ""
+    # Iteration limit: pipeline re-runs up to this many times if QA fails
+    max_iterations: int = 3
+    # Which iteration we are currently on (1-based, updated at runtime)
+    current_iteration: int = 0
 
     def to_dict(self) -> dict:
         return {
@@ -154,6 +160,9 @@ class KanbanTask:
             "progress": self.progress,
             "has_errors": self.has_errors, "tags": self.tags,
             "phases_selected": self.phases_selected,
+            "corrections": self.corrections,
+            "max_iterations": self.max_iterations,
+            "current_iteration": self.current_iteration,
         }
 
     def to_dict_ui(self) -> dict:
@@ -170,6 +179,7 @@ class KanbanTask:
         ts = time.strftime("%H:%M:%S")
         t = log_type or LogEntry.classify(msg)
         self.logs.append({"ts": ts, "phase": phase, "type": t, "msg": msg})
+        print(f"[{ts}][{phase}][{t}] {msg}", flush=True)
         self.updated_at = time.strftime("%Y-%m-%dT%H:%M:%S")
 
     def subtask_progress(self) -> int:
@@ -272,6 +282,9 @@ class AppState:
                     has_errors=d.get("has_errors", False),
                     tags=d.get("tags", []),
                     phases_selected=d.get("phases_selected", ["planning", "coding", "qa"]),
+                    corrections=d.get("corrections", ""),
+                    max_iterations=d.get("max_iterations", 3),
+                    current_iteration=d.get("current_iteration", 0),
                 )
                 self.load_logs_for_task(t)
                 self.kanban_tasks.append(t)
@@ -349,8 +362,9 @@ class AppState:
 
     # ── Board view ───────────────────────────────────────────────
     def kanban_board(self) -> dict:
+        """Return slim task dicts for the board — no file_contents, no full logs."""
         board: dict[str, list] = {col: [] for col in COLUMNS}
         for t in self.kanban_tasks:
             col = t.column if t.column in COLUMNS else "planning"
-            board[col].append(t.to_dict())
+            board[col].append(t.to_dict_ui())   # excludes file_contents
         return board

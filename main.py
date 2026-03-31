@@ -10,6 +10,8 @@ import sys
 import threading
 import time
 import traceback
+import faulthandler
+faulthandler.enable()
 
 # Force unbuffered stdout/stderr so errors appear immediately on Windows
 sys.stdout.reconfigure(line_buffering=True)
@@ -57,15 +59,43 @@ def _push_board():
     try:
         eel.board_updated(STATE.kanban_board())
     except Exception as _e:
-        print(f"[WARN] _push_board: {_e}", flush=True)
+        print(f"[WARN] _push_board failed: {_e}", flush=True)
+        traceback.print_exc()
 
 
 def _push_task(task: KanbanTask):
-    STATE._save_kanban()
     try:
+        STATE._save_kanban()
         eel.task_updated(task.to_dict_ui())
     except Exception as _e:
-        print(f"[WARN] _push_task: {_e}", flush=True)
+        print(f"[WARN] _push_task failed: {_e}", flush=True)
+        traceback.print_exc()
+
+
+def _format_qa_as_corrections(
+    qa_issues: list[str], task_title: str, task_description: str
+) -> str:
+    """
+    Format QA failure issues into a structured corrections string
+    that patch-planning can use to update the implementation plan.
+    """
+    lines = [
+        "QA FAILED — the implemented changes did not fully satisfy the task.",
+        f"Task: {task_title}",
+        f"Original description: {task_description[:300]}",
+        "",
+        f"Issues found ({len(qa_issues)}):",
+    ]
+    for i, issue in enumerate(qa_issues, 1):
+        lines.append(f"  {i}. {issue}")
+    lines += [
+        "",
+        "INSTRUCTIONS FOR PATCH PLANNING:",
+        "- Do NOT redo subtasks that are already correct.",
+        "- Add or update ONLY the subtasks needed to fix the issues listed above.",
+        "- Each new subtask must directly address a specific issue from the list.",
+    ]
+    return "\n".join(lines)
 
 
 # ─── Eel API ──────────────────────────────────────────────────────
@@ -127,6 +157,7 @@ def add_task(cfg: dict) -> dict:
         created_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
         updated_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
         phases_selected=cfg.get("phases", ["planning", "coding", "qa"]),
+        max_iterations=int(cfg.get("max_iterations", 3)),
     )
     STATE.add_task(task)
     _push_board()
@@ -155,8 +186,20 @@ def move_task(task_id: str, column: str) -> dict:
 
 
 @eel.expose
+def save_corrections(task_id: str, corrections: str) -> dict:
+    """Save human corrections text for a task before re-running."""
+    task = STATE.get_task(task_id)
+    if not task:
+        return {"ok": False, "error": "Task not found"}
+    task.corrections = corrections.strip()
+    STATE._save_kanban()
+    return {"ok": True}
+
+
+@eel.expose
 def start_task(task_id: str) -> dict:
     """Run the pipeline for a task in a background thread."""
+    print("[MAIN] start_task:", task_id, flush=True)
     task = STATE.get_task(task_id)
     if not task:
         return {"ok": False, "error": "Task not found"}
@@ -179,55 +222,107 @@ def start_task(task_id: str) -> dict:
         _push_board()
         _push_task(task)
 
-        phases = task.phases_selected or ["planning", "coding", "qa"]
+        phases      = task.phases_selected or ["planning", "coding", "qa"]
+        max_iter    = max(1, task.max_iterations or 3)
+        has_qa      = "qa" in phases
+        final_passed = not has_qa  # if no QA phase, consider it passed by default
 
         try:
-            # Init task dir if needed
             if not task.task_dir:
                 STATE.init_task_dir(task)
 
-            if "planning" in phases:
-                task.column = "in_progress"
-                task.add_log("═══ Starting Pipeline ═══", "system", "phase_header")
+            for iteration in range(1, max_iter + 1):
+                task.current_iteration = iteration
+
+                if iteration == 1 and task.corrections:
+                    task.add_log("═══ Starting Pipeline (with corrections) ═══", "system", "phase_header")
+                    task.add_log(f"  Corrections: {task.corrections[:200]}", "system", "info")
+                elif iteration == 1:
+                    task.add_log("═══ Starting Pipeline ═══", "system", "phase_header")
+                else:
+                    task.add_log(
+                        f"═══ Iteration {iteration}/{max_iter} — QA failed, retrying ═══",
+                        "system", "phase_header",
+                    )
                 _push_task(task)
-                ok = PlanningPhase(STATE, task).run()
-                if not ok:
-                    task.column = "human_review"
-                    task.has_errors = True
-                    task.tags = list(set(task.tags + ["Has Errors"]))
+
+                # ── Planning ──────────────────────────────────────
+                if "planning" in phases:
+                    task.column = "in_progress"
                     _push_task(task)
-                    _push_board()
-                    STATE.active_task_id = ""
-                    return
-                task.tags = list(set(tag for tag in task.tags if tag != "Has Errors"))
+                    ok = PlanningPhase(STATE, task).run()
+                    if not ok:
+                        task.column     = "human_review"
+                        task.has_errors = True
+                        task.tags       = list(set(task.tags + ["Has Errors"]))
+                        _push_task(task)
+                        _push_board()
+                        STATE.active_task_id = ""
+                        return
+                    task.tags = [t for t in task.tags if t != "Has Errors"]
 
-            if "coding" in phases:
-                CodingPhase(STATE, task).run()
+                # ── Coding ────────────────────────────────────────
+                if "coding" in phases:
+                    CodingPhase(STATE, task).run()
 
-            if "qa" in phases:
-                QAPhase(STATE, task).run()
+                # ── QA ────────────────────────────────────────────
+                if has_qa:
+                    qa_passed, qa_issues = QAPhase(STATE, task).run()
+                    final_passed = qa_passed
 
-            # Determine final column
-            if task.has_errors:
-                task.column = "human_review"
-                task.tags = list(set(task.tags + ["Needs Review", "Has Errors"]))
+                    if qa_passed:
+                        task.add_log(
+                            f"  ✓ QA passed on iteration {iteration}/{max_iter}",
+                            "system", "ok",
+                        )
+                        break  # success — exit iteration loop
+
+                    # QA failed
+                    if iteration < max_iter:
+                        # Format QA issues as corrections for the next patch iteration
+                        task.corrections = _format_qa_as_corrections(
+                            qa_issues, task.title, task.description
+                        )
+                        task.add_log(
+                            f"  QA failed ({len(qa_issues)} issue(s)) "
+                            f"— starting iteration {iteration + 1}/{max_iter}",
+                            "system", "warn",
+                        )
+                        _push_task(task)
+                        # Continue to next iteration (planning will run in patch mode)
+                    else:
+                        task.add_log(
+                            f"  QA failed after {max_iter} iteration(s) "
+                            f"— escalating to human review",
+                            "system", "error",
+                        )
+                else:
+                    # No QA phase — single pass only
+                    break
+
+            # ── Final status ──────────────────────────────────────
+            if task.has_errors or not final_passed:
+                task.column   = "human_review"
+                task.has_errors = True
+                task.tags     = list(set(task.tags + ["Needs Review", "Has Errors"]))
             else:
-                task.column = "done"
-                task.tags = list(set(tag for tag in task.tags if tag not in ("Has Errors", "Needs Review")))
+                task.column   = "done"
+                task.tags     = [t for t in task.tags if t not in ("Has Errors", "Needs Review")]
                 task.tags.append("Complete")
                 task.progress = 100
+                task.corrections = ""
 
         except TaskAbortedError:
             task.add_log("■ Task aborted by user", "system", "warn")
             task.column = "human_review"
-            task.tags = list(set(task.tags + ["Aborted"]))
+            task.tags   = list(set(task.tags + ["Aborted"]))
         except Exception:
             err = traceback.format_exc()
             print(f"\n[PIPELINE ERROR] Task {task_id}:\n{err}", flush=True)
             task.add_log(f"[PIPELINE ERROR]\n{err}", "system", "error")
-            task.column = "human_review"
+            task.column     = "human_review"
             task.has_errors = True
-            task.tags = list(set(task.tags + ["Has Errors"]))
+            task.tags       = list(set(task.tags + ["Has Errors"]))
         finally:
             try:
                 _push_task(task)
@@ -491,5 +586,6 @@ if __name__ == "__main__":
     print(f"Ollama Project Planner  |  web: {WEB_DIR}")
     try:
         eel.start("index.html", size=(1400, 900), port=8765, block=True)
-    except (SystemExit, KeyboardInterrupt):
-        pass
+    except BaseException as e:
+        print(f"[ERROR] Failed to start Eel server: {e}", flush=True)
+        traceback.print_exc()

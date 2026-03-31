@@ -13,6 +13,7 @@ from core.validator import (
     validate_json_file,
     validate_subtasks,
 )
+from core.project_index import ProjectIndex
 from core.phases.base import BasePhase
 
 
@@ -168,21 +169,44 @@ class PlanningPhase(BasePhase):
         self.state.cache.update_file_paths(wd)
         self.log(f"  Scanned {len(self.state.cache.file_paths)} project files", "info")
 
-        steps = [
-            ("1.1 Discovery",       self._step1_discovery),
-            ("1.2 Requirements",    self._step2_requirements),
-            ("1.3 Spec",            self._step3_spec),
-            ("1.4 Critique",        self._step4_critique),
-            ("1.5 Impl Plan",       self._step5_impl_plan),
-            ("1.6 Load Subtasks",   self._step6_load_subtasks),
-            ("1.7 Prepare Workdir", self._step7_prepare_workdir),
-        ]
+        # ── Step 1.0: Build/update project index (no Ollama round-trip per file) ──
+        self._project_index = ProjectIndex(wd)
+        self.log("─── Step 1.0: Project index pre-scan ───")
+        try:
+            self._project_index.scan_and_update(
+                ollama=self.ollama,
+                model=model,
+                log_fn=self.log,
+            )
+        except Exception as e:
+            import traceback as _tb
+            self.log(f"  [WARN] Index pre-scan failed: {e} — continuing without index", "warn")
+            self.log(_tb.format_exc(), "warn")
+            self._project_index = None
+
+        # If corrections exist and subtasks already exist → patch mode
+        if self.task.corrections and self.task.subtasks:
+            self.log(f"  Patch mode: applying corrections to existing plan", "info")
+            steps = [
+                ("1.5 Patch Plan",    self._step5_patch_plan),
+                ("1.6 Load Subtasks", self._step6_load_subtasks),
+                ("1.7 Prepare Workdir", self._step7_prepare_workdir),
+            ]
+        else:
+            steps = [
+                ("1.1 Discovery",       self._step1_discovery),
+                ("1.2 Requirements",    self._step2_requirements),
+                ("1.3 Spec",            self._step3_spec),
+                ("1.4 Critique",        self._step4_critique),
+                ("1.5 Impl Plan",       self._step5_impl_plan),
+                ("1.6 Load Subtasks",   self._step6_load_subtasks),
+                ("1.7 Prepare Workdir", self._step7_prepare_workdir),
+            ]
 
         for name, fn in steps:
             self.log(f"─── Step {name} ───")
             ok = fn(model)
             if not ok:
-                # 1.4 Critique failure is non-fatal (fixes are applied inside)
                 if "Critique" in name:
                     self.log(f"[WARN] Step {name} had issues but spec was fixed", "warn")
                 else:
@@ -200,25 +224,47 @@ class PlanningPhase(BasePhase):
 
         executor = self._make_planning_executor(wd)
 
-        # Provide upfront file list so model doesn't spend rounds listing directories
-        known_paths = "\n".join(
-            f"  {p}" for p in self.state.cache.file_paths[:50]
-            if not p.startswith(".tasks") and not p.startswith(".git")
-        ) or "  (none scanned yet)"
+        # ── Build context from semantic index ─────────────────────
+        if self._project_index and self._project_index.data:
+            # Score all files by relevance to the task description
+            task_text = f"{self.task.title} {self.task.description}"
+            ranked = self._project_index.get_relevant_files(task_text, top_n=30)
+
+            relevant_files = [r for r, _ in ranked]
+
+            index_summary = self._project_index.format_for_prompt(relevant_files)
+            file_context_msg = (
+                f"PROJECT INDEX (files ranked by relevance to this task):\n"
+                f"Format: path | description | symbols | imports\n\n"
+                f"{index_summary}\n\n"
+                f"These are the {len(relevant_files)} most relevant files. "
+                f"Use read_file to get the full content of the ones you need.\n"
+                f"Dependencies (used_by/imports) in the index show what else may be affected."
+            )
+            self.log(f"  Using index: {len(relevant_files)} relevant files identified", "info")
+        else:
+            # Fallback: raw file list (index not available)
+            known_paths = "\n".join(
+                f"  {p}" for p in self.state.cache.file_paths[:50]
+                if not p.startswith(".tasks") and not p.startswith(".git")
+            ) or "  (none scanned yet)"
+            file_context_msg = (
+                f"Project files (read them directly — no need to list_directory):\n"
+                f"{known_paths}\n\n"
+                f"IMPORTANT: Do NOT explore the .tasks/ directory."
+            )
+            self.log("  Index not available — using raw file list", "warn")
 
         msg = (
             f"Project directory: {wd}\n"
             f"Task: {self.task.title}\n"
             f"Task description: {self.task.description}\n\n"
-            f"Project files (read them directly — no need to list_directory):\n"
-            f"{known_paths}\n\n"
-            f"IMPORTANT: Do NOT explore the .tasks/ directory — it contains "
-            f"other tasks' planning artifacts unrelated to this task.\n\n"
+            f"{file_context_msg}\n\n"
             f"Write project_index.json to this EXACT path: {self._rel(proj_index_path)}\n"
             f"Write context.json to this EXACT path: {self._rel(context_path)}\n\n"
-            "Read 3-5 source files most relevant to the task description, "
+            "Read the most relevant source files to understand the codebase, "
             "then write both output files immediately. "
-            "Do not read every file — focus only on what is relevant."
+            "Focus only on files relevant to the task — do not read everything."
         )
 
         def validate():
@@ -379,6 +425,56 @@ class PlanningPhase(BasePhase):
             PLANNING_TOOLS, executor, msg, validate, model,
         )
 
+    # ── 1.5b Patch plan (corrections mode) ───────────────────────
+    def _step5_patch_plan(self, model: str) -> bool:
+        """
+        Re-plan only for the corrections the human provided.
+        Keeps done subtasks intact, adds/modifies only what corrections require.
+        """
+        wd       = self.task.project_path or self.state.working_dir
+        plan_path = os.path.join(self.task.task_dir, "implementation_plan.json")
+        spec_path = os.path.join(self.task.task_dir, "spec.md")
+
+        spec_content = self._read_file_safe(spec_path)
+        existing_plan = self._read_file_safe(plan_path)
+
+        # Show which subtasks are already done
+        done_ids = [s["id"] for s in self.task.subtasks if s.get("status") == "done"]
+        pending_ids = [s["id"] for s in self.task.subtasks if s.get("status") != "done"]
+        subtask_summary = "\n".join(
+            f"  [{s.get('status','?').upper()}] {s['id']}: {s.get('title','')}"
+            for s in self.task.subtasks
+        )
+
+        existing_files = "\n".join(
+            f"  {p}" for p in self.state.cache.file_paths[:60]
+            if not p.startswith(".tasks") and not p.startswith(".git")
+        )
+
+        executor = self._make_planning_executor(wd)
+        msg = (
+            f"CORRECTIONS TO APPLY:\n{self.task.corrections}\n\n"
+            f"Original spec:\n{spec_content[:1000]}\n\n"
+            f"Existing subtask statuses:\n{subtask_summary}\n\n"
+            f"Existing implementation_plan.json:\n{existing_plan[:2000]}\n\n"
+            f"Project files (valid for files_to_modify):\n{existing_files}\n\n"
+            f"Write updated implementation_plan.json to: {self._rel(plan_path)}\n\n"
+            "RULES:\n"
+            "1. Keep all subtasks with status='done' EXACTLY as they are.\n"
+            "2. For pending subtasks: update them if the corrections affect them.\n"
+            "3. Add NEW subtasks only for corrections that are not covered by existing subtasks.\n"
+            "4. Do NOT re-do work already marked done — only add/fix what the corrections require.\n"
+            "5. files_to_modify must only contain paths from the project files list above.\n"
+        )
+
+        def validate():
+            return _validate_impl_plan(plan_path, project_path=wd)
+
+        return self.run_loop(
+            "1.5 Patch Plan", "p5_impl_plan.md",
+            PLANNING_TOOLS, executor, msg, validate, model,
+        )
+
     # ── 1.6 Load subtasks ─────────────────────────────────────────
     def _step6_load_subtasks(self, _model: str) -> bool:
         """Convert implementation_plan.json → task.subtasks."""
@@ -400,7 +496,8 @@ class PlanningPhase(BasePhase):
                     "files_to_create": s.get("files_to_create", []),
                     "files_to_modify": s.get("files_to_modify", []),
                     "patterns_from":   s.get("patterns_from", []),
-                    "status": "pending",
+                    # Preserve status from JSON (patch mode keeps "done" subtasks intact)
+                    "status": s.get("status", "pending"),
                 })
 
         self.task.subtasks = subtasks
@@ -438,11 +535,15 @@ class PlanningPhase(BasePhase):
                 if path:
                     to_copy.add(path)
 
-        copied, missing = [], []
+        copied, missing, skipped = [], [], []
         for rel_path in sorted(to_copy):
             src_file  = os.path.join(project, rel_path)
             dest_file = os.path.join(workdir, rel_path)
-            if os.path.isfile(src_file):
+            if os.path.isfile(dest_file):
+                # File already exists in workdir (from a previous iteration) — keep it
+                skipped.append(rel_path)
+                self.log(f"  ↷ kept existing workdir/{rel_path}", "info")
+            elif os.path.isfile(src_file):
                 os.makedirs(os.path.dirname(dest_file), exist_ok=True)
                 shutil.copy2(src_file, dest_file)
                 copied.append(rel_path)
@@ -452,7 +553,9 @@ class PlanningPhase(BasePhase):
                 self.log(f"  ✗ not found in project: {rel_path}", "warn")
 
         self.log(
-            f"  Workdir ready: {len(copied)} copied, {len(missing)} not found",
+            f"  Workdir ready: {len(copied)} copied, "
+            f"{len(skipped)} kept from prior iteration, "
+            f"{len(missing)} not found",
             "ok" if not missing else "warn",
         )
         return True   # missing files are warned but don't block coding
