@@ -7,6 +7,7 @@ import eel
 
 from core.state import AppState, KanbanTask, TaskAbortedError
 from core.ollama_client import OllamaClient
+from core.tools import ToolExecutor
 
 PROMPTS_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "prompts")
 
@@ -116,7 +117,7 @@ class BasePhase:
         return "\n\n".join(parts)
 
     # ── Executor factory ─────────────────────────────────────────
-    def _make_executor(self, wd: str, **kwargs) -> "ToolExecutor":
+    def _make_executor(self, wd: str, **kwargs) -> ToolExecutor:
         """
         Create a ToolExecutor pre-wired with:
         - the global FileCache (path index)

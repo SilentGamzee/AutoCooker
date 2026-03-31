@@ -314,7 +314,7 @@ def _lint_js(abs_path: str) -> tuple[bool, str]:
         try:
             result = subprocess.run(
                 ["tsc", "--noEmit", "--skipLibCheck", abs_path],
-                capture_output=True, text=True, timeout=30,
+                capture_output=True, text=True, timeout=900,
             )
             if result.returncode != 0:
                 output = (result.stdout + result.stderr).strip()

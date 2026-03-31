@@ -139,7 +139,7 @@ class OllamaClient:
                 resp = s.post(
                     f"{self.base_url}/api/chat",
                     json=payload,
-                    timeout=(10, 30),  # отдельно connect и read
+                    timeout=(900, 900),  # отдельно connect и read
                 )
                 resp.raise_for_status()
             except BaseException as e:
