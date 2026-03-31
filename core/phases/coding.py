@@ -163,7 +163,31 @@ class CodingPhase(BasePhase):
                 except Exception:
                     pass
 
+        # Build summary of already-completed subtasks so the model knows
+        # what was already written and avoids duplicating or conflicting work.
+        completed_summary = "\n".join(
+            "  ✓ {id}: {title}{files}".format(
+                id=s["id"],
+                title=s.get("title", ""),
+                files=(
+                    " → " + ", ".join(
+                        s.get("files_to_modify", []) + s.get("files_to_create", [])
+                    )
+                    if s.get("files_to_modify") or s.get("files_to_create") else ""
+                ),
+            )
+            for s in self.task.subtasks
+            if s.get("status") == "done"
+        )
+
         msg = (
+            (
+                f"=== ALREADY COMPLETED IN THIS SESSION ===\n"
+                f"{completed_summary}\n"
+                f"Do NOT re-implement anything listed above. Build on top of it.\n"
+                f"==========================================\n\n"
+            ) if completed_summary else ""
+        ) + (
             f"Subtask ID: {sid}\n"
             f"Title: {title}\n\n"
             f"Description:\n{subtask_dict.get('description', '')}\n\n"

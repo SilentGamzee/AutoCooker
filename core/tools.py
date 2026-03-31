@@ -191,6 +191,37 @@ PLANNING_WRITE_FILE = {
     },
 }
 
+READ_FILE_RANGE = {
+    "type": "function",
+    "function": {
+        "name": "read_file_range",
+        "description": (
+            "Read only a specific line range from a file. "
+            "Use this instead of read_file when working with large files (>200 lines) "
+            "and you only need a specific function or section. "
+            "Returns the requested lines with 1-based line numbers as a prefix."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Relative path from the working directory root.",
+                },
+                "start_line": {
+                    "type": "integer",
+                    "description": "First line to return (1-based).",
+                },
+                "end_line": {
+                    "type": "integer",
+                    "description": "Last line to return (1-based). Use -1 to read to end of file.",
+                },
+            },
+            "required": ["path", "start_line", "end_line"],
+        },
+    },
+}
+
 LINT_FILE = {
     "type": "function",
     "function": {
@@ -257,11 +288,11 @@ SUBMIT_QA_VERDICT = {
 # Planning: read-only access to project + write ONLY to task planning directory.
 # MODIFY_FILE is intentionally excluded — no reason to modify project files during planning.
 PLANNING_TOOLS = [READ_FILE, LIST_DIRECTORY, PLANNING_WRITE_FILE, CREATE_TASK]
-CODING_TOOLS   = [READ_FILE, LIST_DIRECTORY, WRITE_FILE, MODIFY_FILE, LINT_FILE, CONFIRM_TASK_DONE]
+CODING_TOOLS   = [READ_FILE, READ_FILE_RANGE, LIST_DIRECTORY, WRITE_FILE, MODIFY_FILE, LINT_FILE, CONFIRM_TASK_DONE]
 
 # QA Reviewer: strictly read-only — it evaluates, never writes project files.
-QA_REVIEWER_TOOLS = [READ_FILE, LIST_DIRECTORY, LINT_FILE, SUBMIT_QA_VERDICT]
-QA_FIXER_TOOLS    = [READ_FILE, LIST_DIRECTORY, WRITE_FILE, MODIFY_FILE, LINT_FILE]
+QA_REVIEWER_TOOLS = [READ_FILE, READ_FILE_RANGE, LIST_DIRECTORY, LINT_FILE, SUBMIT_QA_VERDICT]
+QA_FIXER_TOOLS    = [READ_FILE, READ_FILE_RANGE, LIST_DIRECTORY, WRITE_FILE, MODIFY_FILE, LINT_FILE]
 QA_TOOLS          = QA_REVIEWER_TOOLS
 
 
@@ -312,6 +343,7 @@ class ToolExecutor:
     def __call__(self, tool_name: str, args: dict) -> str:
         dispatch = {
             "read_file":         self._read_file,
+            "read_file_range":   self._read_file_range,
             "list_directory":    self._list_directory,
             "write_file":        self._write_file,
             "modify_file":       self._modify_file,
@@ -381,6 +413,37 @@ class ToolExecutor:
             return content
         except Exception as e:
             return f"ERROR reading file: {e}"
+
+    def _read_file_range(self, args: dict) -> str:
+        path_raw   = args.get("path", "")
+        start_line = int(args.get("start_line", 1))
+        end_line   = int(args.get("end_line", -1))
+        abs_path   = self._safe_path(path_raw)
+
+        validation = self._validate_path(abs_path, "read")
+        if validation != "OK":
+            return validation
+
+        if not os.path.isfile(abs_path):
+            return f"ERROR: File not found: {path_raw}"
+        try:
+            with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
+                all_lines = f.readlines()
+
+            total = len(all_lines)
+            start = max(0, start_line - 1)          # convert to 0-based
+            end   = total if end_line == -1 else min(end_line, total)
+
+            selected = all_lines[start:end]
+            # Prefix each line with its 1-based number for easy old_text targeting
+            result = "".join(
+                f"{start + i + 1:4d}\t{line}"
+                for i, line in enumerate(selected)
+            )
+            header = f"[Lines {start + 1}–{start + len(selected)} of {total} total]\n"
+            return header + result
+        except Exception as e:
+            return f"ERROR reading file range: {e}"
 
     def _list_directory(self, args: dict) -> str:
         path_rel = args.get("path", "")

@@ -121,7 +121,41 @@ The description must answer ALL of these:
 3. **`description` must specify exact class/function names** — not "add the relevant code"
 4. **`patterns_from` must reference files that actually exist** (from context.json)
 5. **NEVER create a subtask that is only about validation or testing** unless tests are explicitly in the task requirements
-6. **Number of subtasks must match the complexity**: Simple → 1-3, Standard → 3-8, Complex → 6-15
+6. **Number of subtasks must match the complexity**: Simple → 1-3, Standard → 3-8, Complex → 6-12
+
+---
+
+## SUBTASK SIZING — GROUP RELATED WORK
+
+Small models lose coherence with too many subtasks. Group related functions into one subtask:
+
+❌ BAD — too granular (each function is its own subtask):
+- "Add handleAttachmentClick function"
+- "Add handleFileSelect function"
+- "Add deleteAttachment function"
+
+✓ GOOD — one logical block:
+- "Add all attachment event handlers to app.js: handleAttachmentClick, handleFileSelect, deleteAttachment"
+
+**Rule**: If a subtask would add < 20 lines of code — merge it with its neighbor.
+**Rule**: Maximum 10 subtasks per task for Standard complexity, 12 for Complex.
+
+---
+
+## VERIFY/CHECK SUBTASKS ARE FORBIDDEN
+
+NEVER create a subtask whose title starts with:
+"Verify", "Check", "Test", "Ensure", "Validate", "Confirm", "Make sure"
+
+These are not implementation tasks. If you find yourself writing one — convert it:
+
+❌ FORBIDDEN: "Verify to_dict() includes attachments field"
+✓ CORRECT:   "Update to_dict() to include attachments field" (with files_to_modify: state.py)
+
+❌ FORBIDDEN: "Ensure get_task endpoint returns attachments"
+✓ CORRECT:   "Modify get_task in main.py to include task.attachments in the response"
+
+Every subtask MUST have at least one entry in `files_to_create` OR `files_to_modify`.
 
 ---
 

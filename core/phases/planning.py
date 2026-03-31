@@ -321,14 +321,44 @@ class PlanningPhase(BasePhase):
 
         req_content = self._read_file_safe(req_path)
         ctx_content = self._read_file_safe(context_path)
-        
+
+        # Extract reference file paths from context.json and pre-read them
+        # so the model sees real code patterns without spending tool-call rounds.
+        code_samples = ""
+        try:
+            import json as _json
+            ctx_data = _json.loads(ctx_content)
+            ref_files = (
+                ctx_data.get("task_relevant_files", {}).get("to_reference", [])
+                + ctx_data.get("task_relevant_files", {}).get("to_modify", [])
+            )
+            # Deduplicate, take up to 3 files, read first 120 lines each
+            seen: set = set()
+            for fpath in ref_files:
+                if fpath in seen or len(seen) >= 3:
+                    break
+                seen.add(fpath)
+                full = os.path.join(wd, fpath)
+                if os.path.isfile(full):
+                    try:
+                        with open(full, encoding="utf-8", errors="replace") as _f:
+                            lines = _f.readlines()[:120]
+                        sample = "".join(lines)
+                        code_samples += f"\n=== {fpath} (first 120 lines) ===\n{sample}\n"
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
         executor = self._make_planning_executor(wd)
         msg = (
             f"requirements.json:\n{req_content}\n\n"
             f"context.json:\n{ctx_content}\n\n"
-            f"Write spec.md to: {self._rel(spec_path)}\n\n"
-            "Read the reference files listed in context.json before writing the spec. "
-            "Include actual code snippets from those files in the Patterns section. "
+            + (f"ACTUAL CODE FROM PROJECT (copy these patterns exactly):\n{code_samples}\n\n"
+               if code_samples else "")
+            + f"Write spec.md to: {self._rel(spec_path)}\n\n"
+            "Use the actual code samples above for the Patterns section — copy real snippets, "
+            "do NOT invent code. "
             "The acceptance criteria section must be copied verbatim from requirements.json."
         )
 
@@ -342,6 +372,27 @@ class PlanningPhase(BasePhase):
 
     # ── 1.4 Critique ──────────────────────────────────────────────
     def _step4_critique(self, model: str) -> bool:
+        ok = self._run_critique_once(model)
+        if not ok:
+            return False
+
+        # If the critique found and fixed issues, run a second pass to verify
+        # the fixed spec doesn't have new problems introduced by the edits.
+        critique_path = os.path.join(self.task.task_dir, "critique_report.json")
+        try:
+            import json as _json
+            with open(critique_path, encoding="utf-8") as _f:
+                report = _json.load(_f)
+            if report.get("fixes_applied", 0) > 0:
+                self.log("  Re-running critique on fixed spec…", "info")
+                return self._run_critique_once(model)
+        except Exception:
+            pass
+
+        return True
+
+    def _run_critique_once(self, model: str) -> bool:
+        """Single critique pass — called once or twice by _step4_critique."""
         wd            = self.task.project_path or self.state.working_dir
         spec_path     = os.path.join(self.task.task_dir, "spec.md")
         req_path      = os.path.join(self.task.task_dir, "requirements.json")
