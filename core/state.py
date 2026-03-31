@@ -344,19 +344,42 @@ class AppState:
         root = task.project_path or self.working_dir
         tasks_root = os.path.join(root, ".tasks")
         os.makedirs(tasks_root, exist_ok=True)
-        n = 1
-        # Check both the directory and any in-memory tasks to avoid collisions
-        existing_dirs = {
-            t.task_dir for t in self.kanban_tasks if t.task_dir
-        }
+
+        # Derive folder number from task ID (e.g. "007-attachments-v3" → 7)
+        # so task_dir always matches the visible task number.
+        n: int = 0
+        if task.id:
+            import re as _re
+            m = _re.match(r"^(\d+)", task.id)
+            if m:
+                n = int(m.group(1))
+
+        # Fallback: find next free number (original behaviour)
+        if n == 0:
+            existing_dirs = {t.task_dir for t in self.kanban_tasks if t.task_dir}
+            n = 1
+            while (
+                os.path.exists(os.path.join(tasks_root, f"task_{n:03d}"))
+                or os.path.join(tasks_root, f"task_{n:03d}") in existing_dirs
+            ):
+                n += 1
+
+        # If the preferred folder already exists (e.g. from a previous run
+        # of a same-numbered task in a different project), append a suffix.
+        base_name = f"task_{n:03d}"
+        folder_name = base_name
+        suffix = 0
+        existing_dirs = {t.task_dir for t in self.kanban_tasks if t.task_dir}
         while (
-            os.path.exists(os.path.join(tasks_root, f"task_{n:03d}"))
-            or os.path.join(tasks_root, f"task_{n:03d}") in existing_dirs
+            os.path.exists(os.path.join(tasks_root, folder_name))
+            and os.path.join(tasks_root, folder_name) not in existing_dirs
         ):
-            n += 1
+            suffix += 1
+            folder_name = f"{base_name}_{suffix}"
+
         task.task_number = n
-        task.task_json_path = os.path.join(tasks_root, f"task_{n:03d}.json")
-        task.task_dir = os.path.join(tasks_root, f"task_{n:03d}")
+        task.task_json_path = os.path.join(tasks_root, f"{folder_name}.json")
+        task.task_dir = os.path.join(tasks_root, folder_name)
         os.makedirs(task.task_dir, exist_ok=True)
         self._save_kanban()
 
