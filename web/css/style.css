@@ -931,6 +931,38 @@ html, body {
 }
 .ov-val.mono { font-family: var(--mono); font-size: 11px; }
 
+/* ── Patch info in Overview ───────────────────────────────────── */
+.patch-badge {
+  display: inline-block;
+  padding: 1px 7px;
+  border-radius: 10px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  background: rgba(245, 158, 11, .15);
+  color: #f59e0b;
+  border: 1px solid rgba(245, 158, 11, .3);
+  vertical-align: middle;
+}
+.patch-badge--full {
+  background: rgba(99, 102, 241, .12);
+  color: #818cf8;
+  border-color: rgba(99, 102, 241, .3);
+}
+.patch-running {
+  color: #60a5fa;
+  font-weight: 600;
+}
+.patch-corrections {
+  display: block;
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--text3);
+  font-style: italic;
+  line-height: 1.4;
+}
+
 .ov-actions {
   display: flex;
   gap: 8px;

@@ -308,6 +308,9 @@ function populateModal(task) {
   document.getElementById('ov-created').textContent = task.created_at || '—';
   document.getElementById('ov-updated').textContent = task.updated_at || '—';
 
+  // Patch / corrections info row
+  _renderPatchInfo(task);
+
   // Run / Continue / Restart / Abort buttons
   _updateTaskButtons(task);
 
@@ -702,6 +705,56 @@ function switchMTab(btn, tab) {
 }
 
 // ─── Pipeline action buttons ─────────────────────────────────────
+
+function _renderPatchInfo(task) {
+  const row  = document.getElementById('ov-patch-row');
+  const info = document.getElementById('ov-patch-info');
+
+  const hasPatch     = !!(task.corrections && task.corrections.trim());
+  const iteration    = task.current_iteration || 0;
+  const maxIter      = task.max_iterations   || 3;
+  const isRunning    = activeRunId === task.id;
+  const inProgress   = task.column === 'in_progress';
+
+  // Show the row only when there's something meaningful to display
+  const hasIterInfo  = iteration > 0;
+  if (!hasPatch && !hasIterInfo) {
+    row.classList.add('hidden');
+    return;
+  }
+  row.classList.remove('hidden');
+
+  // Build content
+  const parts = [];
+
+  if (hasIterInfo) {
+    const iterLabel = isRunning && inProgress
+      ? `<span class="patch-running">⟳ Running</span> iteration ${iteration} / ${maxIter}`
+      : `Iteration ${iteration} / ${maxIter}`;
+
+    // Flow type: patch mode vs fresh planning
+    const hasSubs    = (task.subtasks || []).length > 0;
+    const modeLabel  = (hasPatch && hasSubs && iteration > 1)
+      ? '<span class="patch-badge">patch</span>'
+      : '<span class="patch-badge patch-badge--full">full plan</span>';
+
+    parts.push(`${modeLabel} ${iterLabel}`);
+  }
+
+  if (hasPatch) {
+    const preview = task.corrections.trim().replace(/\n/g, ' ');
+    const short   = preview.length > 120 ? preview.slice(0, 120) + '…' : preview;
+    parts.push(`<span class="patch-corrections">${_esc(short)}</span>`);
+  }
+
+  info.innerHTML = parts.join('<br>');
+}
+
+function _esc(s) {
+  return String(s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
 
 function _updateTaskButtons(task) {
   const isRunning  = activeRunId === task.id;
