@@ -96,6 +96,18 @@ class FileCache:
         return new_paths
 
     def update_content(self, rel_path: str, content: str):
+        # Simple FIFO eviction: remove the oldest entry when cache is full.
+        # This prevents unbounded memory growth across long Planning+Coding sessions.
+        # The value 20 is generous enough to keep all actively used files in memory
+        # while preventing stale early-phase files from bloating the system prompt.
+        MAX_CACHED_FILES = 20
+        if rel_path in self.file_contents:
+            # Move to end (most recently used) by re-inserting
+            del self.file_contents[rel_path]
+        elif len(self.file_contents) >= MAX_CACHED_FILES:
+            # Evict oldest (first inserted)
+            oldest = next(iter(self.file_contents))
+            del self.file_contents[oldest]
         self.file_contents[rel_path] = content
 
     def get_content(self, rel_path: str) -> Optional[str]:
@@ -203,6 +215,42 @@ class AppState:
         self.cache = FileCache()
         # Legacy compat for phases that call state.logs
         self.logs: list[str] = []
+        # Recent projects — persisted in app_settings.json
+        self.recent_dirs: list[str] = []
+
+    # ── Settings persistence (app-level, not per-project) ────────
+    def load_settings(self, settings_path: str):
+        """Load app settings (last dir, recent dirs) from settings_path."""
+        try:
+            with open(settings_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self.recent_dirs = data.get("recent_dirs", [])[:5]
+        except Exception:
+            pass  # First run or corrupt file — start fresh
+
+    def save_settings(self, settings_path: str):
+        """Persist app settings to settings_path."""
+        try:
+            data = {
+                "last_working_dir": self.working_dir,
+                "recent_dirs": self.recent_dirs[:5],
+                "version": 1,
+            }
+            os.makedirs(os.path.dirname(settings_path), exist_ok=True)
+            with open(settings_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def add_recent_dir(self, path: str):
+        """Add path to recent_dirs, keeping it unique and capped at 5."""
+        # Remove duplicates (case-insensitive on Windows)
+        self.recent_dirs = [
+            d for d in self.recent_dirs
+            if os.path.normcase(d) != os.path.normcase(path)
+        ]
+        self.recent_dirs.insert(0, path)
+        self.recent_dirs = self.recent_dirs[:5]
 
     def request_abort(self, task_id: str):
         """Signal that a task should stop at the next checkpoint."""

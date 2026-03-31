@@ -111,3 +111,35 @@ Look for:
 - If a directory structure is unclear, call `list_directory` on it
 - Document patterns you ACTUALLY found, not what you expect to find
 - If the project is empty/greenfield, write that explicitly in both files
+
+---
+
+## RELATED FILES RULE (apply to every file you identify)
+
+For every file you add to `to_modify` or `to_create`, ask these questions:
+
+**1. What else is in the same directory?**
+Call `list_directory` on the parent folder. Any file there that touches the same
+feature domain belongs in `to_reference` (at minimum) or `to_modify` if it also needs changes.
+
+Example: modifying `web/js/app.js` → check `web/css/`, `web/index.html`.
+Example: modifying `core/state.py` → check all other files in `core/`.
+
+**2. What imports this file?**
+Search for the module name in other files. Any file that imports the modified module
+may need updating if you change its public API.
+
+Example: adding a field to `core/state.py` → find all `from core.state import` usages.
+Example: adding a new endpoint in `main.py` → the frontend `app.js` must call it.
+
+**3. What is the "wiring" layer?**
+Every project has a file that connects modules together
+(e.g. `main.py`, `__init__.py`, `index.js`, `router.py`).
+If you modify a module, always include the wiring layer in `to_reference`.
+
+**4. Are there paired files by convention?**
+Many projects have conventions: `.py` + test file, `.js` + `.css`, model + migration.
+Check if a natural pair exists and include it.
+
+**Rule**: `to_reference` should always have at least as many files as `to_modify`.
+If you can only find 1 file to modify and 0 to reference — you haven't looked hard enough.

@@ -80,10 +80,13 @@ class OllamaClient:
                     and before every tool execution.
         """
         history = list(messages)
-        # Always keep the first message (original user task) + last N messages.
-        # This prevents the model from getting lost in a long repetitive history
-        # while still knowing what it was asked to do.
-        HISTORY_CAP = 10
+        # Cap history by total character size, not message count.
+        # This is more meaningful for small models (Qwen 9B, etc.) where
+        # a single tool_result can be 3-5k chars — 10 messages could easily
+        # be 30-50k chars, far exceeding the effective context window.
+        # We keep the first message (original task) + the most recent messages
+        # that fit within the char budget.
+        MAX_HISTORY_CHARS = 12000
 
         # Repetition detector: tracks (tool_name, args_key) → consecutive count
         _last_call: tuple[str, str] = ("", "")
@@ -101,9 +104,22 @@ class OllamaClient:
             if is_aborted and is_aborted():
                 raise RuntimeError("__ABORTED__")
 
-            # ── Cap history: first message + last (HISTORY_CAP-1) messages ──
-            if len(history) > HISTORY_CAP:
-                capped_history = history[:1] + history[-(HISTORY_CAP - 1):]
+            # ── Cap history by character budget ───────────────────
+            # Always keep the first message (original task). Then add
+            # the most recent messages newest-first until the budget runs out.
+            if len(history) > 1:
+                first_msg   = history[:1]
+                rest        = history[1:]
+                budget      = MAX_HISTORY_CHARS
+                kept: list  = []
+                for msg in reversed(rest):
+                    msg_size = len(str(msg.get("content", "")))
+                    if budget - msg_size < 0 and kept:
+                        # Budget exhausted — stop (but always keep at least 1 recent msg)
+                        break
+                    kept.append(msg)
+                    budget -= msg_size
+                capped_history = first_msg + list(reversed(kept))
             else:
                 capped_history = history
 
@@ -139,7 +155,7 @@ class OllamaClient:
                 resp = s.post(
                     f"{self.base_url}/api/chat",
                     json=payload,
-                    timeout=(900, 900),  # отдельно connect и read
+                    timeout=(10, 30),  # отдельно connect и read
                 )
                 resp.raise_for_status()
             except BaseException as e:

@@ -143,6 +143,24 @@ def _validate_impl_plan(path: str, project_path: str = "") -> tuple[bool, str]:
                         f"If this is a new file, move it to files_to_create instead."
                     )
 
+    # Reject verify-only subtasks that have no files to write.
+    # These are planning drift — they describe checking, not building.
+    VERIFY_PREFIXES = (
+        "verify ", "check ", "test ", "ensure ", "validate ",
+        "confirm ", "make sure", "assert ",
+    )
+    for s in all_subtasks:
+        title_lower = s.get("title", "").lower().strip()
+        if any(title_lower.startswith(p) for p in VERIFY_PREFIXES):
+            has_files = s.get("files_to_create") or s.get("files_to_modify")
+            if not has_files:
+                errors.append(
+                    f"Subtask {s.get('id','?')}: title '{s.get('title','')}' "
+                    f"is a verify-only task (no files_to_create or files_to_modify). "
+                    f"Rewrite it as an implementation task with actual files to change, "
+                    f"or remove it entirely."
+                )
+
     if errors:
         summary = _phase_summary(data["phases"])
         return False, (
@@ -585,6 +603,27 @@ class PlanningPhase(BasePhase):
             for path in subtask.get("patterns_from", []):
                 if path:
                     to_copy.add(path)
+
+        # For every file being CREATED, also copy existing sibling files from
+        # the same directory into workdir. This gives the coding agent real
+        # context — it sees what already exists in that directory and can match
+        # naming conventions, imports, and code style without guessing.
+        for subtask in self.task.subtasks:
+            for new_file in subtask.get("files_to_create", []):
+                if not new_file:
+                    continue
+                parent_dir = os.path.dirname(new_file).replace("\\", "/")
+                siblings = [
+                    p for p in self.state.cache.file_paths
+                    if os.path.dirname(p).replace("\\", "/") == parent_dir
+                    and p not in to_copy
+                    and not p.startswith(".tasks")
+                    and not p.startswith(".git")
+                ]
+                # Copy up to 4 siblings — enough for patterns, not overwhelming
+                for sib in siblings[:4]:
+                    to_copy.add(sib)
+                    self.log(f"  + sibling for {new_file}: {sib}", "info")
 
         copied, missing, skipped = [], [], []
         for rel_path in sorted(to_copy):

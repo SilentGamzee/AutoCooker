@@ -39,11 +39,29 @@ threading.excepthook = _thread_excepthook
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 WEB_DIR  = os.path.join(BASE_DIR, "web")
+SETTINGS_PATH = os.path.join(BASE_DIR, "app_settings.json")
 
 eel.init(WEB_DIR)
 
 STATE  = AppState()
 OLLAMA = OllamaClient()
+
+# ── Auto-restore last working directory ───────────────────────────
+# Load settings first so recent_dirs and last_working_dir are available
+# before the UI requests them.
+STATE.load_settings(SETTINGS_PATH)
+_last_dir = ""
+try:
+    import json as _json
+    with open(SETTINGS_PATH, "r", encoding="utf-8") as _f:
+        _last_dir = _json.load(_f).get("last_working_dir", "")
+except Exception:
+    pass
+if _last_dir and os.path.isdir(_last_dir):
+    STATE.working_dir = os.path.realpath(_last_dir)
+    STATE.cache.update_file_paths(STATE.working_dir)
+    STATE.load_kanban()
+    print(f"  Auto-restored working dir: {STATE.working_dir}", flush=True)
 
 # ─── Helpers ──────────────────────────────────────────────────────
 
@@ -113,6 +131,9 @@ def set_working_dir(path: str) -> dict:
     STATE.working_dir = os.path.realpath(path)
     STATE.cache.update_file_paths(STATE.working_dir)
     STATE.load_kanban()
+    # Persist last dir and update recent list
+    STATE.add_recent_dir(STATE.working_dir)
+    STATE.save_settings(SETTINGS_PATH)
     _push_board()
     return {
         "ok": True,
@@ -125,6 +146,12 @@ def set_working_dir(path: str) -> dict:
 @eel.expose
 def get_working_dir() -> str:
     return STATE.working_dir
+
+
+@eel.expose
+def get_recent_dirs() -> list:
+    """Return up to 5 recently used project directories (most recent first)."""
+    return [d for d in STATE.recent_dirs if os.path.isdir(d)]
 
 
 @eel.expose

@@ -754,11 +754,41 @@ async function moveTaskModal(col) {
 }
 
 // ─── Working directory ───────────────────────────────────────────
-function showDirModal() {
+async function showDirModal() {
   document.getElementById('overlay-dir').classList.add('open');
+  // Populate recent dirs list each time the modal opens
+  const recent = await eel.get_recent_dirs()();
+  const section = document.getElementById('recent-dirs-section');
+  const list    = document.getElementById('recent-dirs-list');
+  if (recent && recent.length > 0) {
+    list.innerHTML = '';
+    recent.forEach(dir => {
+      const item = document.createElement('div');
+      item.className = 'recent-dir-item';
+      const name = dir.replace(/\\/g, '/').split('/').pop() || dir;
+      item.innerHTML = `
+        <span class="recent-dir-icon">📁</span>
+        <div class="recent-dir-info">
+          <div class="recent-dir-name">${name}</div>
+          <div class="recent-dir-path">${dir}</div>
+        </div>
+        <button class="recent-dir-select" onclick="selectRecentDir(${JSON.stringify(dir)})">Select</button>
+      `;
+      list.appendChild(item);
+    });
+    section.classList.remove('hidden');
+  } else {
+    section.classList.add('hidden');
+  }
 }
+
 function closeDirModal() {
   document.getElementById('overlay-dir').classList.remove('open');
+}
+
+function selectRecentDir(path) {
+  document.getElementById('dir-input').value = path;
+  applyDir();
 }
 
 async function applyDir() {
