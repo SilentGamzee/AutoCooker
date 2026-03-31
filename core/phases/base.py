@@ -7,7 +7,6 @@ import eel
 
 from core.state import AppState, KanbanTask, TaskAbortedError
 from core.ollama_client import OllamaClient
-from core.tools import ToolExecutor
 
 PROMPTS_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "prompts")
 
@@ -27,31 +26,37 @@ class BasePhase:
         self.phase_name = phase_name   # "planning" | "coding" | "qa"
         self.ollama = OllamaClient()
 
+    # ── Gevent-safe eel dispatcher ────────────────────────────────
+    @staticmethod
+    def _gevent_safe(fn):
+        """Schedule fn() inside gevent's event loop (thread-safe)."""
+        try:
+            import gevent as _gevent
+            _gevent.spawn(fn)
+        except Exception:
+            fn()
+
     # ── Logging ──────────────────────────────────────────────────
     def log(self, msg: str, log_type: Optional[str] = None):
         self.task.add_log(msg, phase=self.phase_name, log_type=log_type)
         self.state.logs.append(msg)
         # Persist log entry to task_dir/logs.json immediately
         self.state.save_logs_for_task(self.task)
-        try:
-            eel.task_log_added(self.task.id, self.task.logs[-1])
-        except Exception as _e:
-            if "eel" not in type(_e).__module__.lower():
-                print(f"[WARN] task_log_added: {_e}", flush=True)
+        # eel call must go through gevent event loop — not safe from real OS threads
+        task_id = self.task.id
+        entry   = self.task.logs[-1]
+        self._gevent_safe(lambda: eel.task_log_added(task_id, entry))
 
     def set_step(self, step: str):
-        try:
-            eel.task_step_changed(self.task.id, self.phase_name, step)
-        except Exception:
-            pass  # eel disconnect is normal
+        task_id    = self.task.id
+        phase_name = self.phase_name
+        self._gevent_safe(lambda: eel.task_step_changed(task_id, phase_name, step))
 
     def push_task(self):
         """Push full task state to UI."""
         self.state._save_kanban()
-        try:
-            eel.task_updated(self.task.to_dict_ui())
-        except Exception:
-            pass  # eel disconnect is normal
+        task_dict = self.task.to_dict_ui()
+        self._gevent_safe(lambda: eel.task_updated(task_dict))
 
     # ── System prompt ────────────────────────────────────────────
     def build_system(self, prompt_file: str) -> str:
@@ -117,7 +122,7 @@ class BasePhase:
         return "\n\n".join(parts)
 
     # ── Executor factory ─────────────────────────────────────────
-    def _make_executor(self, wd: str, **kwargs) -> ToolExecutor:
+    def _make_executor(self, wd: str, **kwargs) -> "ToolExecutor":
         """
         Create a ToolExecutor pre-wired with:
         - the global FileCache (path index)

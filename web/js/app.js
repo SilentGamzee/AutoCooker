@@ -308,10 +308,8 @@ function populateModal(task) {
   document.getElementById('ov-created').textContent = task.created_at || '—';
   document.getElementById('ov-updated').textContent = task.updated_at || '—';
 
-  // Run/Abort buttons
-  const isRunning = activeRunId === task.id;
-  document.getElementById('btn-run').classList.toggle('hidden', isRunning);
-  document.getElementById('btn-abort').classList.toggle('hidden', !isRunning);
+  // Run / Continue / Restart / Abort buttons
+  _updateTaskButtons(task);
 
   // Corrections panel: show when task is done or in human_review
   const showCorrections = ['done', 'human_review'].includes(task.column);
@@ -703,7 +701,63 @@ function switchMTab(btn, tab) {
   }
 }
 
-// ─── Run / Abort ─────────────────────────────────────────────────
+// ─── Pipeline action buttons ─────────────────────────────────────
+
+function _updateTaskButtons(task) {
+  const isRunning  = activeRunId === task.id;
+  // A task has been started before if it has a task_dir OR subtasks OR logs
+  const hasStarted = !!(task.task_dir || (task.subtasks && task.subtasks.length) ||
+                        (task.logs && task.logs.length));
+
+  // While running: only Abort visible
+  document.getElementById('btn-abort').classList.toggle('hidden', !isRunning);
+
+  if (isRunning) {
+    document.getElementById('btn-run').classList.add('hidden');
+    document.getElementById('btn-continue').classList.add('hidden');
+    document.getElementById('btn-restart').classList.add('hidden');
+    return;
+  }
+
+  if (hasStarted) {
+    // Task was started before → show Continue + Restart
+    document.getElementById('btn-run').classList.add('hidden');
+    document.getElementById('btn-continue').classList.remove('hidden');
+    document.getElementById('btn-restart').classList.remove('hidden');
+  } else {
+    // Fresh task → show Run only
+    document.getElementById('btn-run').classList.remove('hidden');
+    document.getElementById('btn-continue').classList.add('hidden');
+    document.getElementById('btn-restart').classList.add('hidden');
+  }
+}
+
+async function runActiveTask() {
+  if (!activeTaskId) return;
+  const res = await eel.start_task(activeTaskId)();
+  if (!res.ok) { alert('Error: ' + res.error); return; }
+  activeRunId = activeTaskId;
+  const task = await eel.get_task(activeTaskId)();
+  if (task) _updateTaskButtons(task);
+}
+
+async function continueActiveTask() {
+  // Continue = same as Run — pipeline resumes from last state
+  await runActiveTask();
+}
+
+async function restartActiveTask() {
+  if (!activeTaskId) return;
+  if (!confirm('Restart will erase all progress, subtasks and logs for this task.\n\nAre you sure?')) return;
+  const res = await eel.restart_task(activeTaskId)();
+  if (!res.ok) { alert('Error: ' + res.error); return; }
+  // Reload task state after reset
+  const task = await eel.get_task(activeTaskId)();
+  if (task) {
+    renderTaskDetail(task);
+  }
+}
+
 async function saveAndRun() {
   if (!activeTaskId) return;
   const corrections = document.getElementById('corrections-input').value.trim();
@@ -717,21 +771,12 @@ async function clearCorrections() {
   await eel.save_corrections(activeTaskId, '')();
 }
 
-async function runActiveTask() {
-  if (!activeTaskId) return;
-  const res = await eel.start_task(activeTaskId)();
-  if (!res.ok) { alert('Error: ' + res.error); return; }
-  activeRunId = activeTaskId;
-  document.getElementById('btn-run').classList.add('hidden');
-  document.getElementById('btn-abort').classList.remove('hidden');
-}
-
 async function abortActiveTask() {
   if (!activeTaskId) return;
   await eel.abort_task(activeTaskId)();
   activeRunId = null;
-  document.getElementById('btn-run').classList.remove('hidden');
-  document.getElementById('btn-abort').classList.add('hidden');
+  const task = await eel.get_task(activeTaskId)();
+  if (task) _updateTaskButtons(task);
 }
 
 async function deleteActiveTask() {

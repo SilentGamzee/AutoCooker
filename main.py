@@ -37,6 +37,43 @@ def _thread_excepthook(args):
 
 threading.excepthook = _thread_excepthook
 
+def _main_excepthook(exc_type, exc_value, exc_tb):
+    """Print uncaught exceptions on the main thread."""
+    if exc_type is SystemExit:
+        return
+    print("\n[MAIN THREAD ERROR] Uncaught exception:", flush=True)
+    traceback.print_exception(exc_type, exc_value, exc_tb)
+
+sys.excepthook = _main_excepthook
+
+def _setup_gevent_error_handler():
+    """
+    Install a gevent hub error handler so greenlet crashes print full
+    tracebacks instead of silently disappearing.
+    Must be called AFTER import eel (which triggers gevent monkeypatch).
+    """
+    try:
+        import gevent.hub as _hub
+
+        _orig_handle_error = _hub.Hub.handle_error
+
+        def _handle_error(self, context, exc_type, exc_value, exc_tb):
+            if exc_type is SystemExit:
+                # Let SystemExit propagate normally (eel shutdown)
+                _orig_handle_error(self, context, exc_type, exc_value, exc_tb)
+                return
+            print(
+                f"\n[GEVENT ERROR] Unhandled exception in greenlet {context!r}:",
+                flush=True,
+            )
+            traceback.print_exception(exc_type, exc_value, exc_tb)
+            # Still call original so gevent can clean up
+            _orig_handle_error(self, context, exc_type, exc_value, exc_tb)
+
+        _hub.Hub.handle_error = _handle_error
+    except Exception as e:
+        print(f"[WARN] Could not install gevent error handler: {e}", flush=True)
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 WEB_DIR  = os.path.join(BASE_DIR, "web")
 SETTINGS_PATH = os.path.join(BASE_DIR, "app_settings.json")
@@ -45,6 +82,13 @@ eel.init(WEB_DIR)
 
 STATE  = AppState()
 OLLAMA = OllamaClient()
+
+# Pipeline guard — prevents concurrent runs without holding a lock
+# during the entire pipeline execution (which blocked eel's event loop).
+# _PIPELINE_GATE is only held for the brief check in start_task/restart_task.
+# _PIPELINE_RUNNING is the actual "is something running" flag.
+_PIPELINE_GATE    = threading.Lock()   # held only during start/stop check
+_PIPELINE_RUNNING = False              # True while a pipeline thread is active
 
 # ── Auto-restore last working directory ───────────────────────────
 # Load settings first so recent_dirs and last_working_dir are available
@@ -73,21 +117,34 @@ def _slug(title: str) -> str:
     return s[:60]
 
 
-def _push_board():
+def _gevent_safe(fn):
+    """
+    Schedule fn() to run inside gevent's event loop.
+
+    eel's WebSocket is NOT thread-safe for writes from real OS threads.
+    On Windows with Python 3.12, gevent does not monkeypatch threading.Thread
+    into greenlets — the pipeline runs as a real OS thread. Calling eel.*()
+    directly from that thread corrupts the WebSocket and triggers _detect_shutdown.
+
+    gevent.spawn() queues fn as a new greenlet in the hub. This is thread-safe:
+    the hub picks it up and executes it inside the event loop on the next iteration.
+    """
     try:
-        eel.board_updated(STATE.kanban_board())
-    except Exception as _e:
-        print(f"[WARN] _push_board failed: {_e}", flush=True)
-        traceback.print_exc()
+        import gevent as _gevent
+        _gevent.spawn(fn)
+    except Exception:
+        fn()   # fallback if gevent not available (tests, etc.)
+
+
+def _push_board():
+    board = STATE.kanban_board()
+    _gevent_safe(lambda: eel.board_updated(board))
 
 
 def _push_task(task: KanbanTask):
-    try:
-        STATE._save_kanban()
-        eel.task_updated(task.to_dict_ui())
-    except Exception as _e:
-        print(f"[WARN] _push_task failed: {_e}", flush=True)
-        traceback.print_exc()
+    STATE._save_kanban()
+    task_dict = task.to_dict_ui()
+    _gevent_safe(lambda: eel.task_updated(task_dict))
 
 
 def _format_qa_as_corrections(
@@ -231,16 +288,24 @@ def start_task(task_id: str) -> dict:
     if not task:
         return {"ok": False, "error": "Task not found"}
 
-    # Already running check
-    if STATE.active_task_id == task_id:
-        return {"ok": False, "error": "Task already running"}
+    # Atomically check + mark running so no two pipelines start simultaneously.
+    # _PIPELINE_GATE is held only for this brief check — NOT for the whole run.
+    global _PIPELINE_RUNNING
+    with _PIPELINE_GATE:
+        if _PIPELINE_RUNNING:
+            return {"ok": False, "error": "Another task is already running. Abort it first."}
+        _PIPELINE_RUNNING = True
 
     def run():
+        global _PIPELINE_RUNNING
         try:
             _run_pipeline()
         except Exception:
             print("[PIPELINE THREAD] Unexpected top-level error:", flush=True)
             traceback.print_exc()
+        finally:
+            with _PIPELINE_GATE:
+                _PIPELINE_RUNNING = False
 
     def _run_pipeline():
         STATE.active_task_id = task_id
@@ -365,8 +430,57 @@ def start_task(task_id: str) -> dict:
 
 @eel.expose
 def abort_task(task_id: str) -> dict:
+    # Cancel the in-flight HTTP request to Ollama first.
+    # Without this, Ollama keeps processing the old request and blocks
+    # any new requests from starting — causing "no Ollama activity" on restart.
+    OLLAMA.abort()
     STATE.request_abort(task_id)   # sets abort flag + clears active_task_id
     # UI state is updated by the pipeline thread when it catches TaskAbortedError
+    return {"ok": True}
+
+
+@eel.expose
+def restart_task(task_id: str) -> dict:
+    """
+    Full reset: wipe task_dir contents, clear subtasks/logs/corrections,
+    reset progress and column — as if the task was just created.
+    """
+    import shutil as _shutil
+
+    if _PIPELINE_RUNNING:
+        return {"ok": False, "error": "A pipeline is running — abort it first"}
+
+    task = STATE.get_task(task_id)
+    if not task:
+        return {"ok": False, "error": "Task not found"}
+
+    # Wipe the task directory but keep the directory itself
+    if task.task_dir and os.path.isdir(task.task_dir):
+        for entry in os.listdir(task.task_dir):
+            full = os.path.join(task.task_dir, entry)
+            try:
+                if os.path.isdir(full):
+                    _shutil.rmtree(full)
+                else:
+                    os.remove(full)
+            except Exception as e:
+                print(f"[restart_task] could not remove {full}: {e}", flush=True)
+
+    # Reset all in-memory state
+    task.subtasks      = []
+    task.logs          = []
+    task.corrections   = ""
+    task.progress      = 0
+    task.has_errors    = False
+    task.column        = "planning"
+    task.tags          = [t for t in task.tags
+                          if t not in ("Has Errors", "Needs Review", "Complete", "Aborted")]
+    task.file_contents = {}
+    task.files         = []
+
+    STATE._save_kanban()
+    _push_task(task)
+    _push_board()
     return {"ok": True}
 
 
@@ -611,8 +725,28 @@ def merge_workdir(task_id: str) -> dict:
 
 if __name__ == "__main__":
     print(f"Ollama Project Planner  |  web: {WEB_DIR}")
+
+    # Install gevent error handler now that eel has been imported
+    # and gevent monkeypatching has happened
+    _setup_gevent_error_handler()
+
+    # Dump all thread stacks to stderr automatically on fatal signals
+    # (SIGSEGV, SIGFPE, etc.) — supplements faulthandler.enable() above
+    import signal as _signal
+    try:
+        faulthandler.register(_signal.SIGUSR1, all_threads=True)
+    except (AttributeError, OSError):
+        pass   # SIGUSR1 not available on Windows — that's fine
+
     try:
         eel.start("index.html", size=(1400, 900), port=8765, block=True)
+    except SystemExit:
+        # eel calls sys.exit() on browser disconnect — print all thread stacks
+        print("\n[EEL] Server stopped (browser disconnected or window closed).", flush=True)
+        print("[EEL] Active thread stacks at shutdown:", flush=True)
+        faulthandler.dump_traceback()
+    except KeyboardInterrupt:
+        print("\n[EEL] Keyboard interrupt — shutting down.", flush=True)
     except BaseException as e:
-        print(f"[ERROR] Failed to start Eel server: {e}", flush=True)
+        print(f"\n[EEL CRASH] {type(e).__name__}: {e}", flush=True)
         traceback.print_exc()

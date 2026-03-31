@@ -188,20 +188,53 @@ class PlanningPhase(BasePhase):
         self.state.cache.update_file_paths(wd)
         self.log(f"  Scanned {len(self.state.cache.file_paths)} project files", "info")
 
-        # ── Step 1.0: Build/update project index (no Ollama round-trip per file) ──
+        # ── Step 1.0: Build/update project index ──────────────────
+        # IMPORTANT: run in a background thread with timeout.
+        # scan_and_update calls Ollama which can hang indefinitely if Ollama is
+        # busy (e.g. leftover request from a previous killed app session).
+        # The index is a relevance-ranking aid, not critical path — if it times
+        # out we simply continue with the raw file list.
         self._project_index = ProjectIndex(wd)
         self.log("─── Step 1.0: Project index pre-scan ───")
-        try:
-            self._project_index.scan_and_update(
-                ollama=self.ollama,
-                model=model,
-                log_fn=self.log,
+
+        import threading as _threading
+        _index_error: list = []   # mutable container so thread can write to it
+
+        def _run_index():
+            print("[DEBUG _run_index] thread started", flush=True)
+            try:
+                self._project_index.scan_and_update(
+                    ollama=self.ollama,
+                    model=model,
+                    log_fn=self.log,
+                    max_files_to_describe=10,
+                )
+                print("[DEBUG _run_index] scan_and_update completed OK", flush=True)
+            except Exception as e:
+                import traceback as _tb
+                print(f"[DEBUG _run_index] EXCEPTION: {e}", flush=True)
+                _index_error.append(str(e))
+                self.log(f"  [WARN] Index scan error: {e}", "warn")
+                self.log(_tb.format_exc(), "warn")
+
+        index_thread = _threading.Thread(target=_run_index, daemon=True)
+        index_thread.start()
+        INDEX_TIMEOUT = 120   # seconds — generous for loading + first batch
+        index_thread.join(timeout=INDEX_TIMEOUT)
+
+        if index_thread.is_alive():
+            # Still running after timeout — skip index, continue pipeline
+            self.log(
+                f"  [WARN] Index scan exceeded {INDEX_TIMEOUT}s — "
+                "continuing without index. Ollama may be busy.",
+                "warn",
             )
-        except Exception as e:
-            import traceback as _tb
-            self.log(f"  [WARN] Index pre-scan failed: {e} — continuing without index", "warn")
-            self.log(_tb.format_exc(), "warn")
             self._project_index = None
+        elif _index_error:
+            self.log("  [WARN] Index scan failed — continuing without index", "warn")
+            self._project_index = None
+        else:
+            self.log("  Index scan complete", "info")
 
         # If corrections exist and subtasks already exist → patch mode
         if self.task.corrections and self.task.subtasks:
@@ -625,11 +658,8 @@ class PlanningPhase(BasePhase):
         self.state.save_subtasks_for_task(self.task)
         self.log(f"  Loaded {len(subtasks)} subtasks from implementation_plan.json", "ok")
 
-        try:
-            import eel
-            eel.task_updated(self.task.to_dict_ui())
-        except Exception:
-            pass  # eel disconnect is normal
+        task_dict = self.task.to_dict_ui()
+        self._gevent_safe(lambda: eel.task_updated(task_dict))
         return True
 
     # ── 1.7 Prepare workdir ──────────────────────────────────────

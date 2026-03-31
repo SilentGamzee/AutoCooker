@@ -214,7 +214,9 @@
           <div class="ov-row"><span class="ov-label">Updated</span><span class="ov-val" id="ov-updated"></span></div>
         </div>
         <div class="ov-actions">
-          <button class="btn-primary" id="btn-run" onclick="runActiveTask()">▶ Run Pipeline</button>
+          <button class="btn-primary hidden" id="btn-run" onclick="runActiveTask()">▶ Run Pipeline</button>
+          <button class="btn-primary hidden" id="btn-continue" onclick="continueActiveTask()">▶ Continue Pipeline</button>
+          <button class="btn-secondary hidden" id="btn-restart" onclick="restartActiveTask()">↺ Restart</button>
           <button class="btn-danger hidden" id="btn-abort" onclick="abortActiveTask()">■ Abort</button>
           <button class="btn-secondary" onclick="moveTaskModal('queue')">→ Queue</button>
           <button class="btn-secondary" onclick="moveTaskModal('done')">→ Done</button>

@@ -660,6 +660,23 @@ html, body {
 }
 .btn-secondary:hover { color: var(--text); border-color: var(--text3); }
 
+/* Restart button — amber tint so it reads as "destructive-ish" but not danger-red */
+#btn-restart {
+  background: var(--bg3);
+  color: #f59e0b;
+  border: 1px solid #92400e44;
+  padding: 7px 14px;
+  border-radius: var(--r6);
+  font: 12px var(--font);
+  cursor: pointer;
+  transition: all 0.15s;
+}
+#btn-restart:hover {
+  background: #92400e22;
+  border-color: #f59e0b88;
+  color: #fbbf24;
+}
+
 .btn-ghost {
   background: transparent;
   color: var(--text2);

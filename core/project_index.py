@@ -59,7 +59,7 @@ _SKIP_EXTS    = {".pyc", ".pyo", ".class", ".o", ".so", ".dll", ".exe",
 
 # Rough estimate: 4 chars ≈ 1 token
 _CHARS_PER_TOKEN = 4
-_BATCH_TOKEN_LIMIT = 8_000
+_BATCH_TOKEN_LIMIT = 2_000  # smaller batches = faster Ollama responses per batch
 
 # Vision model name hints
 _VISION_HINTS = {"llava", "bakllava", "moondream", "cogvlm", "minicpm-v"}
@@ -102,10 +102,13 @@ class ProjectIndex:
         model: str,
         log_fn: Callable[[str], None],
         force: bool = False,
+        max_files_to_describe: int = 0,  # 0 = no cap
     ) -> None:
         """
         Walk project, find new/changed files, describe them via Ollama in batches.
         Existing entries whose mtime hasn't changed are left untouched.
+        max_files_to_describe: if > 0, limit how many files are sent to Ollama.
+          Remaining new files are indexed without descriptions (static info only).
         """
         self.load()
         gitignore_patterns = _parse_gitignore(self.project_path)
@@ -131,13 +134,50 @@ class ProjectIndex:
 
         log_fn(f"  [Index] Indexing {len(to_index)} new/changed files…")
 
-        # Split into batches by token count
-        batches = _make_batches(self.project_path, to_index)
+        # Apply cap: files beyond the limit get static-only indexing (no Ollama)
+        if max_files_to_describe > 0 and len(to_index) > max_files_to_describe:
+            to_describe  = to_index[:max_files_to_describe]
+            to_static    = to_index[max_files_to_describe:]
+            log_fn(
+                f"  [Index] Describing {len(to_describe)} via Ollama, "
+                f"{len(to_static)} static-only (cap={max_files_to_describe})"
+            )
+        else:
+            to_describe = to_index
+            to_static   = []
+
+        # Index static-only files first (fast, no Ollama)
+        now_ts = time.strftime("%Y-%m-%dT%H:%M:%S")
+        for rel in to_static:
+            abs_path = os.path.join(self.project_path, rel)
+            try:
+                mtime      = os.path.getmtime(abs_path)
+                size_bytes = os.path.getsize(abs_path)
+            except OSError:
+                mtime, size_bytes = 0.0, 0
+            static = _extract_static_info(abs_path)
+            existing = self.data.get(rel, {})
+            self.data[rel] = {
+                "description":  existing.get("description", ""),
+                "symbols":      static["symbols"],
+                "imports":      static["imports"],
+                "used_by":      existing.get("used_by", []),
+                "test_files":   _find_test_files(rel, self.data),
+                "type":         _file_type(rel),
+                "lang":         _file_lang(rel),
+                "size_bytes":   size_bytes,
+                "mtime":        mtime,
+                "last_indexed": now_ts,
+            }
+
+        # Split into batches by token count and send to Ollama
+        batches = _make_batches(self.project_path, to_describe)
         log_fn(f"  [Index] {len(batches)} batch(es) to send to Ollama")
 
         for i, batch in enumerate(batches, 1):
             log_fn(f"  [Index] Batch {i}/{len(batches)} — {len(batch)} files…")
             self._describe_batch(batch, ollama, model, log_fn)
+            log_fn(f"  [Index] Batch {i}/{len(batches)} done")
 
         # Rebuild used_by for only the changed files
         self._rebuild_used_by(changed=to_index)
@@ -265,6 +305,9 @@ class ProjectIndex:
         code_batch  = [r for r in batch if _file_type(r) != "image"]
         image_batch = [r for r in batch if _file_type(r) == "image"]
 
+        print(f"[DEBUG _describe_batch] code={code_batch} image={image_batch}", flush=True)
+        log_fn(f"  [Index] batch split: {len(code_batch)} code, {len(image_batch)} image")
+
         if code_batch:
             self._describe_code_batch(code_batch, ollama, model, log_fn)
 
@@ -278,23 +321,25 @@ class ProjectIndex:
         model: str,
         log_fn: Callable[[str], None],
     ) -> None:
+        print(f"[DEBUG _describe_code_batch] START files={batch}", flush=True)
         # Build file sections
         sections: list[str] = []
         for rel in batch:
             abs_path = os.path.join(self.project_path, rel)
+            print(f"[DEBUG] reading {rel} ...", flush=True)
             try:
                 with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
                     content = f.read()
-            except Exception:
+            except Exception as e:
+                print(f"[DEBUG] read error {rel}: {e}", flush=True)
                 content = "(unreadable)"
-            # Truncate large files — first 300 lines is usually enough for a description
+            # Truncate large files — first 60 lines is enough for a one-sentence description
             lines = content.splitlines()
-            if len(lines) > 300:
-                content = "\n".join(lines[:300]) + f"\n…(truncated, {len(lines)} lines total)"
+            if len(lines) > 60:
+                content = "\n".join(lines[:60]) + f"\n…(truncated, {len(lines)} lines total)"
             sections.append(f"=== {rel} ===\n{content}")
 
         batch_text = "\n\n".join(sections)
-
         prompt = (
             "Analyze the following source files and return ONLY a JSON object.\n"
             "For each file path key, return an object with:\n"
@@ -304,12 +349,21 @@ class ProjectIndex:
             + batch_text
         )
 
+        print(f"[DEBUG] prompt built len={len(prompt)}, calling complete() model={model}", flush=True)
+        log_fn(f"  [Index] calling complete() model={model} prompt_len={len(prompt)}")
+
         try:
-            response = ollama.complete(model=model, prompt=prompt, max_tokens=1500)
+            response = ollama.complete(
+                model=model, prompt=prompt, max_tokens=1500, log_fn=log_fn
+            )
+            print(f"[DEBUG] complete() returned len={len(response)}", flush=True)
             parsed = _parse_json_response(response)
         except Exception as e:
-            log_fn(f"  [Index] Ollama batch failed: {e}", )
+            print(f"[DEBUG] complete() EXCEPTION: {type(e).__name__}: {e}", flush=True)
+            log_fn(f"  [Index] Ollama batch failed: {e}")
             parsed = {}
+
+        print(f"[DEBUG _describe_code_batch] END parsed keys={list(parsed.keys())}", flush=True)
 
         now_ts  = time.strftime("%Y-%m-%dT%H:%M:%S")
         for rel in batch:

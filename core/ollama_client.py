@@ -2,6 +2,7 @@
 from __future__ import annotations
 import json
 import sys
+import threading
 import traceback
 import requests
 from typing import Callable, Optional
@@ -10,39 +11,124 @@ from typing import Callable, Optional
 class OllamaClient:
     def __init__(self, base_url: str = "http://localhost:11434"):
         self.base_url = base_url.rstrip("/")
+        # Persistent session — closed on abort() to cancel in-flight requests
+        self._session = requests.Session()
+        self._session.trust_env = False   # ignore system HTTP_PROXY
+        self._session_lock = threading.Lock()
 
-    # ------------------------------------------------------------------
-    def complete(self, model: str, prompt: str, max_tokens: int = 1500) -> str:
-        """Single-turn completion. Used by ProjectIndex for batch file descriptions."""
+    # ── Session management ────────────────────────────────────────
+
+    def abort(self) -> None:
+        """
+        Cancel any in-flight HTTP request by closing+replacing the session.
+        Must be called from abort_task() in main.py so Ollama stops the old
+        request and is immediately available for the next pipeline run.
+        """
+        with self._session_lock:
+            try:
+                self._session.close()
+            except Exception:
+                pass
+            self._session = requests.Session()
+            self._session.trust_env = False
+
+    def _sess(self) -> requests.Session:
+        with self._session_lock:
+            return self._session
+
+    def _post(self, url: str, json_payload: dict, timeout) -> requests.Response:
+        """
+        Execute requests.post without blocking gevent's event loop.
+
+        When called from inside a gevent greenlet (the normal case with eel):
+          - Submits the HTTP request to a real OS thread via gevent's thread pool
+          - Suspends the current greenlet so the event loop can process WebSocket
+            messages, eel calls, timers, etc. while Ollama is working
+          - Resumes the greenlet when the response arrives
+
+        When called from a real OS thread (fallback):
+          - Executes requests.post directly
+
+        This is the standard gevent pattern for blocking I/O from greenlets.
+        Without it, requests.post blocks the entire event loop and eel loses
+        its WebSocket heartbeat → _detect_shutdown → sys.exit().
+        """
+        import requests as _req   # local import so no circular dep issues
+
+        def _do_post():
+            return self._sess().post(url, json=json_payload, timeout=timeout)
+
         try:
-            resp = requests.post(
+            import gevent.hub as _gh
+            import gevent as _gevent
+            hub = _gh.get_hub()
+            # getcurrent() is not hub → we're inside a greenlet, not the hub itself
+            if hub is not None and _gevent.getcurrent() is not hub:
+                # threadpool.apply() runs _do_post in a real OS thread
+                # and yields the current greenlet back to the hub while waiting
+                return hub.threadpool.apply(_do_post)
+        except ImportError:
+            pass   # gevent not installed — running without eel, call directly
+        except Exception:
+            pass   # anything else → fall through to direct call
+
+        return _do_post()
+
+    # ── Single-turn completion (used by ProjectIndex) ─────────────
+
+    def complete(
+        self,
+        model: str,
+        prompt: str,
+        max_tokens: int = 1500,
+        log_fn: Optional[Callable[[str], None]] = None,
+    ) -> str:
+        """Single-turn completion. Errors surfaced to log_fn AND console."""
+        print(f"[DEBUG complete()] ENTERED model={model} prompt_len={len(prompt)}", flush=True)
+        if log_fn:
+            log_fn(f"[Ollama] complete() sending — model={model} prompt_len={len(prompt)}")
+        try:
+            print(f"[DEBUG complete()] calling self._post() ...", flush=True)
+            resp = self._post(
                 f"{self.base_url}/api/generate",
-                json={
-                    "model": model, "prompt": prompt, "stream": False,
-                    "options": {"temperature": 0.1, "num_predict": max_tokens},
-                },
-                timeout=(10, 60),
+                {"model": model, "prompt": prompt, "stream": False,
+                 "options": {"temperature": 0.1, "num_predict": max_tokens}},
+                (10, 300),
             )
+            print(f"[DEBUG complete()] POST returned status={resp.status_code}", flush=True)
             resp.raise_for_status()
-            return resp.json().get("response", "")
+            result = resp.json().get("response", "")
+            print(f"[DEBUG complete()] success response_len={len(result)}", flush=True)
+            if log_fn:
+                log_fn(f"[Ollama] complete() done — response_len={len(result)}")
+            return result
+        except requests.exceptions.ConnectionError as e:
+            msg = f"[Ollama] complete() — connection error (is Ollama running?): {e}"
+        except requests.exceptions.Timeout:
+            msg = "[Ollama] complete() — timed out (300s). Ollama busy or overloaded."
         except Exception as e:
-            print(f"[OllamaClient.complete] failed: {e}", flush=True)
-            return ""
+            msg = f"[Ollama] complete() failed: {type(e).__name__}: {e}"
+        print(f"[DEBUG complete()] ERROR: {msg}", flush=True)
+        if log_fn:
+            log_fn(msg, "warn")
+        return ""
 
     def complete_vision(
-        self, model: str, prompt: str,
-        image_b64: str, mime_type: str = "image/png", max_tokens: int = 200,
+        self,
+        model: str,
+        prompt: str,
+        image_b64: str,
+        mime_type: str = "image/png",
+        max_tokens: int = 200,
     ) -> str:
-        """Vision completion for image description (llava, bakllava, etc.)."""
+        """Vision completion for image description."""
         try:
-            resp = requests.post(
+            resp = self._post(
                 f"{self.base_url}/api/generate",
-                json={
-                    "model": model, "prompt": prompt, "images": [image_b64],
-                    "stream": False,
-                    "options": {"temperature": 0.1, "num_predict": max_tokens},
-                },
-                timeout=(10, 60),
+                {"model": model, "prompt": prompt, "images": [image_b64],
+                 "stream": False,
+                 "options": {"temperature": 0.1, "num_predict": max_tokens}},
+                (10, 120),
             )
             resp.raise_for_status()
             return resp.json().get("response", "")
@@ -50,16 +136,16 @@ class OllamaClient:
             print(f"[OllamaClient.complete_vision] failed: {e}", flush=True)
             return ""
 
-    # ------------------------------------------------------------------
     def list_models(self) -> list[str]:
         try:
             r = requests.get(f"{self.base_url}/api/tags", timeout=5)
             r.raise_for_status()
             return [m["name"] for m in r.json().get("models", [])]
-        except Exception as e:
+        except Exception:
             return []
 
-    # ------------------------------------------------------------------
+    # ── Multi-turn chat with tool calling ─────────────────────────
+
     def chat_with_tools(
         self,
         model: str,
@@ -70,52 +156,30 @@ class OllamaClient:
         log_fn: Optional[Callable[[str], None]] = None,
         is_aborted: Optional[Callable[[], bool]] = None,
         max_tool_rounds: int = 40,
-    ) -> tuple[list[dict], str]:
-        """
-        Run a multi-turn chat with tool calling.
-        Returns (full_messages, final_text_response).
-
-        is_aborted: optional callable that returns True when the task
-                    has been aborted — checked before every tool round
-                    and before every tool execution.
-        """
+    ) -> tuple[list[dict], str, int]:
         history = list(messages)
-        # Cap history by total character size, not message count.
-        # This is more meaningful for small models (Qwen 9B, etc.) where
-        # a single tool_result can be 3-5k chars — 10 messages could easily
-        # be 30-50k chars, far exceeding the effective context window.
-        # We keep the first message (original task) + the most recent messages
-        # that fit within the char budget.
         MAX_HISTORY_CHARS = 12000
-
-        # Repetition detector: tracks (tool_name, args_key) → consecutive count
         _last_call: tuple[str, str] = ("", "")
         _repeat_count: int = 0
-        REPEAT_LIMIT = 3   # break inner loop after this many identical calls in a row
-        _tool_calls_made: int = 0  # total tool invocations across all rounds
-
-        # Track files already read this session to detect re-read loops
+        REPEAT_LIMIT = 3
+        _tool_calls_made: int = 0
         _files_read: set[str] = set()
         _rounds_without_write: int = 0
-        MAX_ROUNDS_WITHOUT_WRITE = 8  # inject nudge if model reads without writing
+        MAX_ROUNDS_WITHOUT_WRITE = 8
 
         for _round in range(max_tool_rounds):
-            # ── Abort check before each round ─────────────────────
             if is_aborted and is_aborted():
                 raise RuntimeError("__ABORTED__")
 
-            # ── Cap history by character budget ───────────────────
-            # Always keep the first message (original task). Then add
-            # the most recent messages newest-first until the budget runs out.
+            # Cap history by character budget
             if len(history) > 1:
-                first_msg   = history[:1]
-                rest        = history[1:]
-                budget      = MAX_HISTORY_CHARS
-                kept: list  = []
+                first_msg  = history[:1]
+                rest       = history[1:]
+                budget     = MAX_HISTORY_CHARS
+                kept: list = []
                 for msg in reversed(rest):
                     msg_size = len(str(msg.get("content", "")))
                     if budget - msg_size < 0 and kept:
-                        # Budget exhausted — stop (but always keep at least 1 recent msg)
                         break
                     kept.append(msg)
                     budget -= msg_size
@@ -123,22 +187,22 @@ class OllamaClient:
             else:
                 capped_history = history
 
-            # ── Inject "write now" nudge if model has been reading too long ──
+            # Write nudge
             if _rounds_without_write >= MAX_ROUNDS_WITHOUT_WRITE:
                 already_read = sorted(_files_read)[:10]
                 nudge = (
-                    f"You have read {len(_files_read)} files across {_round} rounds without writing anything. "
-                    f"You already have: {already_read}. "
+                    f"You have read {len(_files_read)} files across {_round} rounds "
+                    f"without writing anything. You already have: {already_read}. "
                     "Stop reading — write the required output file NOW using write_file."
                 )
                 capped_history = capped_history + [{"role": "user", "content": nudge}]
-                _rounds_without_write = 0   # reset so nudge isn't repeated every round
+                _rounds_without_write = 0
 
             payload: dict = {
-                "model": model,
+                "model":    model,
                 "messages": capped_history,
-                "stream": False,
-                "options": {"temperature": 0.2},
+                "stream":   False,
+                "options":  {"temperature": 0.2},
             }
             if system:
                 payload["system"] = system
@@ -146,46 +210,45 @@ class OllamaClient:
                 payload["tools"] = tools
 
             if log_fn:
-                log_fn(f"[Ollama] Sending request (round {_round + 1})…")
+                log_fn(f"[Ollama] Sending request (round {_round + 1})\u2026")
 
             try:
-                payload["stream"] = False  # важно для Ollama chat
-                s = requests.Session()
-                s.trust_env = True  # игнорировать HTTP_PROXY / HTTPS_PROXY из окружения
-                resp = s.post(
+                resp = self._post(
                     f"{self.base_url}/api/chat",
-                    json=payload,
-                    timeout=(10, 30),  # отдельно connect и read
+                    payload,
+                    (10, 900),
                 )
                 resp.raise_for_status()
+            except requests.exceptions.ConnectionError as e:
+                # Session closed by abort() — treat as abort
+                if is_aborted and is_aborted():
+                    raise RuntimeError("__ABORTED__")
+                raise RuntimeError(f"Ollama connection error: {e}")
             except BaseException as e:
                 print(f"\n[Ollama] Request failed ({type(e).__name__}): {e!r}", flush=True)
                 traceback.print_exc(file=sys.stdout)
                 raise
 
-            data = resp.json()
-            message = data.get("message", {})
+            data       = resp.json()
+            message    = data.get("message", {})
             history.append(message)
-
-            content = message.get("content") or ""
+            content    = message.get("content") or ""
             tool_calls: list[dict] = message.get("tool_calls") or []
 
             if content and log_fn:
-                log_fn(f"[Ollama] {content[:400]}{'…' if len(content) > 400 else ''}")
+                preview = content[:400] + ("\u2026" if len(content) > 400 else "")
+                log_fn(f"[Ollama] {preview}")
 
             if not tool_calls:
-                # Final answer – no more tool calls
                 return history, content, _tool_calls_made
 
-            # Execute each tool call and feed results back
             for tc in tool_calls:
-                # ── Abort check between tool executions ───────────
                 if is_aborted and is_aborted():
                     raise RuntimeError("__ABORTED__")
 
-                fn = tc.get("function", {})
+                fn        = tc.get("function", {})
                 tool_name: str = fn.get("name", "")
-                raw_args = fn.get("arguments", {})
+                raw_args  = fn.get("arguments", {})
                 if isinstance(raw_args, str):
                     try:
                         raw_args = json.loads(raw_args)
@@ -194,11 +257,13 @@ class OllamaClient:
 
                 _tool_calls_made += 1
                 if log_fn:
-                    log_fn(f"[Tool ►] {tool_name}({json.dumps(raw_args, ensure_ascii=False)[:200]})")
+                    log_fn(
+                        f"[Tool \u25ba] {tool_name}"
+                        f"({json.dumps(raw_args, ensure_ascii=False)[:200]})"
+                    )
 
-                # Track reads vs writes for the "write now" nudge
                 if tool_name in ("write_file", "modify_file"):
-                    _rounds_without_write = -1   # reset; incremented to 0 after loop
+                    _rounds_without_write = -1
                 elif tool_name == "read_file":
                     _path_arg = raw_args.get("path", "")
                     if _path_arg in _files_read and log_fn:
@@ -212,41 +277,33 @@ class OllamaClient:
 
                 if log_fn:
                     preview = str(result)[:300]
-                    log_fn(f"[Tool ◄] {preview}{'…' if len(str(result)) > 300 else ''}")
+                    suffix  = "\u2026" if len(str(result)) > 300 else ""
+                    log_fn(f"[Tool \u25c4] {preview}{suffix}")
 
-                history.append({
-                    "role": "tool",
-                    "content": str(result),
-                })
+                history.append({"role": "tool", "content": str(result)})
 
-                # ── Repetition detection ───────────────────────────
                 call_key = (tool_name, json.dumps(raw_args, sort_keys=True))
                 if call_key == _last_call:
                     _repeat_count += 1
                 else:
-                    _last_call = call_key
+                    _last_call    = call_key
                     _repeat_count = 1
 
                 if _repeat_count >= REPEAT_LIMIT:
                     if log_fn:
                         log_fn(
-                            f"[WARN] Tool '{tool_name}' called {_repeat_count}× in a row "
-                            f"with identical args — breaking inner loop to force re-evaluation.",
+                            f"[WARN] Tool '{tool_name}' called {_repeat_count}\u00d7 in a row "
+                            "with identical args \u2014 breaking inner loop.",
                             "warn",
                         )
-                    # Inject a nudge so the model knows it's stuck
-                    history.append({
-                        "role": "user",
-                        "content": (
-                            f"You have called '{tool_name}' {_repeat_count} times in a row "
-                            f"with the same arguments and received the same result each time. "
-                            f"Reading this file again will not help. "
-                            f"You must now call write_file to make progress, or call "
-                            f"submit_qa_verdict / confirm_task_done to signal completion."
-                        ),
-                    })
+                    history.append({"role": "user", "content": (
+                        f"You have called '{tool_name}' {_repeat_count} times in a row "
+                        "with the same arguments. Reading this file again will not help. "
+                        "You must now call write_file to make progress, or call "
+                        "submit_qa_verdict / confirm_task_done to signal completion."
+                    )})
                     return history, "", _tool_calls_made
 
-            _rounds_without_write += 1  # one more round done
+            _rounds_without_write += 1
 
         return history, "", _tool_calls_made
