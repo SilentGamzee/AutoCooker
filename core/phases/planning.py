@@ -8,6 +8,7 @@ import time
 from core.state import AppState, KanbanTask
 from core.tools import ToolExecutor, PLANNING_TOOLS
 from core.sandbox import create_sandbox, WORKDIR_NAME
+from core.project_index import analyze_cross_deps
 from core.validator import (
     validate_task_info,
     validate_json_file,
@@ -242,6 +243,57 @@ class PlanningPhase(BasePhase):
 
         executor = self._make_planning_executor(wd)
 
+        # ── Pre-compute cross-file dependencies (no LLM needed) ───
+        # This runs before the model so Discovery gets a ready-made
+        # dependency graph instead of having to guess relationships.
+        cross_deps_msg = ""
+        try:
+            all_paths = [
+                p for p in self.state.cache.file_paths
+                if not p.startswith(".tasks") and not p.startswith(".git")
+            ]
+            cross = analyze_cross_deps(wd, all_paths)
+
+            # Format a compact summary for the prompt
+            lines = ["PRE-COMPUTED CROSS-FILE DEPENDENCY GRAPH (use this to decide what to include in context.json):"]
+
+            # Forward graph: who imports who
+            graph = cross.get("graph", {})
+            if graph:
+                lines.append("\nImport graph (file → files it depends on):")
+                for src, info in list(graph.items())[:25]:
+                    deps = info.get("imports", [])
+                    if deps:
+                        lines.append(f"  {src} → {', '.join(deps[:6])}")
+
+            # Semantic index highlights: shared CSS classes, DOM IDs, API endpoints, RPC
+            sem = cross.get("semantic_index", {})
+            for sem_type in ("api_endpoints", "rpc_calls", "dom_ids", "event_names", "env_vars"):
+                entries = sem.get(sem_type, {})
+                if entries:
+                    lines.append(f"\n{sem_type} (value → files that mention it):")
+                    for val, files in list(entries.items())[:15]:
+                        if len(files) > 1:   # only show cross-file references
+                            lines.append(f"  {val!r}: {', '.join(files[:4])}")
+
+            # CSS classes used across multiple files
+            css = sem.get("css_classes", {})
+            cross_css = {k: v for k, v in css.items() if len(v) > 1}
+            if cross_css:
+                lines.append("\ncss_classes used in multiple files (implies CSS ↔ JS/HTML coupling):")
+                for cls, files in list(cross_css.items())[:10]:
+                    lines.append(f"  .{cls}: {', '.join(files[:4])}")
+
+            lines.append(
+                "\nRULE: If you add a file to context.json → to_modify, "
+                "also check its entries in the graph above and include "
+                "the files that import it (reverse_graph) or share semantic values with it."
+            )
+            cross_deps_msg = "\n".join(lines) + "\n\n"
+            self.log(f"  Cross-deps: {len(graph)} files analysed", "info")
+        except Exception as e:
+            self.log(f"  [WARN] Cross-deps analysis failed: {e}", "warn")
+
         # ── Build context from semantic index ─────────────────────
         if self._project_index and self._project_index.data:
             # Score all files by relevance to the task description
@@ -277,6 +329,7 @@ class PlanningPhase(BasePhase):
             f"Project directory: {wd}\n"
             f"Task: {self.task.title}\n"
             f"Task description: {self.task.description}\n\n"
+            f"{cross_deps_msg}"
             f"{file_context_msg}\n\n"
             f"Write project_index.json to this EXACT path: {self._rel(proj_index_path)}\n"
             f"Write context.json to this EXACT path: {self._rel(context_path)}\n\n"
@@ -298,7 +351,6 @@ class PlanningPhase(BasePhase):
             "1.1 Discovery", "p1_discovery.md",
             PLANNING_TOOLS, executor, msg, validate, model,
         )
-
     # ── 1.2 Requirements ──────────────────────────────────────────
     def _step2_requirements(self, model: str) -> bool:
         wd = self.task.project_path or self.state.working_dir
