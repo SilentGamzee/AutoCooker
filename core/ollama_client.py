@@ -303,6 +303,22 @@ class OllamaClient:
                     suffix  = "\u2026" if len(str(result)) > 300 else ""
                     log_fn(f"[Tool \u25c4] {preview}{suffix}")
 
+                # ══════════════════════════════════════════════════════
+                # FIX: Немедленный выход после confirm_task_done
+                # Предотвращает зацикливание, когда модель вызывает
+                # confirm_task_done многократно (40+ раз)
+                # ══════════════════════════════════════════════════════
+                if tool_name == "confirm_task_done":
+                    if log_fn:
+                        log_fn(
+                            "  → confirm_task_done called - exiting for validation check",
+                            "info"
+                        )
+                    history.append({"role": "tool", "content": str(result)})
+                    # Немедленно завершить chat_with_tools
+                    # Управление вернётся в run_loop для проверки validate_fn
+                    return history, "", _tool_calls_made
+
                 history.append({"role": "tool", "content": str(result)})
 
                 call_key = (tool_name, json.dumps(raw_args, sort_keys=True))

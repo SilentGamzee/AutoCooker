@@ -70,15 +70,41 @@ class QAPhase(BasePhase):
             self.log("═══ QA PHASE COMPLETE — FAILED (subtask review) ═══", "error")
             self.task.has_errors = True
             return False, all_issues
+        
+        # ── NEW: Requirements Checklist Verification ────────────────────
+        # Verify each specific requirement from Planning's extracted checklist
+        checklist_passed = True
+        checklist_issues = []
+        
+        if self.task.requirements_checklist:
+            self.log("─── QA Requirements Checklist Verification ───")
+            checklist_passed, checklist_issues = self._verify_requirements_checklist(model)
+            
+            if not checklist_passed:
+                self.log(f"  ⚠️ {len(checklist_issues)} requirement(s) not satisfied", "warn")
+                all_issues.extend(checklist_issues)
 
         # ── Task-goal verification (did we actually solve what was asked?) ─
         self.log("─── QA Goal Verification ───")
         goal_passed, goal_issues = self._verify_task_goal(model)
 
-        if not goal_passed:
-            self.log("═══ QA PHASE COMPLETE — FAILED (goal not met) ═══", "error")
+        # ── Final verdict combines all checks ──────────────────────────
+        final_passed = tests_ok and subtask_passed and checklist_passed and goal_passed
+        final_issues = all_issues + checklist_issues + goal_issues
+        
+        if not final_passed:
+            reasons = []
+            if not tests_ok:
+                reasons.append("tests failed")
+            if not checklist_passed:
+                reasons.append(f"{len(checklist_issues)} requirements not met")
+            if not goal_passed:
+                reasons.append("goal not achieved")
+            
+            reason_str = ", ".join(reasons)
+            self.log(f"═══ QA PHASE COMPLETE — FAILED ({reason_str}) ═══", "error")
             self.task.has_errors = True
-            return False, goal_issues
+            return False, final_issues
 
         self.log("═══ QA PHASE COMPLETE — PASSED ═══", "ok")
         return True, []
@@ -289,6 +315,140 @@ class QAPhase(BasePhase):
             self.log(f"  ✗ [Goal] {issue}", "warn")
 
         return verdict == "PASS", issues
+    
+    # ── Requirements Checklist Verification ───────────────────────────
+    def _verify_requirements_checklist(self, model: str) -> tuple[bool, list[str]]:
+        """
+        Verify each requirement from the Planning-extracted checklist.
+        Uses Ollama to check if each requirement is satisfied by the implementation.
+        Returns (all_passed, failed_requirements_list).
+        """
+        if not self.task.requirements_checklist:
+            self.log("  No requirements checklist to verify", "info")
+            return True, []
+        
+        workdir = os.path.join(self.task.task_dir, WORKDIR_NAME)
+        
+        # Get changed files summary
+        changed_files = self._get_changed_files_summary(workdir)
+        
+        all_passed = True
+        failed_requirements = []
+        
+        for i, req_dict in enumerate(self.task.requirements_checklist, 1):
+            requirement = req_dict.get("requirement", "")
+            if not requirement:
+                continue
+            
+            self.log(f"  Checking requirement {i}/{len(self.task.requirements_checklist)}: {requirement[:80]}...", "info")
+            
+            # Build verification prompt
+            prompt = f"""
+REQUIREMENT TO VERIFY:
+{requirement}
+
+IMPLEMENTATION (changed files):
+{changed_files}
+
+QUESTION:
+Is this requirement satisfied by the implementation?
+
+Analyze the code changes and determine if they fulfill the requirement.
+Respond with:
+- PASS if the requirement is clearly satisfied
+- FAIL if the requirement is not met or only partially implemented
+
+Then provide a brief explanation (1-2 sentences).
+
+Format:
+VERDICT: [PASS/FAIL]
+EXPLANATION: [your explanation]
+"""
+            
+            try:
+                response = self.ollama.complete(
+                    model=model,
+                    system="You are a QA engineer verifying requirements against implementation.",
+                    prompt=prompt,
+                    max_tokens=300
+                )
+                
+                # Parse response
+                verdict = "FAIL"
+                explanation = response
+                
+                if "VERDICT:" in response:
+                    lines = response.split('\n')
+                    for line in lines:
+                        if line.strip().startswith("VERDICT:"):
+                            verdict_line = line.replace("VERDICT:", "").strip()
+                            verdict = "PASS" if "PASS" in verdict_line.upper() else "FAIL"
+                        elif line.strip().startswith("EXPLANATION:"):
+                            explanation = line.replace("EXPLANATION:", "").strip()
+                
+                # Update checklist
+                req_dict["status"] = "pass" if verdict == "PASS" else "fail"
+                req_dict["explanation"] = explanation
+                
+                if verdict == "PASS":
+                    self.log(f"    ✓ PASS: {explanation[:100]}", "ok")
+                else:
+                    self.log(f"    ✗ FAIL: {explanation[:100]}", "warn")
+                    all_passed = False
+                    failed_requirements.append(f"Requirement {i}: {requirement}")
+                    
+            except Exception as e:
+                self.log(f"    ⚠️ Verification error: {e}", "warn")
+                req_dict["status"] = "error"
+                req_dict["explanation"] = f"Verification failed: {e}"
+                all_passed = False
+        
+        # Save updated checklist
+        self.state._save_kanban()
+        
+        # Save verification report
+        self.task.qa_verification_report = {
+            "total_requirements": len(self.task.requirements_checklist),
+            "passed": sum(1 for r in self.task.requirements_checklist if r.get("status") == "pass"),
+            "failed": sum(1 for r in self.task.requirements_checklist if r.get("status") == "fail"),
+            "errors": sum(1 for r in self.task.requirements_checklist if r.get("status") == "error"),
+            "requirements": self.task.requirements_checklist
+        }
+        self.state._save_kanban()
+        
+        return all_passed, failed_requirements
+    
+    def _get_changed_files_summary(self, workdir: str) -> str:
+        """Get a summary of changed files with their contents."""
+        summary_parts = []
+        
+        # Get scope from subtasks
+        for subtask in self.task.subtasks:
+            if subtask.get("status") != "done":
+                continue
+            
+            files_created = subtask.get("files_to_create", [])
+            files_modified = subtask.get("files_to_modify", [])
+            
+            for fpath in files_created + files_modified:
+                full_path = os.path.join(workdir, fpath)
+                if os.path.isfile(full_path):
+                    try:
+                        with open(full_path, 'r', encoding='utf-8', errors='replace') as f:
+                            content = f.read()
+                        
+                        # Truncate large files
+                        if len(content) > 1500:
+                            content = content[:1500] + "\n...(truncated)"
+                        
+                        summary_parts.append(f"\n=== {fpath} ===\n{content}")
+                    except Exception:
+                        summary_parts.append(f"\n=== {fpath} ===\n(could not read)")
+        
+        if not summary_parts:
+            return "(no changed files found)"
+        
+        return "\n".join(summary_parts)
 
     # ── Tests ─────────────────────────────────────────────────────────
     def _run_tests(self) -> bool:

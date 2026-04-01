@@ -176,6 +176,13 @@ class KanbanTask:
     max_patches: int = 2
     patch_count: int = 0
     last_executed_subtask_id: str = ""
+    
+    # ══════════════════════════════════════════════════════
+    # Requirements verification (for improved QA)
+    # ══════════════════════════════════════════════════════
+    requirements_checklist: list[dict] = field(default_factory=list)
+    # Each requirement dict: {"requirement": str, "status": str, "explanation": str}
+    qa_verification_report: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -205,6 +212,9 @@ class KanbanTask:
             "max_patches": self.max_patches,
             "patch_count": self.patch_count,
             "last_executed_subtask_id": self.last_executed_subtask_id,
+            # Requirements verification
+            "requirements_checklist": self.requirements_checklist,
+            "qa_verification_report": self.qa_verification_report,
         }
 
     def to_dict_ui(self) -> dict:
@@ -227,8 +237,18 @@ class KanbanTask:
     def subtask_progress(self) -> int:
         if not self.subtasks:
             return self.progress
-        done = sum(1 for s in self.subtasks if s.get("status") == "done")
-        return int(done / len(self.subtasks) * 100)
+        
+        # Count only valid subtasks (exclude skipped and invalid)
+        valid_subtasks = [
+            s for s in self.subtasks 
+            if s.get("status") not in ("skipped", "invalid")
+        ]
+        
+        if not valid_subtasks:
+            return 100  # All subtasks skipped/invalid = task complete
+        
+        done = sum(1 for s in valid_subtasks if s.get("status") == "done")
+        return int(done / len(valid_subtasks) * 100)
     
     def update_phase_status(self, phase: str, status: str):
         """Update phase status and set resume metadata for smart Continue."""
@@ -404,6 +424,9 @@ class AppState:
                     max_patches=d.get("max_patches", 2),
                     patch_count=d.get("patch_count", 0),
                     last_executed_subtask_id=d.get("last_executed_subtask_id", ""),
+                    # Requirements verification
+                    requirements_checklist=d.get("requirements_checklist", []),
+                    qa_verification_report=d.get("qa_verification_report", {}),
                 )
                 self.load_logs_for_task(t)
                 self.kanban_tasks.append(t)

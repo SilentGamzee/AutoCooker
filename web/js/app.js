@@ -446,6 +446,14 @@ function renderSubtasks(subtasks) {
       badge = '<span class="st-badge st-done">✓ Done</span>';
       iconChar = '✓';
       iconCls = 'done';
+    } else if (status === 'invalid') {
+      badge = '<span class="st-badge st-invalid">⊘ Invalid</span>';
+      iconChar = '⊘';
+      iconCls = 'invalid';
+    } else if (status === 'skipped') {
+      badge = '<span class="st-badge st-skipped">⊘ Skipped</span>';
+      iconChar = '⊘';
+      iconCls = 'skipped';
     } else if (status === 'needs_analysis') {
       badge = '<span class="st-badge st-analysis">⚠️ Analysis Needed</span>';
       iconChar = '⚠';

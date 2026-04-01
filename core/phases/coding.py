@@ -75,6 +75,33 @@ class CodingPhase(BasePhase):
                 )
                 all_ok = False
                 continue
+            
+            # Skip if manually skipped or marked invalid
+            if prior_status in ("skipped", "invalid"):
+                self.log(
+                    f"  ⊘ Task {sid} is {prior_status}, skipping",
+                    "info"
+                )
+                continue
+            
+            # ══════════════════════════════════════════════════════
+            # NEW: Automatic validation before execution
+            # ══════════════════════════════════════════════════════
+            valid, invalid_reason = self._validate_subtask_before_execution(subtask_dict)
+            if not valid:
+                subtask_dict["status"] = "invalid"
+                subtask_dict["invalid_reason"] = invalid_reason
+                subtask_dict["invalidated_at"] = self._current_timestamp()
+                
+                self.log(
+                    f"  ⊘ Task {sid} is invalid: {invalid_reason}. Skipping.",
+                    "warn"
+                )
+                
+                # Save status and continue to next subtask
+                self.state.save_subtasks_for_task(self.task)
+                self.push_task()
+                continue
 
             # Task header
             self.log(f"\n  ▶ Task {sid}: {subtask_dict.get('title', '')}", "step_header")
@@ -320,6 +347,63 @@ class CodingPhase(BasePhase):
             CODING_TOOLS, executor, msg, validate_fn, model,
             max_outer_iterations=10,  # Reduced from 20 - each attempt gets 10 internal rounds
         )
+
+    # ── Subtask validation before execution ────────────────────────
+    def _validate_subtask_before_execution(
+        self, subtask_dict: dict
+    ) -> tuple[bool, str]:
+        """
+        Validate subtask before execution to catch obviously invalid tasks.
+        Returns (is_valid, reason).
+        
+        Checks:
+        1. Has files to create or modify
+        2. Files to modify actually exist
+        3. Has non-empty description
+        4. No duplicate file creation (same file in multiple subtasks)
+        """
+        sid = subtask_dict.get("id", "?")
+        
+        # Check 1: Must have files to work with
+        files_to_create = subtask_dict.get("files_to_create", [])
+        files_to_modify = subtask_dict.get("files_to_modify", [])
+        
+        if not files_to_create and not files_to_modify:
+            return False, "No files to create or modify"
+        
+        # Check 2: Files to modify must exist
+        workdir = self.task.project_path or self.state.working_dir
+        for file_path in files_to_modify:
+            full_path = os.path.join(workdir, file_path)
+            if not os.path.isfile(full_path):
+                return False, f"File to modify doesn't exist: {file_path}"
+        
+        # Check 3: Must have description
+        description = subtask_dict.get("description", "").strip()
+        if not description:
+            return False, "Empty description"
+        
+        # Check 4: Duplicate file creation check
+        # (only check files_to_create, not files_to_modify)
+        for file_path in files_to_create:
+            # Check if this file is created by another subtask
+            for other_st in self.task.subtasks:
+                if other_st.get("id") == sid:
+                    continue  # Skip self
+                
+                other_creates = other_st.get("files_to_create", [])
+                if file_path in other_creates:
+                    # Check if the other subtask is done or in progress
+                    other_status = other_st.get("status", "pending")
+                    if other_status in ("done", "in_progress"):
+                        return False, f"File {file_path} already handled by {other_st.get('id')}"
+        
+        return True, "OK"
+    
+    def _current_timestamp(self) -> str:
+        """Get current timestamp in ISO format."""
+        import time
+        return time.strftime("%Y-%m-%dT%H:%M:%S")
 
     # ── Structural completion checker ──────────────────────────────
     def _check_completion_condition(

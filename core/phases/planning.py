@@ -248,6 +248,7 @@ class PlanningPhase(BasePhase):
             steps = [
                 ("1.1 Discovery",       self._step1_discovery),
                 ("1.2 Requirements",    self._step2_requirements),
+                ("1.2.1 Extract Checklist", self._step2_1_extract_checklist),
                 ("1.3 Spec",            self._step3_spec),
                 ("1.4 Critique",        self._step4_critique),
                 ("1.5 Impl Plan",       self._step5_impl_plan),
@@ -414,6 +415,92 @@ class PlanningPhase(BasePhase):
             "1.2 Requirements", "p2_requirements.md",
             PLANNING_TOOLS, executor, msg, validate, model,
         )
+    
+    # ── 1.2.1 Extract Requirements Checklist ──────────────────────
+    def _step2_1_extract_checklist(self, model: str) -> bool:
+        """
+        Extract a numbered checklist of specific, testable requirements
+        from the task description for QA verification.
+        """
+        self.log("  Extracting requirements checklist for QA verification...")
+        
+        prompt = f"""
+TASK TITLE: {self.task.title}
+
+TASK DESCRIPTION:
+{self.task.description}
+
+Extract a numbered list of SPECIFIC, TESTABLE requirements that can be verified by examining the code.
+
+Requirements should be:
+1. Concrete and specific (not vague)
+2. Verifiable by code inspection
+3. Focused on user-visible functionality
+4. Independent (each requirement stands alone)
+
+Example:
+Task: "Add login form with email and password fields"
+Requirements:
+1. Login form HTML element exists
+2. Email input field is present in the form
+3. Password input field is present in the form
+4. Submit button exists in the form
+5. Form validation checks email format
+6. Error message displays on invalid credentials
+
+Now extract requirements for the task above. Output ONLY the numbered list, one requirement per line.
+"""
+        
+        try:
+            response = self.ollama.complete(
+                model=model,
+                system="You are a requirements analyst. Extract clear, testable requirements from task descriptions.",
+                prompt=prompt,
+                max_tokens=800
+            )
+            
+            # Parse numbered list
+            requirements = self._parse_requirements_list(response)
+            
+            if not requirements:
+                self.log("  ⚠️ No requirements extracted, using task description as single requirement", "warn")
+                requirements = [self.task.description]
+            
+            # Save to task as checklist
+            self.task.requirements_checklist = [
+                {"requirement": req, "status": "pending", "explanation": ""}
+                for req in requirements
+            ]
+            
+            self.state._save_kanban()
+            
+            self.log(f"  ✓ Extracted {len(requirements)} requirements for QA verification", "ok")
+            for i, req in enumerate(requirements, 1):
+                self.log(f"    {i}. {req[:100]}{'...' if len(req) > 100 else ''}", "info")
+            
+            return True
+            
+        except Exception as e:
+            self.log(f"  ⚠️ Requirements extraction failed: {e}", "warn")
+            # Not critical - continue with empty checklist
+            return True
+    
+    def _parse_requirements_list(self, text: str) -> list[str]:
+        """Parse numbered list from AI response."""
+        lines = text.strip().split('\n')
+        requirements = []
+        
+        import re
+        for line in lines:
+            line = line.strip()
+            # Match patterns like "1. ", "1) ", "1 - ", etc.
+            match = re.match(r'^\d+[\.\)\-\:]\s*(.+)$', line)
+            if match:
+                req = match.group(1).strip()
+                if req and len(req) > 10:  # Filter out too short entries
+                    requirements.append(req)
+        
+        return requirements
 
     # ── 1.3 Spec ──────────────────────────────────────────────────
     def _step3_spec(self, model: str) -> bool:

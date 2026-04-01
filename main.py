@@ -707,17 +707,60 @@ def get_task_files(task_id: str) -> list[str]:
     if task.project_path and os.path.isdir(task.project_path):
         paths: list[str] = []
         for dirpath, dirnames, filenames in os.walk(task.project_path):
+            # Filter out hidden and system directories
             dirnames[:] = [
                 d for d in dirnames
                 if not d.startswith(".") and d not in ("__pycache__", "node_modules")
             ]
             for fname in filenames:
+                # ══════════════════════════════════════════════════════
+                # Filter out system and cache files
+                # ══════════════════════════════════════════════════════
+                if _should_ignore_file(fname):
+                    continue
+                
                 full = os.path.join(dirpath, fname)
                 paths.append(os.path.relpath(full, task.project_path))
         task.files = paths
         STATE._save_kanban()
         return paths
     return task.files
+
+
+def _should_ignore_file(filename: str) -> bool:
+    """
+    Check if file should be ignored from task file list.
+    Returns True if file should be ignored.
+    """
+    # Ignore compiled Python files
+    if filename.endswith(('.pyc', '.pyo', '.pyd')):
+        return True
+    
+    # Ignore Python cache files
+    if filename.endswith('.py[cod]'):
+        return True
+    
+    # Ignore OS-specific files
+    if filename in ('.DS_Store', 'Thumbs.db', 'desktop.ini'):
+        return True
+    
+    # Ignore editor/IDE files
+    if filename.endswith(('.swp', '.swo', '~', '.bak')):
+        return True
+    
+    # Ignore hidden files (starting with .)
+    if filename.startswith('.') and filename not in ('.gitignore', '.env.example'):
+        return True
+    
+    # Ignore common lock files
+    if filename.endswith(('.lock', '.pid')):
+        return True
+    
+    # Ignore log files (optional - comment out if you need logs)
+    # if filename.endswith('.log'):
+    #     return True
+    
+    return False
 
 
 @eel.expose
