@@ -249,6 +249,9 @@ class PlanningPhase(BasePhase):
                 ("1.1 Discovery",       self._step1_discovery),
                 ("1.2 Requirements",    self._step2_requirements),
                 ("1.2.1 Extract Checklist", self._step2_1_extract_checklist),
+                ("1.2.2 Extract User Flow", self._step2_2_extract_user_flow),
+                ("1.2.3 Extract System Flow", self._step2_3_extract_system_flow),
+                ("1.2.4 Extract Purpose", self._step2_4_extract_purpose),
                 ("1.3 Spec",            self._step3_spec),
                 ("1.4 Critique",        self._step4_critique),
                 ("1.5 Impl Plan",       self._step5_impl_plan),
@@ -483,6 +486,224 @@ Now extract requirements for the task above. Output ONLY the numbered list, one 
         except Exception as e:
             self.log(f"  ⚠️ Requirements extraction failed: {e}", "warn")
             # Not critical - continue with empty checklist
+            return True
+    
+    def _step2_2_extract_user_flow(self, model: str) -> bool:
+        """
+        Extract User Flow - how user interacts with the feature (UI steps).
+        """
+        try:
+            self.log("  Extracting user flow (UI interaction steps)...", "info")
+            
+            prompt = f"""
+TASK: {self.task.title}
+
+DESCRIPTION:
+{self.task.description}
+
+Extract the USER FLOW - step by step, how will the user interact with this feature?
+
+Focus on:
+- UI interactions (clicks, inputs, views)
+- User actions (opens, selects, uploads, downloads)
+- What user sees at each step
+
+Format as numbered list:
+1. User opens [where]
+2. User clicks [what]
+3. User sees [what]
+4. User inputs [what]
+5. System shows [result]
+6. User completes [action]
+
+Provide 5-15 concrete steps. Be specific about UI elements and user actions.
+"""
+            
+            response = self.ollama.complete(
+                model=model,
+                system="You extract user interaction flows from task descriptions.",
+                prompt=prompt,
+                max_tokens=500
+            )
+            
+            # Parse numbered list
+            user_flow = self._parse_requirements_list(response)
+            
+            if not user_flow:
+                self.log("  No user flow extracted, skipping", "warn")
+                return True
+            
+            # Save to task
+            self.task.user_flow_steps = user_flow
+            self.state._save_kanban()
+            
+            self.log(f"  ✓ Extracted {len(user_flow)} user flow steps", "ok")
+            for i, step in enumerate(user_flow[:5], 1):  # Show first 5
+                self.log(f"    {i}. {step[:80]}{'...' if len(step) > 80 else ''}", "info")
+            if len(user_flow) > 5:
+                self.log(f"    ... and {len(user_flow) - 5} more steps", "info")
+            
+            return True
+            
+        except Exception as e:
+            self.log(f"  ⚠️ User flow extraction failed: {e}", "warn")
+            return True
+    
+    def _step2_3_extract_system_flow(self, model: str) -> bool:
+        """
+        Extract System Flow - what the system does with data (processing steps).
+        CRITICAL for features like attachments that need actual processing.
+        """
+        try:
+            self.log("  Extracting system flow (data processing steps)...", "info")
+            
+            # Check if task involves data processing
+            keywords = ["attach", "upload", "file", "image", "document", "data", "api", "ollama", "vision", "process", "send", "extract"]
+            has_processing = any(kw in self.task.description.lower() for kw in keywords)
+            
+            if not has_processing:
+                self.log("  No data processing keywords found, skipping system flow", "info")
+                return True
+            
+            prompt = f"""
+TASK: {self.task.title}
+
+DESCRIPTION:
+{self.task.description}
+
+Extract the SYSTEM FLOW - what does the program/system do with the data?
+
+Consider:
+- If task involves attachments/files → how are they processed?
+- If task involves images → are they sent to Ollama vision?
+- If task involves documents → is text extracted?
+- If task involves API calls → what data is sent/received?
+- If task involves validation → what checks are performed?
+- If task involves storage → how is data persisted?
+
+Format as numbered list of SYSTEM actions:
+1. System receives [data] from [source]
+2. System validates [what]
+3. System processes [data] by [action]
+4. System sends to [destination] (e.g., Ollama API, database)
+5. System stores [result] in [location]
+6. System returns [output] to [recipient]
+
+Focus on DATA FLOW and PROCESSING, not UI. Be specific about:
+- API calls (especially Ollama vision for images)
+- Data transformations (base64, text extraction, parsing)
+- Storage locations
+- Processing steps
+
+Provide 5-15 concrete steps.
+"""
+            
+            response = self.ollama.complete(
+                model=model,
+                system="You extract system data processing flows from task descriptions.",
+                prompt=prompt,
+                max_tokens=600
+            )
+            
+            # Parse numbered list
+            system_flow = self._parse_requirements_list(response)
+            
+            if not system_flow:
+                self.log("  No system flow extracted", "warn")
+                return True
+            
+            # Save to task
+            self.task.system_flow_steps = system_flow
+            self.state._save_kanban()
+            
+            self.log(f"  ✓ Extracted {len(system_flow)} system flow steps", "ok")
+            for i, step in enumerate(system_flow[:5], 1):
+                self.log(f"    {i}. {step[:80]}{'...' if len(step) > 80 else ''}", "info")
+            if len(system_flow) > 5:
+                self.log(f"    ... and {len(system_flow) - 5} more steps", "info")
+            
+            return True
+            
+        except Exception as e:
+            self.log(f"  ⚠️ System flow extraction failed: {e}", "warn")
+            return True
+    
+    def _step2_4_extract_purpose(self, model: str) -> bool:
+        """
+        Extract Purpose - why user needs this feature (problem/solution/use cases).
+        """
+        try:
+            self.log("  Extracting purpose (problem/solution/use cases)...", "info")
+            
+            prompt = f"""
+TASK: {self.task.title}
+
+DESCRIPTION:
+{self.task.description}
+
+Why does the user need this feature? What problem does it solve?
+
+Answer in this format:
+PROBLEM: [what problem user has now - 1-2 sentences]
+SOLUTION: [how this feature solves it - 1-2 sentences]
+USE CASES: [specific scenarios where user benefits - 2-3 examples]
+
+Be concrete and specific.
+"""
+            
+            response = self.ollama.complete(
+                model=model,
+                system="You extract the purpose and value proposition of features.",
+                prompt=prompt,
+                max_tokens=400
+            )
+            
+            # Parse sections
+            purpose = {
+                "problem": "",
+                "solution": "",
+                "use_cases": ""
+            }
+            
+            lines = response.split('\n')
+            current_section = None
+            
+            for line in lines:
+                line = line.strip()
+                if line.startswith("PROBLEM:"):
+                    current_section = "problem"
+                    purpose["problem"] = line.replace("PROBLEM:", "").strip()
+                elif line.startswith("SOLUTION:"):
+                    current_section = "solution"
+                    purpose["solution"] = line.replace("SOLUTION:", "").strip()
+                elif line.startswith("USE CASES:") or line.startswith("USE CASE:"):
+                    current_section = "use_cases"
+                    purpose["use_cases"] = line.replace("USE CASES:", "").replace("USE CASE:", "").strip()
+                elif current_section and line:
+                    purpose[current_section] += " " + line
+            
+            # Clean up
+            for key in purpose:
+                purpose[key] = purpose[key].strip()
+            
+            if not any(purpose.values()):
+                self.log("  No purpose extracted, skipping", "warn")
+                return True
+            
+            # Save to task
+            self.task.purpose = purpose
+            self.state._save_kanban()
+            
+            self.log(f"  ✓ Extracted purpose", "ok")
+            if purpose["problem"]:
+                self.log(f"    Problem: {purpose['problem'][:100]}...", "info")
+            if purpose["solution"]:
+                self.log(f"    Solution: {purpose['solution'][:100]}...", "info")
+            
+            return True
+            
+        except Exception as e:
+            self.log(f"  ⚠️ Purpose extraction failed: {e}", "warn")
             return True
     
     def _parse_requirements_list(self, text: str) -> list[str]:

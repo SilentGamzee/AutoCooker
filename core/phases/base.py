@@ -38,10 +38,25 @@ class BasePhase:
 
     # ── Logging ──────────────────────────────────────────────────
     def log(self, msg: str, log_type: Optional[str] = None):
+        # Task-specific log
         self.task.add_log(msg, phase=self.phase_name, log_type=log_type)
         self.state.logs.append(msg)
         # Persist log entry to task_dir/logs.json immediately
         self.state.save_logs_for_task(self.task)
+        
+        # Global log (centralized logging)
+        try:
+            from core.logger import GLOBAL_LOG
+            GLOBAL_LOG.log(
+                phase=self.phase_name,
+                level=log_type or "info",
+                message=msg,
+                task_id=self.task.id,
+                log_type=log_type or "info"
+            )
+        except Exception:
+            pass  # Don't crash if global logging fails
+        
         # eel call must go through gevent event loop — not safe from real OS threads
         task_id = self.task.id
         entry   = self.task.logs[-1]

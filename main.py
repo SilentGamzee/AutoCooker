@@ -24,6 +24,7 @@ from core.ollama_client import OllamaClient
 from core.phases.planning import PlanningPhase
 from core.phases.coding import CodingPhase
 from core.phases.qa import QAPhase
+from core.logger import GLOBAL_LOG  # Global logging
 
 # ─── Global error reporting ──────────────────────────────────────
 import threading
@@ -335,6 +336,7 @@ def start_task(task_id: str) -> dict:
         else:
             # Новый запуск - начинаем с начала
             task.add_log("═══ Starting Pipeline ═══", "system", "phase_header")
+            GLOBAL_LOG.log("system", "info", f"═══ Starting Pipeline for task {task.id} ═══", task.id, "phase_header")
             # Сброс статусов фаз
             for phase in phases:
                 task.phase_status[phase] = "pending"

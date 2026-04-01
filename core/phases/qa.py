@@ -17,6 +17,7 @@ MAX_FIXER_ITERATIONS    = 3  # outer loops inside run_loop for the fixer
 class QAPhase(BasePhase):
     def __init__(self, state: AppState, task: KanbanTask):
         super().__init__(state, task, "qa")
+        self._review_attempts = 0  # Track review cycles to avoid empty re-reads
 
     # ── Entry ─────────────────────────────────────────────────────────
     def run(self) -> tuple[bool, list[str]]:
@@ -83,14 +84,38 @@ class QAPhase(BasePhase):
             if not checklist_passed:
                 self.log(f"  ⚠️ {len(checklist_issues)} requirement(s) not satisfied", "warn")
                 all_issues.extend(checklist_issues)
+        
+        # ── NEW: User Flow Verification ──────────────────────────────────
+        # Verify user can actually interact with the feature
+        user_flow_passed = True
+        user_flow_issues = []
+        
+        if self.task.user_flow_steps:
+            user_flow_passed, user_flow_issues = self._verify_user_flow(model)
+            
+            if not user_flow_passed:
+                self.log(f"  ⚠️ {len(user_flow_issues)} user flow step(s) not supported", "warn")
+                all_issues.extend(user_flow_issues)
+        
+        # ── NEW: System Flow Verification ────────────────────────────────
+        # Verify system actually PROCESSES data (not just stores)
+        system_flow_passed = True
+        system_flow_issues = []
+        
+        if self.task.system_flow_steps:
+            system_flow_passed, system_flow_issues = self._verify_system_flow(model)
+            
+            if not system_flow_passed:
+                self.log(f"  ⚠️ {len(system_flow_issues)} system flow step(s) not implemented", "warn")
+                all_issues.extend(system_flow_issues)
 
         # ── Task-goal verification (did we actually solve what was asked?) ─
         self.log("─── QA Goal Verification ───")
         goal_passed, goal_issues = self._verify_task_goal(model)
 
         # ── Final verdict combines all checks ──────────────────────────
-        final_passed = tests_ok and subtask_passed and checklist_passed and goal_passed
-        final_issues = all_issues + checklist_issues + goal_issues
+        final_passed = tests_ok and subtask_passed and checklist_passed and user_flow_passed and system_flow_passed and goal_passed
+        final_issues = all_issues + checklist_issues + user_flow_issues + system_flow_issues + goal_issues
         
         if not final_passed:
             reasons = []
@@ -98,6 +123,10 @@ class QAPhase(BasePhase):
                 reasons.append("tests failed")
             if not checklist_passed:
                 reasons.append(f"{len(checklist_issues)} requirements not met")
+            if not user_flow_passed:
+                reasons.append(f"{len(user_flow_issues)} user flow steps unsupported")
+            if not system_flow_passed:
+                reasons.append(f"{len(system_flow_issues)} system flow steps missing")
             if not goal_passed:
                 reasons.append("goal not achieved")
             
@@ -419,7 +448,10 @@ EXPLANATION: [your explanation]
         return all_passed, failed_requirements
     
     def _get_changed_files_summary(self, workdir: str) -> str:
-        """Get a summary of changed files with their contents."""
+        """
+        Get FULL content of changed files (not truncated preview).
+        Uses larger limit (5KB instead of 1.5KB) to avoid "empty file" issues.
+        """
         summary_parts = []
         
         # Get scope from subtasks
@@ -435,20 +467,157 @@ EXPLANATION: [your explanation]
                 if os.path.isfile(full_path):
                     try:
                         with open(full_path, 'r', encoding='utf-8', errors='replace') as f:
-                            content = f.read()
+                            content = f.read()  # Read FULL file
                         
-                        # Truncate large files
-                        if len(content) > 1500:
-                            content = content[:1500] + "\n...(truncated)"
+                        # Truncate only very large files (5KB limit instead of 1.5KB)
+                        if len(content) > 5000:
+                            content = content[:5000] + "\n...(truncated for context, but file is complete)"
                         
                         summary_parts.append(f"\n=== {fpath} ===\n{content}")
-                    except Exception:
-                        summary_parts.append(f"\n=== {fpath} ===\n(could not read)")
+                    except Exception as e:
+                        summary_parts.append(f"\n=== {fpath} ===\n(error reading: {e})")
         
         if not summary_parts:
             return "(no changed files found)"
         
         return "\n".join(summary_parts)
+    
+    def _verify_user_flow(self, model: str) -> tuple[bool, list[str]]:
+        """
+        Verify that implementation supports the extracted user flow steps.
+        Checks if user can actually perform each UI interaction.
+        """
+        if not self.task.user_flow_steps:
+            self.log("  No user flow defined, skipping", "info")
+            return True, []
+        
+        self.log(f"─── QA User Flow Verification ({len(self.task.user_flow_steps)} steps) ───")
+        
+        workdir = os.path.join(self.task.task_dir, WORKDIR_NAME)
+        changed_files = self._get_changed_files_summary(workdir)
+        
+        all_passed = True
+        failed_steps = []
+        
+        for i, step in enumerate(self.task.user_flow_steps, 1):
+            self.log(f"  Checking step {i}/{len(self.task.user_flow_steps)}: {step[:60]}...", "info")
+            
+            prompt = f"""
+USER FLOW STEP:
+{step}
+
+IMPLEMENTATION (code):
+{changed_files}
+
+Can the user perform this step with the current implementation?
+
+Analyze:
+- If step says "clicks button" → is there a button element?
+- If step says "sees list" → is there HTML/rendering code?
+- If step says "uploads file" → is there file input?
+- If step says "downloads" → is there download link/button?
+
+Answer YES only if the code clearly supports this user action.
+Answer NO if the code is missing or incomplete.
+
+Format:
+VERDICT: [YES/NO]
+REASON: [brief explanation]
+"""
+            
+            try:
+                response = self.ollama.complete(
+                    model=model,
+                    system="You verify user flow steps against implementation.",
+                    prompt=prompt,
+                    max_tokens=200
+                )
+                
+                verdict = "NO"
+                if "VERDICT:" in response and "YES" in response.upper():
+                    verdict = "YES"
+                
+                if verdict == "YES":
+                    self.log(f"    ✓ Step {i} supported", "ok")
+                else:
+                    self.log(f"    ✗ Step {i} NOT supported: {step[:60]}", "warn")
+                    all_passed = False
+                    failed_steps.append(f"User flow step {i}: {step}")
+                    
+            except Exception as e:
+                self.log(f"    ⚠️ Verification error: {e}", "warn")
+                all_passed = False
+        
+        return all_passed, failed_steps
+    
+    def _verify_system_flow(self, model: str) -> tuple[bool, list[str]]:
+        """
+        Verify that system actually PROCESSES data as specified.
+        CRITICAL for catching missing functionality (e.g., attachments not sent to Ollama).
+        """
+        if not self.task.system_flow_steps:
+            self.log("  No system flow defined, skipping", "info")
+            return True, []
+        
+        self.log(f"─── QA System Flow Verification ({len(self.task.system_flow_steps)} steps) ───")
+        
+        workdir = os.path.join(self.task.task_dir, WORKDIR_NAME)
+        changed_files = self._get_changed_files_summary(workdir)
+        
+        all_passed = True
+        failed_steps = []
+        
+        for i, step in enumerate(self.task.system_flow_steps, 1):
+            self.log(f"  Checking step {i}/{len(self.task.system_flow_steps)}: {step[:60]}...", "info")
+            
+            prompt = f"""
+SYSTEM FLOW STEP:
+{step}
+
+IMPLEMENTATION (code):
+{changed_files}
+
+Does the implementation actually PERFORM this processing step?
+
+Look for ACTUAL CODE that does this:
+- If step says "sends to Ollama vision" → search for ollama API call with vision model
+- If step says "extracts text from PDF" → search for PDF parsing code
+- If step says "validates data" → search for validation logic
+- If step says "encodes to base64" → search for base64 encoding
+- If step says "stores in database" → search for save/persist calls
+
+Answer YES only if you see CONCRETE CODE performing this action.
+Answer NO if code just passes/stores data without actual processing.
+
+Format:
+VERDICT: [YES/NO]
+EVIDENCE: [what code you found or what's missing]
+"""
+            
+            try:
+                response = self.ollama.complete(
+                    model=model,
+                    system="You verify system data processing against implementation.",
+                    prompt=prompt,
+                    max_tokens=300
+                )
+                
+                verdict = "NO"
+                if "VERDICT:" in response and "YES" in response.upper():
+                    verdict = "YES"
+                
+                if verdict == "YES":
+                    self.log(f"    ✓ Step {i} implemented", "ok")
+                else:
+                    self.log(f"    ✗ Step {i} NOT implemented: {step[:60]}", "warn")
+                    all_passed = False
+                    failed_steps.append(f"System flow step {i}: {step}")
+                    
+            except Exception as e:
+                self.log(f"    ⚠️ Verification error: {e}", "warn")
+                all_passed = False
+        
+        return all_passed, failed_steps
 
     # ── Tests ─────────────────────────────────────────────────────────
     def _run_tests(self) -> bool:

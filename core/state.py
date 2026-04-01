@@ -183,6 +183,18 @@ class KanbanTask:
     requirements_checklist: list[dict] = field(default_factory=list)
     # Each requirement dict: {"requirement": str, "status": str, "explanation": str}
     qa_verification_report: dict = field(default_factory=dict)
+    
+    # ══════════════════════════════════════════════════════
+    # Flow verification (user + system flows)
+    # ══════════════════════════════════════════════════════
+    user_flow_steps: list[str] = field(default_factory=list)
+    # UI interaction steps: how user interacts with the feature
+    
+    system_flow_steps: list[str] = field(default_factory=list)
+    # System processing steps: what system does with data
+    
+    purpose: dict = field(default_factory=dict)
+    # Purpose: {"problem": str, "solution": str, "use_cases": str}
 
     def to_dict(self) -> dict:
         return {
@@ -215,6 +227,10 @@ class KanbanTask:
             # Requirements verification
             "requirements_checklist": self.requirements_checklist,
             "qa_verification_report": self.qa_verification_report,
+            # Flow verification
+            "user_flow_steps": self.user_flow_steps,
+            "system_flow_steps": self.system_flow_steps,
+            "purpose": self.purpose,
         }
 
     def to_dict_ui(self) -> dict:
@@ -427,6 +443,10 @@ class AppState:
                     # Requirements verification
                     requirements_checklist=d.get("requirements_checklist", []),
                     qa_verification_report=d.get("qa_verification_report", {}),
+                    # Flow verification
+                    user_flow_steps=d.get("user_flow_steps", []),
+                    system_flow_steps=d.get("system_flow_steps", []),
+                    purpose=d.get("purpose", {}),
                 )
                 self.load_logs_for_task(t)
                 self.kanban_tasks.append(t)
