@@ -16,13 +16,31 @@ class GlobalLogger:
     """
     
     def __init__(self, log_file: str = "autocooker.log"):
-        self.log_file = log_file
+        # Ensure log file is in the same directory as main.py (project root)
+        # Get the directory where this module is located (core/)
+        import sys
+        if hasattr(sys.modules['__main__'], '__file__'):
+            # Get project root (parent of core/)
+            main_file = sys.modules['__main__'].__file__
+            if main_file:
+                project_root = os.path.dirname(os.path.abspath(main_file))
+                self.log_file = os.path.join(project_root, log_file)
+            else:
+                self.log_file = log_file
+        else:
+            # Fallback to current directory
+            self.log_file = log_file
+        
         self.session_start = datetime.now().isoformat()
         
         # Create log file if doesn't exist
-        if not os.path.exists(log_file):
-            with open(log_file, 'w', encoding='utf-8') as f:
-                f.write("")  # Create empty file
+        try:
+            if not os.path.exists(self.log_file):
+                with open(self.log_file, 'w', encoding='utf-8') as f:
+                    f.write("")  # Create empty file
+            print(f"[GlobalLogger] Logging to: {os.path.abspath(self.log_file)}", flush=True)
+        except Exception as e:
+            print(f"[GlobalLogger] Warning: Could not create log file {self.log_file}: {e}", flush=True)
     
     def log(
         self,

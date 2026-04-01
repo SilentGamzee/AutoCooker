@@ -1,17 +1,15 @@
-"""QA phase: read-only review → targeted fix → re-review. Max 2 cycles."""
+"""QA phase: read-only review and verification. NO file modifications."""
 from __future__ import annotations
 import os
 import subprocess
 
 from core.state import AppState, KanbanTask
-from core.tools import ToolExecutor, QA_REVIEWER_TOOLS, QA_FIXER_TOOLS
+from core.tools import ToolExecutor, QA_REVIEWER_TOOLS  # Only reviewer tools, no fixer!
 from core.sandbox import WORKDIR_NAME
 from core.phases.base import BasePhase
 
 # Hard caps — prevent runaway loops
-MAX_REVIEW_FIX_CYCLES  = 2  # reviewer → fixer → reviewer → ... → stop
 MAX_REVIEWER_ITERATIONS = 4  # outer loops inside run_loop for the reviewer
-MAX_FIXER_ITERATIONS    = 3  # outer loops inside run_loop for the fixer
 
 
 class QAPhase(BasePhase):
@@ -38,36 +36,23 @@ class QAPhase(BasePhase):
         scope_summary = self._build_scope_summary()
         self.log(f"  Scope: {len(self.task.subtasks)} subtasks", "info")
 
-        all_issues: list[str] = []
-        subtask_passed = False
-
-        # ── Subtask-level review/fix cycles (existing behaviour) ──────
-        for cycle in range(1, MAX_REVIEW_FIX_CYCLES + 2):
-            self.log(f"─── QA Review (cycle {cycle}/{MAX_REVIEW_FIX_CYCLES + 1}) ───")
-            verdict, new_issues, summary = self._review(model, scope_summary, all_issues)
-            self.log(
-                f"  Verdict: {verdict} — {summary}",
-                "ok" if verdict == "PASS" else "warn",
-            )
-
-            if verdict == "PASS" or not new_issues:
-                subtask_passed = True
-                break
-
-            all_issues = new_issues
-
-            if cycle > MAX_REVIEW_FIX_CYCLES:
-                self.log(
-                    f"  QA could not resolve {len(all_issues)} issue(s) after "
-                    f"{MAX_REVIEW_FIX_CYCLES} fix cycle(s).",
-                    "error",
-                )
-                break
-
-            self.log(f"─── QA Fix (cycle {cycle}/{MAX_REVIEW_FIX_CYCLES}) ───")
-            self._fix(model, all_issues)
-
+        # ── Single read-only review (NO fix cycles) ───────────────────────
+        self.log("─── QA Review ───")
+        verdict, all_issues, summary = self._review(model, scope_summary, [])
+        
+        subtask_passed = (verdict == "PASS")
+        
+        self.log(
+            f"  Verdict: {verdict} — {summary}",
+            "ok" if verdict == "PASS" else "warn",
+        )
+        
         if not subtask_passed:
+            self.log(
+                f"  ⚠️ Found {len(all_issues)} issue(s). "
+                "Task will be sent for patch iteration (NOT fixed by QA).",
+                "warn"
+            )
             self.log("═══ QA PHASE COMPLETE — FAILED (subtask review) ═══", "error")
             self.task.has_errors = True
             return False, all_issues
@@ -207,32 +192,6 @@ class QAPhase(BasePhase):
         return verdict, issues, summary
 
     # ── Fix ───────────────────────────────────────────────────────────
-    def _fix(self, model: str, issues: list[str]):
-        workdir = os.path.join(self.task.task_dir, WORKDIR_NAME)
-        executor = self._make_executor(workdir)
-
-        scope_summary = self._build_scope_summary()
-        issue_list = "\n".join(f"  {i+1}. {iss}" for i, iss in enumerate(issues))
-
-        msg = (
-            f"Task: {self.task.title}\n\n"
-            f"Files in scope (only edit these):\n{scope_summary}\n\n"
-            f"Issues to fix ({len(issues)}):\n{issue_list}\n\n"
-            "Instructions:\n"
-            "1. Fix each issue — nothing else.\n"
-            "2. Only edit files that are in scope.\n"
-            "3. Make minimal, targeted changes.\n"
-            "4. Verify with read_file after each write."
-        )
-
-        self.run_loop(
-            "QA Fix", "p6_coding.md",
-            QA_FIXER_TOOLS, executor, msg,
-            lambda: (True, "OK"),
-            model,
-            max_outer_iterations=MAX_FIXER_ITERATIONS,
-        )
-
     # ── Scope builder ─────────────────────────────────────────────────
     def _build_scope_summary(self) -> str:
         workdir = os.path.join(self.task.task_dir, WORKDIR_NAME)
