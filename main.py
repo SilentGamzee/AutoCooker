@@ -472,8 +472,10 @@ def start_task(task_id: str) -> dict:
                             
                             if patch_iteration < max_patches:
                                 # Можем попробовать ещё раз с патчем
+                                remaining_patches = max_patches - patch_iteration
                                 task.add_log(
-                                    f"  🔄 Will retry with patch iteration {patch_iteration + 1}/{max_patches}",
+                                    f"  🔄 Will retry with patch iteration {patch_iteration + 1}/{max_patches} "
+                                    f"({remaining_patches} patch(es) remaining)",
                                     "system", "info"
                                 )
                                 task.add_log(
@@ -488,7 +490,7 @@ def start_task(task_id: str) -> dict:
                                 
                                 _push_task(task)
                                 
-                                # Continue to next patch iteration
+                                # Continue to next patch iteration (НЕ human review)
                                 continue
                             else:
                                 # Достигнут лимит патчей - эскалация
@@ -544,21 +546,25 @@ def start_task(task_id: str) -> dict:
                             
                             if patch_iteration < max_patches:
                                 # Попробовать патч на основе QA issues
+                                remaining_patches = max_patches - patch_iteration
                                 task.corrections = _format_qa_as_corrections(
                                     qa_issues, task.title, task.description
                                 )
                                 task.add_log(
                                     f"  QA failed ({len(qa_issues)} issue(s)) "
-                                    f"— starting patch iteration {patch_iteration + 1}/{max_patches}",
+                                    f"— starting patch iteration {patch_iteration + 1}/{max_patches} "
+                                    f"({remaining_patches} patch(es) remaining)",
                                     "system", "warn"
                                 )
                                 
-                                # Сброс для retry
+                                # Сброс всех фаз для retry (включая Planning для обновления плана)
+                                task.phase_status["planning"] = "pending"
                                 task.phase_status["coding"] = "pending"
                                 task.phase_status["qa"] = "pending"
-                                task.resume_from_phase = "coding"
+                                task.resume_from_phase = "planning"
                                 
                                 _push_task(task)
+                                # Continue to next patch iteration (НЕ human review)
                                 continue
                             else:
                                 # Max patches - escalate
@@ -584,10 +590,12 @@ def start_task(task_id: str) -> dict:
             # ══════════════════════════════════════════════════════
             # Final status
             # ══════════════════════════════════════════════════════
-            if task.has_errors:
+            # Только устанавливаем human_review если колонка ещё не установлена
+            # (т.е. не была установлена в цикле патчей при достижении лимита)
+            if task.has_errors and task.column not in ("human_review", "done"):
                 task.column = "human_review"
                 task.tags = list(set(task.tags + ["Needs Review", "Has Errors"]))
-            else:
+            elif not task.has_errors:
                 task.column = "done"
                 task.tags = [t for t in task.tags if t not in ("Has Errors", "Needs Review")]
                 task.tags.append("Complete")
