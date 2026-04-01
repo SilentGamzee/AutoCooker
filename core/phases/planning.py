@@ -5,6 +5,8 @@ import os
 import shutil
 import time
 
+import eel
+
 from core.state import AppState, KanbanTask
 from core.tools import ToolExecutor, PLANNING_TOOLS
 from core.sandbox import create_sandbox, WORKDIR_NAME
