@@ -231,16 +231,8 @@ class CodingPhase(BasePhase):
                 if not os.path.isfile(full):
                     return False, f"File not found in task workdir: {f}"
 
-            # Check 3: at least one write happened
-            expected_changes = len(files_to_create) + len(files_to_modify)
-            if expected_changes > 0 and len(writes_made) == 0:
-                return (
-                    False,
-                    "confirm_task_done was called but no files were written. "
-                    "The task requires actual file changes.",
-                )
-
-            # Check 4: structural completion condition — check workdir first, then project
+            # Check 3: structural completion condition — check workdir first, then project
+            # (moved before write check so we can verify "already done" cases)
             if completion_cond:
                 check_dir = workdir if os.path.isdir(workdir) else wd
                 cond_ok, cond_msg = self._check_completion_condition(
@@ -248,6 +240,22 @@ class CodingPhase(BasePhase):
                 )
                 if not cond_ok:
                     return False, f"Structural condition not met: {cond_msg}"
+
+            # Check 4: at least one write happened (unless task was already complete)
+            expected_changes = len(files_to_create) + len(files_to_modify)
+            if expected_changes > 0 and len(writes_made) == 0:
+                # If no writes were made but the structural condition passed,
+                # the task was already complete — this is valid
+                if completion_cond:
+                    # Structural condition already verified above
+                    return True, "OK: task already completed (verified by completion condition)"
+                else:
+                    # No completion condition to verify, and no writes — this is an error
+                    return (
+                        False,
+                        "confirm_task_done was called but no files were written. "
+                        "The task requires actual file changes.",
+                    )
 
             return True, "OK"
 

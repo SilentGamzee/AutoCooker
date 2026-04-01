@@ -125,6 +125,72 @@ The description must answer ALL of these:
 
 ---
 
+## MANDATORY PRE-PLANNING VERIFICATION
+
+**BEFORE creating ANY subtask, you MUST verify the following using read_file:**
+
+### Rule 1: Verify file locations
+❌ DON'T assume where classes/functions are located  
+✅ DO use read_file to check actual location
+
+Example:
+```
+Spec says: "Use Attachment dataclass"
+❌ WRONG: Assume it's in core/state.py → create subtask "Add Attachment to state.py"
+✅ RIGHT:  read_file("core/state.py") → not found
+           read_file("core/attachment.py") → found! 
+           → create subtask "Import Attachment from core/attachment.py"
+```
+
+### Rule 2: Check if element already exists
+❌ DON'T create subtasks for elements that already exist  
+✅ DO verify with read_file before adding to plan
+
+Example:
+```
+Spec says: "Add attachment-list container to Overview section"
+✅ read_file("web/index.html") → search for "attachment-list"
+   → If found: DON'T create subtask (already done)
+   → If not found: Create subtask to add it
+```
+
+### Rule 3: Every subtask MUST have files
+Each subtask MUST have at least one of:
+- `files_to_create`: ["path/to/new.py"]
+- `files_to_modify`: ["path/to/existing.py"]
+
+❌ FORBIDDEN: Empty files_to_create AND empty files_to_modify  
+⚠️ Exception: Only if this is a "verification-only" task AND explicitly marked as such
+
+### Rule 4: Verify files_to_modify actually exist
+Before adding a file to `files_to_modify`:
+```
+✅ read_file("src/config.py") → check it exists
+   → If exists: Add to files_to_modify
+   → If not exists: Add to files_to_create instead
+```
+
+---
+
+## FORBIDDEN PATTERNS
+
+These patterns indicate you skipped verification:
+
+❌ Creating multiple subtasks that modify the same element  
+   Example: "Add class X to state.py" + "Add class X fields to state.py"
+   → Should be ONE subtask if class doesn't exist yet
+
+❌ Subtask with files_to_modify for a non-existent file  
+   → Use files_to_create instead
+
+❌ Subtask to add element that read_file confirms already exists  
+   → Skip this subtask entirely
+
+❌ Guessing class location without verification  
+   → Always read_file to confirm location
+
+---
+
 ## SUBTASK SIZING — GROUP RELATED WORK
 
 Small models lose coherence with too many subtasks. Group related functions into one subtask:

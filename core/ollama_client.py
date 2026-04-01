@@ -158,14 +158,14 @@ class OllamaClient:
         max_tool_rounds: int = 40,
     ) -> tuple[list[dict], str, int]:
         history = list(messages)
-        MAX_HISTORY_CHARS = 12000
+        MAX_HISTORY_CHARS = 30000  # Увеличено для хранения 2-3 больших файлов в истории
         _last_call: tuple[str, str] = ("", "")
         _repeat_count: int = 0
         REPEAT_LIMIT = 3
         _tool_calls_made: int = 0
         _files_read: set[str] = set()
         _rounds_without_write: int = 0
-        MAX_ROUNDS_WITHOUT_WRITE = 8
+        MAX_ROUNDS_WITHOUT_WRITE = 5  # Уменьшено с 8 до 5 для более быстрого срабатывания
 
         for _round in range(max_tool_rounds):
             if is_aborted and is_aborted():
@@ -187,16 +187,32 @@ class OllamaClient:
             else:
                 capped_history = history
 
-            # Write nudge
+            # Write nudge with escalation
             if _rounds_without_write >= MAX_ROUNDS_WITHOUT_WRITE:
                 already_read = sorted(_files_read)[:10]
-                nudge = (
-                    f"You have read {len(_files_read)} files across {_round} rounds "
-                    f"without writing anything. You already have: {already_read}. "
-                    "Stop reading — write the required output file NOW using write_file."
-                )
+                
+                # Эскалация предупреждений
+                if _rounds_without_write == 5:
+                    nudge = (
+                        f"⚠️ You have read {len(_files_read)} files across {_round} rounds "
+                        f"without writing anything. You already have: {already_read}. "
+                        "Stop reading — write the required output file NOW using write_file."
+                    )
+                elif _rounds_without_write == 10:
+                    nudge = (
+                        f"🚨 CRITICAL: {_round} rounds without writing! "
+                        f"Files read: {already_read}. "
+                        "You MUST call write_file or modify_file in THIS round."
+                    )
+                else:  # 15, 20, etc.
+                    nudge = (
+                        f"🔴 FINAL WARNING: {_round} rounds without file changes. "
+                        "Call write_file NOW or task will be marked as failed. "
+                        "If task is already complete, call confirm_task_done instead."
+                    )
+                
                 capped_history = capped_history + [{"role": "user", "content": nudge}]
-                _rounds_without_write = 0
+                # НЕ сбрасываем счётчик - позволяем эскалировать
 
             payload: dict = {
                 "model":    model,
@@ -266,8 +282,15 @@ class OllamaClient:
                     _rounds_without_write = -1
                 elif tool_name == "read_file":
                     _path_arg = raw_args.get("path", "")
-                    if _path_arg in _files_read and log_fn:
-                        log_fn(f"[WARN] Re-reading already-seen file: {_path_arg}", "warn")
+                    
+                    # Предупреждать только если это похоже на зацикливание (3+ раунда без записи)
+                    if _path_arg in _files_read and _rounds_without_write > 2 and log_fn:
+                        log_fn(
+                            f"[WARN] Re-reading already-seen file without writes: {_path_arg} "
+                            f"({_rounds_without_write} rounds since last write)", 
+                            "warn"
+                        )
+                    
                     _files_read.add(_path_arg)
 
                 try:
@@ -285,6 +308,20 @@ class OllamaClient:
                 call_key = (tool_name, json.dumps(raw_args, sort_keys=True))
                 if call_key == _last_call:
                     _repeat_count += 1
+                    
+                    # Детектор зацикливания
+                    if _repeat_count >= REPEAT_LIMIT:
+                        error_msg = (
+                            f"⚠️ LOOP DETECTED: You've called {tool_name} with identical arguments "
+                            f"{_repeat_count} times in a row. This indicates a loop or stuck state. "
+                            f"Try a different approach:\n"
+                            f"  - If the task is complete, call confirm_task_done\n"
+                            f"  - If you need different information, use different tool arguments\n"
+                            f"  - If you're stuck, re-read the task requirements"
+                        )
+                        history.append({"role": "tool", "content": error_msg})
+                        _repeat_count = 0  # Сброс для новой попытки
+                        _last_call = ("", "")  # Сброс для избежания повторного срабатывания
                 else:
                     _last_call    = call_key
                     _repeat_count = 1

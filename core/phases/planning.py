@@ -219,7 +219,7 @@ class PlanningPhase(BasePhase):
 
         index_thread = _threading.Thread(target=_run_index, daemon=True)
         index_thread.start()
-        INDEX_TIMEOUT = 120   # seconds — generous for loading + first batch
+        INDEX_TIMEOUT = 300   # seconds — увеличено с 120 до 300 для больших проектов
         index_thread.join(timeout=INDEX_TIMEOUT)
 
         if index_thread.is_alive():
