@@ -156,6 +156,26 @@ class KanbanTask:
     max_iterations: int = 3
     # Which iteration we are currently on (1-based, updated at runtime)
     current_iteration: int = 0
+    
+    # ══════════════════════════════════════════════════════
+    # Phase state tracking for smart Continue
+    # ══════════════════════════════════════════════════════
+    phase_status: dict = field(default_factory=lambda: {
+        "planning": "pending",
+        "coding": "pending",
+        "qa": "pending"
+    })
+    last_active_phase: str = ""
+    can_resume: bool = True
+    resume_from_phase: str = ""
+    
+    # ══════════════════════════════════════════════════════
+    # Iterative subtask execution
+    # ══════════════════════════════════════════════════════
+    subtask_max_loops: int = 3
+    max_patches: int = 2
+    patch_count: int = 0
+    last_executed_subtask_id: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -175,6 +195,16 @@ class KanbanTask:
             "corrections": self.corrections,
             "max_iterations": self.max_iterations,
             "current_iteration": self.current_iteration,
+            # Phase state tracking
+            "phase_status": self.phase_status,
+            "last_active_phase": self.last_active_phase,
+            "can_resume": self.can_resume,
+            "resume_from_phase": self.resume_from_phase,
+            # Iterative subtasks
+            "subtask_max_loops": self.subtask_max_loops,
+            "max_patches": self.max_patches,
+            "patch_count": self.patch_count,
+            "last_executed_subtask_id": self.last_executed_subtask_id,
         }
 
     def to_dict_ui(self) -> dict:
@@ -199,6 +229,33 @@ class KanbanTask:
             return self.progress
         done = sum(1 for s in self.subtasks if s.get("status") == "done")
         return int(done / len(self.subtasks) * 100)
+    
+    def update_phase_status(self, phase: str, status: str):
+        """Update phase status and set resume metadata for smart Continue."""
+        self.phase_status[phase] = status
+        self.last_active_phase = phase
+        
+        # Determine where to resume from
+        if status == "done":
+            # Phase completed - resume from next phase
+            phase_order = ["planning", "coding", "qa"]
+            try:
+                idx = phase_order.index(phase)
+                if idx + 1 < len(phase_order):
+                    self.resume_from_phase = phase_order[idx + 1]
+                else:
+                    self.resume_from_phase = ""  # All done
+                self.can_resume = True
+            except ValueError:
+                pass
+        elif status == "in_progress":
+            # Phase in progress - resume from this phase
+            self.resume_from_phase = phase
+            self.can_resume = True
+        elif status in ("failed", "needs_analysis"):
+            # Problem - resume from this phase after patch
+            self.resume_from_phase = phase
+            self.can_resume = True
 
 
 # ─── App state ────────────────────────────────────────────────────
@@ -333,6 +390,20 @@ class AppState:
                     corrections=d.get("corrections", ""),
                     max_iterations=d.get("max_iterations", 3),
                     current_iteration=d.get("current_iteration", 0),
+                    # Phase state tracking
+                    phase_status=d.get("phase_status", {
+                        "planning": "pending",
+                        "coding": "pending",
+                        "qa": "pending"
+                    }),
+                    last_active_phase=d.get("last_active_phase", ""),
+                    can_resume=d.get("can_resume", True),
+                    resume_from_phase=d.get("resume_from_phase", ""),
+                    # Iterative subtasks
+                    subtask_max_loops=d.get("subtask_max_loops", 3),
+                    max_patches=d.get("max_patches", 2),
+                    patch_count=d.get("patch_count", 0),
+                    last_executed_subtask_id=d.get("last_executed_subtask_id", ""),
                 )
                 self.load_logs_for_task(t)
                 self.kanban_tasks.append(t)

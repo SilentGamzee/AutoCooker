@@ -314,107 +314,299 @@ def start_task(task_id: str) -> dict:
         _push_board()
         _push_task(task)
 
-        phases      = task.phases_selected or ["planning", "coding", "qa"]
-        max_iter    = max(1, task.max_iterations or 3)
-        has_qa      = "qa" in phases
-        final_passed = not has_qa  # if no QA phase, consider it passed by default
+        phases = task.phases_selected or ["planning", "coding", "qa"]
+        max_patches = task.max_patches or 2
+        has_qa = "qa" in phases
+        
+        # ══════════════════════════════════════════════════════
+        # НОВОЕ: Определить, с какой фазы начинать (Continue logic)
+        # ══════════════════════════════════════════════════════
+        start_from_phase = None
+        is_resume = False
+        
+        if task.can_resume and task.resume_from_phase:
+            # Это Continue - начинаем с сохранённой фазы
+            start_from_phase = task.resume_from_phase
+            is_resume = True
+            task.add_log(
+                f"═══ Resuming from {start_from_phase.upper()} phase ═══",
+                "system", "phase_header"
+            )
+        else:
+            # Новый запуск - начинаем с начала
+            task.add_log("═══ Starting Pipeline ═══", "system", "phase_header")
+            # Сброс статусов фаз
+            for phase in phases:
+                task.phase_status[phase] = "pending"
+        
+        _push_task(task)
 
         try:
             if not task.task_dir:
                 STATE.init_task_dir(task)
 
-            for iteration in range(1, max_iter + 1):
-                task.current_iteration = iteration
-
-                if iteration == 1 and task.corrections:
-                    task.add_log("═══ Starting Pipeline (with corrections) ═══", "system", "phase_header")
-                    task.add_log(f"  Corrections: {task.corrections[:200]}", "system", "info")
-                elif iteration == 1:
-                    task.add_log("═══ Starting Pipeline ═══", "system", "phase_header")
-                else:
+            # ══════════════════════════════════════════════════════
+            # Цикл патчей (для итеративного самовосстановления)
+            # ══════════════════════════════════════════════════════
+            for patch_iteration in range(max_patches + 1):
+                
+                if patch_iteration > 0:
                     task.add_log(
-                        f"═══ Iteration {iteration}/{max_iter} — QA failed, retrying ═══",
-                        "system", "phase_header",
+                        f"═══ Patch Iteration {patch_iteration}/{max_patches} ═══",
+                        "system", "phase_header"
                     )
-                _push_task(task)
-
-                # ── Planning ──────────────────────────────────────
-                if "planning" in phases:
-                    task.column = "in_progress"
+                    task.patch_count = patch_iteration
+                    # При патче сбрасываем needs_analysis
+                    for st in task.subtasks:
+                        if st.get("status") == "needs_analysis":
+                            st["status"] = "pending"
+                            st["current_loop"] = 0
+                            st["analysis_needed"] = False
                     _push_task(task)
-                    ok = PlanningPhase(STATE, task).run()
-                    if not ok:
-                        task.column     = "human_review"
-                        task.has_errors = True
-                        task.tags       = list(set(task.tags + ["Has Errors"]))
-                        _push_task(task)
-                        _push_board()
-                        STATE.active_task_id = ""
-                        return
-                    task.tags = [t for t in task.tags if t != "Has Errors"]
-
-                # ── Coding ────────────────────────────────────────
-                if "coding" in phases:
-                    CodingPhase(STATE, task).run()
-
-                # ── QA ────────────────────────────────────────────
-                if has_qa:
-                    qa_passed, qa_issues = QAPhase(STATE, task).run()
-                    final_passed = qa_passed
-
-                    if qa_passed:
+                
+                # ══════════════════════════════════════════════════════
+                # ── Planning Phase ────────────────────────────────────
+                # ══════════════════════════════════════════════════════
+                if "planning" in phases:
+                    # Проверить, нужно ли запускать Planning
+                    should_run_planning = False
+                    
+                    if patch_iteration > 0:
+                        # При патче всегда запускаем Planning для обновления плана
+                        should_run_planning = True
                         task.add_log(
-                            f"  ✓ QA passed on iteration {iteration}/{max_iter}",
-                            "system", "ok",
+                            "  Planning will update implementation plan based on analysis",
+                            "system", "info"
                         )
-                        break  # success — exit iteration loop
-
-                    # QA failed
-                    if iteration < max_iter:
-                        # Format QA issues as corrections for the next patch iteration
-                        task.corrections = _format_qa_as_corrections(
-                            qa_issues, task.title, task.description
-                        )
-                        task.add_log(
-                            f"  QA failed ({len(qa_issues)} issue(s)) "
-                            f"— starting iteration {iteration + 1}/{max_iter}",
-                            "system", "warn",
-                        )
-                        _push_task(task)
-                        # Continue to next iteration (planning will run in patch mode)
+                    elif is_resume and start_from_phase in ("coding", "qa"):
+                        # Resume с более поздней фазы - пропускаем Planning
+                        if task.phase_status.get("planning") == "done":
+                            task.add_log(
+                                "  ↩ Planning already complete, skipping",
+                                "system", "info"
+                            )
+                            should_run_planning = False
+                        else:
+                            should_run_planning = True
                     else:
-                        task.add_log(
-                            f"  QA failed after {max_iter} iteration(s) "
-                            f"— escalating to human review",
-                            "system", "error",
+                        # Новый запуск или Resume с Planning
+                        should_run_planning = True
+                    
+                    if should_run_planning:
+                        task.update_phase_status("planning", "in_progress")
+                        task.column = "in_progress"
+                        _push_task(task)
+                        
+                        ok = PlanningPhase(STATE, task).run()
+                        
+                        if not ok:
+                            # Critical planning failure
+                            task.update_phase_status("planning", "failed")
+                            task.column = "human_review"
+                            task.has_errors = True
+                            task.tags = list(set(task.tags + ["Planning Failed"]))
+                            _push_task(task)
+                            _push_board()
+                            STATE.active_task_id = ""
+                            return
+                        
+                        task.update_phase_status("planning", "done")
+                        task.tags = [t for t in task.tags if t != "Has Errors"]
+                        _push_task(task)
+                
+                # ══════════════════════════════════════════════════════
+                # ── Coding Phase ──────────────────────────────────────
+                # ══════════════════════════════════════════════════════
+                if "coding" in phases:
+                    # Проверить, нужно ли запускать Coding
+                    should_run_coding = False
+                    
+                    if is_resume and start_from_phase == "qa":
+                        # Resume с QA - проверим, все ли подзадачи done
+                        if task.phase_status.get("coding") == "done":
+                            needs_rerun = any(
+                                st.get("status") in ("pending", "in_progress", "needs_analysis")
+                                for st in task.subtasks
+                            )
+                            if not needs_rerun:
+                                task.add_log(
+                                    "  ↩ Coding already complete, all subtasks done",
+                                    "system", "info"
+                                )
+                                should_run_coding = False
+                            else:
+                                should_run_coding = True
+                        else:
+                            should_run_coding = True
+                    else:
+                        # Новый запуск, Resume с Planning/Coding, или патч
+                        should_run_coding = True
+                    
+                    if should_run_coding:
+                        task.update_phase_status("coding", "in_progress")
+                        _push_task(task)
+                        
+                        coding_ok = CodingPhase(STATE, task).run()
+                        
+                        # ══════════════════════════════════════════════════
+                        # НОВОЕ: Проверка needs_analysis и патчинг
+                        # ══════════════════════════════════════════════════
+                        needs_analysis = any(
+                            st.get("status") == "needs_analysis" 
+                            for st in task.subtasks
                         )
+                        
+                        if needs_analysis:
+                            task.update_phase_status("coding", "needs_analysis")
+                            
+                            # Подсчитать сколько подзадач нужен анализ
+                            analysis_count = sum(
+                                1 for st in task.subtasks 
+                                if st.get("status") == "needs_analysis"
+                            )
+                            
+                            task.add_log(
+                                f"  ⚠️ {analysis_count} subtask(s) need analysis after reaching loop limit",
+                                "system", "warn"
+                            )
+                            
+                            if patch_iteration < max_patches:
+                                # Можем попробовать ещё раз с патчем
+                                task.add_log(
+                                    f"  🔄 Will retry with patch iteration {patch_iteration + 1}/{max_patches}",
+                                    "system", "info"
+                                )
+                                task.add_log(
+                                    "  💡 Tip: Review subtask requirements or increase subtask_max_loops",
+                                    "system", "info"
+                                )
+                                
+                                # Сброс фаз для перезапуска
+                                task.phase_status["planning"] = "pending"
+                                task.phase_status["coding"] = "pending"
+                                task.resume_from_phase = "planning"
+                                
+                                _push_task(task)
+                                
+                                # Continue to next patch iteration
+                                continue
+                            else:
+                                # Достигнут лимит патчей - эскалация
+                                task.add_log(
+                                    f"  ❌ Maximum patches ({max_patches}) reached. "
+                                    "Some subtasks could not complete. Escalating to human review.",
+                                    "system", "error"
+                                )
+                                task.column = "human_review"
+                                task.has_errors = True
+                                task.tags = list(set(task.tags + ["Max Patches", "Needs Review"]))
+                                _push_task(task)
+                                _push_board()
+                                STATE.active_task_id = ""
+                                return
+                        else:
+                            # Все подзадачи выполнены успешно
+                            task.update_phase_status("coding", "done")
+                            _push_task(task)
+                
+                # ══════════════════════════════════════════════════════
+                # ── QA Phase ──────────────────────────────────────────
+                # ══════════════════════════════════════════════════════
+                if has_qa:
+                    # Проверить, нужно ли запускать QA
+                    should_run_qa = False
+                    
+                    if is_resume and start_from_phase == "qa":
+                        should_run_qa = True
+                    elif task.phase_status.get("qa") == "done":
+                        task.add_log(
+                            "  ↩ QA already passed, skipping",
+                            "system", "info"
+                        )
+                        should_run_qa = False
+                    else:
+                        should_run_qa = True
+                    
+                    if should_run_qa:
+                        task.update_phase_status("qa", "in_progress")
+                        _push_task(task)
+                        
+                        qa_passed, qa_issues = QAPhase(STATE, task).run()
+                        
+                        if qa_passed:
+                            task.update_phase_status("qa", "done")
+                            task.add_log("  ✓ QA passed", "system", "ok")
+                            _push_task(task)
+                            break  # Success!
+                        else:
+                            # QA failed
+                            task.update_phase_status("qa", "failed")
+                            
+                            if patch_iteration < max_patches:
+                                # Попробовать патч на основе QA issues
+                                task.corrections = _format_qa_as_corrections(
+                                    qa_issues, task.title, task.description
+                                )
+                                task.add_log(
+                                    f"  QA failed ({len(qa_issues)} issue(s)) "
+                                    f"— starting patch iteration {patch_iteration + 1}/{max_patches}",
+                                    "system", "warn"
+                                )
+                                
+                                # Сброс для retry
+                                task.phase_status["coding"] = "pending"
+                                task.phase_status["qa"] = "pending"
+                                task.resume_from_phase = "coding"
+                                
+                                _push_task(task)
+                                continue
+                            else:
+                                # Max patches - escalate
+                                task.add_log(
+                                    f"  QA failed after {max_patches} patch(es) "
+                                    f"— escalating to human review",
+                                    "system", "error"
+                                )
+                                task.column = "human_review"
+                                task.has_errors = True
+                                task.tags = list(set(task.tags + ["QA Failed", "Needs Review"]))
+                                _push_task(task)
+                                _push_board()
+                                STATE.active_task_id = ""
+                                return
                 else:
-                    # No QA phase — single pass only
+                    # No QA phase — считаем успешным
                     break
-
-            # ── Final status ──────────────────────────────────────
-            if task.has_errors or not final_passed:
-                task.column   = "human_review"
-                task.has_errors = True
-                task.tags     = list(set(task.tags + ["Needs Review", "Has Errors"]))
+                
+                # Если дошли сюда без continue - всё успешно
+                break
+            
+            # ══════════════════════════════════════════════════════
+            # Final status
+            # ══════════════════════════════════════════════════════
+            if task.has_errors:
+                task.column = "human_review"
+                task.tags = list(set(task.tags + ["Needs Review", "Has Errors"]))
             else:
-                task.column   = "done"
-                task.tags     = [t for t in task.tags if t not in ("Has Errors", "Needs Review")]
+                task.column = "done"
+                task.tags = [t for t in task.tags if t not in ("Has Errors", "Needs Review")]
                 task.tags.append("Complete")
                 task.progress = 100
                 task.corrections = ""
+                task.can_resume = False
+                task.resume_from_phase = ""
 
         except TaskAbortedError:
             task.add_log("■ Task aborted by user", "system", "warn")
             task.column = "human_review"
-            task.tags   = list(set(task.tags + ["Aborted"]))
+            task.tags = list(set(task.tags + ["Aborted"]))
         except Exception:
             err = traceback.format_exc()
             print(f"\n[PIPELINE ERROR] Task {task_id}:\n{err}", flush=True)
             task.add_log(f"[PIPELINE ERROR]\n{err}", "system", "error")
-            task.column     = "human_review"
+            task.column = "human_review"
             task.has_errors = True
-            task.tags       = list(set(task.tags + ["Has Errors"]))
+            task.tags = list(set(task.tags + ["Has Errors"]))
         finally:
             try:
                 _push_task(task)

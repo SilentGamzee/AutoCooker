@@ -299,6 +299,15 @@ function populateModal(task) {
     progressWrap.classList.add('hidden');
   }
 
+  // Phase Status Bar
+  updatePhaseStatusBar(task);
+
+  // Resume Indicator
+  updateResumeIndicator(task);
+
+  // Patch Indicator
+  updatePatchIndicator(task);
+
   // Overview
   document.getElementById('ov-desc').textContent    = task.description || '—';
   document.getElementById('ov-branch').textContent  = task.git_branch || '—';
@@ -348,6 +357,73 @@ function computeProgress(task) {
   return Math.round(done / task.subtasks.length * 100);
 }
 
+function updatePhaseStatusBar(task) {
+  const bar = document.getElementById('phase-status-bar');
+  const phaseStatus = task.phase_status || {};
+  const lastActive = task.last_active_phase || '';
+  
+  // Show bar if task is in progress or has phase status
+  const shouldShow = task.column === 'in_progress' || 
+                     Object.values(phaseStatus).some(s => s !== 'pending');
+  bar.classList.toggle('hidden', !shouldShow);
+  
+  if (!shouldShow) return;
+  
+  const phases = ['planning', 'coding', 'qa'];
+  phases.forEach(phase => {
+    const badge = document.getElementById(`phase-badge-${phase}`);
+    const statusEl = document.getElementById(`phase-status-${phase}`);
+    const status = phaseStatus[phase] || 'pending';
+    
+    // Remove all status classes
+    badge.className = 'phase-badge';
+    
+    // Add appropriate class
+    badge.classList.add(`phase-${status}`);
+    if (phase === lastActive) {
+      badge.classList.add('phase-active');
+    }
+    
+    // Update status icon
+    const icons = {
+      'pending': '○',
+      'in_progress': '⟳',
+      'done': '✓',
+      'failed': '✗',
+      'needs_analysis': '⚠️',
+      'skipped': '⊘'
+    };
+    statusEl.textContent = icons[status] || '○';
+  });
+}
+
+function updateResumeIndicator(task) {
+  const indicator = document.getElementById('resume-indicator');
+  const resumePhaseEl = document.getElementById('resume-phase');
+  
+  if (task.can_resume && task.resume_from_phase) {
+    indicator.classList.remove('hidden');
+    resumePhaseEl.textContent = task.resume_from_phase.toUpperCase();
+  } else {
+    indicator.classList.add('hidden');
+  }
+}
+
+function updatePatchIndicator(task) {
+  const indicator = document.getElementById('patch-indicator');
+  const currentEl = document.getElementById('patch-current');
+  const maxEl = document.getElementById('patch-max');
+  
+  if (task.patch_count > 0) {
+    indicator.classList.remove('hidden');
+    currentEl.textContent = task.patch_count;
+    maxEl.textContent = task.max_patches || 2;
+  } else {
+    indicator.classList.add('hidden');
+  }
+}
+
+
 // ─── Subtasks Tab ────────────────────────────────────────────────
 function renderSubtasks(subtasks) {
   const wrap = document.getElementById('subtasks-list');
@@ -356,13 +432,38 @@ function renderSubtasks(subtasks) {
     return;
   }
 
-  const STATUS_ICON = { pending:'', in_progress:'◉', done:'✓', failed:'✕' };
-  const STATUS_CLS  = { pending:'pending', in_progress:'active', done:'done', failed:'failed' };
-
   wrap.innerHTML = subtasks.map((t, i) => {
-    const status   = t.status || 'pending';
-    const iconCls  = STATUS_CLS[status] || 'pending';
-    const iconChar = STATUS_ICON[status] || '';
+    const status = t.status || 'pending';
+    const currentLoop = t.current_loop || 0;
+    const maxLoops = t.max_loops || 3;
+    
+    // Determine badge and icon
+    let badge = '';
+    let iconChar = '';
+    let iconCls = '';
+    
+    if (status === 'done') {
+      badge = '<span class="st-badge st-done">✓ Done</span>';
+      iconChar = '✓';
+      iconCls = 'done';
+    } else if (status === 'needs_analysis') {
+      badge = '<span class="st-badge st-analysis">⚠️ Analysis Needed</span>';
+      iconChar = '⚠';
+      iconCls = 'failed';
+    } else if (status === 'in_progress' && currentLoop > 0) {
+      badge = `<span class="st-badge st-loop">⟳ Loop ${currentLoop}/${maxLoops}</span>`;
+      iconChar = '◉';
+      iconCls = 'active';
+    } else if (status === 'in_progress') {
+      badge = '<span class="st-badge st-progress">◉ In Progress</span>';
+      iconChar = '◉';
+      iconCls = 'active';
+    } else {
+      badge = '<span class="st-badge st-pending">○ Pending</span>';
+      iconChar = '';
+      iconCls = 'pending';
+    }
+    
     return `
     <div class="subtask-row" onclick="toggleSubtask(this)">
       <div class="subtask-check ${iconCls}">${iconChar}</div>
@@ -370,6 +471,7 @@ function renderSubtasks(subtasks) {
         <div class="subtask-header">
           <span class="subtask-num">#${i+1}</span>
           <span class="subtask-title">${esc(t.title)}</span>
+          ${badge}
         </div>
         <div class="subtask-detail">
           <div class="subtask-desc">${esc(t.description || '')}</div>

@@ -50,12 +50,13 @@ class CodingPhase(BasePhase):
             sid = subtask_dict.get("id", f"T-{i+1:03d}")
             prior_status = subtask_dict.get("status", "pending")
 
-            # ── Never blindly skip ─────────────────────────────────
-            # A "done" status from a previous run might mean the work
-            # was attempted but incomplete. Re-verify structurally.
+            # Skip if already done and verification passes
             if prior_status == "done":
                 still_ok, reason = self._verify_structural_completion(subtask_dict)
                 if still_ok:
+                    # Update UI even when skipping
+                    self.task.last_executed_subtask_id = sid
+                    self.push_task()
                     self.log(f"  ✓ Task {sid} already complete (verified)", "ok")
                     continue
                 else:
@@ -64,24 +65,79 @@ class CodingPhase(BasePhase):
                         "warn",
                     )
                     subtask_dict["status"] = "pending"
+                    subtask_dict["current_loop"] = 0
+            
+            # Skip if needs analysis (will be handled in Analysis phase)
+            if prior_status == "needs_analysis":
+                self.log(
+                    f"  ⏸ Task {sid} needs analysis - will be handled in patch cycle",
+                    "warn"
+                )
+                all_ok = False
+                continue
 
+            # Task header
             self.log(f"\n  ▶ Task {sid}: {subtask_dict.get('title', '')}", "step_header")
-            subtask_dict["status"] = "in_progress"
-            self.task.progress = self.task.subtask_progress()
-            self.push_task()
+            
+            # Iterative execution with loop limit
+            max_loops = subtask_dict.get("max_loops", self.task.subtask_max_loops)
+            current_loop = subtask_dict.get("current_loop", 0)
+            success = False
+            
+            while current_loop < max_loops and not success:
+                current_loop += 1
+                subtask_dict["current_loop"] = current_loop
+                subtask_dict["status"] = "in_progress"
+                
+                # Update UI with current subtask and loop indicator
+                self.task.last_executed_subtask_id = sid
+                
+                self.log(
+                    f"  [Loop {current_loop}/{max_loops}] Attempting task {sid}...",
+                    "info"
+                )
+                
+                self.task.progress = self.task.subtask_progress()
+                self.push_task()
 
-            ok = self._execute_one_task(subtask_dict, model)
-
-            subtask_dict["status"] = "done" if ok else "failed"
-            if not ok:
+                # Execute one attempt
+                success = self._execute_one_task(subtask_dict, model)
+                
+                if success:
+                    # Success!
+                    subtask_dict["status"] = "done"
+                    subtask_dict["current_loop"] = 0  # Reset
+                    self.log(
+                        f"  ✓ Task {sid} completed on loop {current_loop}/{max_loops}",
+                        "ok"
+                    )
+                else:
+                    # Failed this attempt
+                    retry_msg = "retrying..." if current_loop < max_loops else "analysis needed"
+                    self.log(
+                        f"  ↻ Loop {current_loop}/{max_loops} failed, {retry_msg}",
+                        "warn"
+                    )
+            
+            # After all attempts
+            if not success:
+                # Reached limit - needs analysis
+                subtask_dict["status"] = "needs_analysis"
+                subtask_dict["analysis_needed"] = True
                 all_ok = False
                 self.task.has_errors = True
-
+                
+                self.log(
+                    f"  ⚠️ Task {sid} did not complete after {max_loops} loops. "
+                    f"Marking for analysis and patch.",
+                    "error"
+                )
+            
             self.task.progress = self.task.subtask_progress()
             self.state.save_subtasks_for_task(self.task)
             self.push_task()
-
-            # Refresh cache after each task so next tasks see new files
+            
+            # Refresh cache
             self.state.cache.update_file_paths(
                 self.task.project_path or self.state.working_dir
             )
@@ -262,7 +318,7 @@ class CodingPhase(BasePhase):
         return self.run_loop(
             f"2.2 Task {sid}", "p6_coding.md",
             CODING_TOOLS, executor, msg, validate_fn, model,
-            max_outer_iterations=20,
+            max_outer_iterations=10,  # Reduced from 20 - each attempt gets 10 internal rounds
         )
 
     # ── Structural completion checker ──────────────────────────────
