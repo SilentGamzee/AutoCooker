@@ -1,6 +1,7 @@
-"""Ollama API client with tool-calling support."""
+"""Ollama API client with tool-calling support - FIXED for Qwen thinking mode."""
 from __future__ import annotations
 import json
+import re
 import sys
 import threading
 import traceback
@@ -83,7 +84,12 @@ class OllamaClient:
         max_tokens: int = 1500,
         log_fn: Optional[Callable[[str], None]] = None,
     ) -> str:
-        """Single-turn completion. Errors surfaced to log_fn AND console."""
+        """Single-turn completion. Errors surfaced to log_fn AND console.
+        
+        FIX: Now handles Qwen's thinking mode by:
+        1. Attempting to parse 'thinking' field if 'response' is empty
+        2. Extracting numbered requirements from thinking output
+        """
         print(f"[DEBUG complete()] ENTERED model={model} prompt_len={len(prompt)}", flush=True)
         if log_fn:
             log_fn(f"[Ollama] complete() sending — model={model} prompt_len={len(prompt)}")
@@ -93,12 +99,45 @@ class OllamaClient:
                 f"{self.base_url}/api/generate",
                 {"model": model, "prompt": prompt, "stream": False,
                  "options": {"temperature": 0.1, "num_predict": max_tokens}},
-                (10, 300),
+                (10, 6000),
             )
             print(f"[DEBUG complete()] POST returned status={resp.status_code}", flush=True)
             resp.raise_for_status()
-            result = resp.json().get("response", "")
+            
+            # Parse JSON response
+            json_data = resp.json()
+            print(f"[DEBUG complete()] Full JSON keys: {list(json_data.keys())}", flush=True)
+            
+            result = json_data.get("response", "")
             print(f"[DEBUG complete()] success response_len={len(result)}", flush=True)
+            
+            # FIX: If response is empty but thinking exists, try to parse thinking
+            if not result:
+                print(f"[DEBUG complete()] WARNING: Empty response!", flush=True)
+                
+                # Check if there's a thinking field (Qwen models)
+                thinking = json_data.get("thinking", "")
+                if thinking:
+                    print(f"[DEBUG complete()] Found thinking field ({len(thinking)} chars)", flush=True)
+                    print(f"[DEBUG complete()] Attempting to extract from thinking...", flush=True)
+                    
+                    # Try to extract the actual response from thinking
+                    result = self._extract_from_thinking(thinking)
+                    
+                    if result:
+                        print(f"[DEBUG complete()] Extracted {len(result)} chars from thinking", flush=True)
+                    else:
+                        print(f"[DEBUG complete()] Could not extract from thinking", flush=True)
+                
+                # If still empty, log full JSON for debugging
+                if not result:
+                    print(f"[DEBUG complete()] JSON data: {json_data}", flush=True)
+                    # Check for error field
+                    if "error" in json_data:
+                        error_msg = json_data.get("error", "Unknown error")
+                        print(f"[DEBUG complete()] Ollama returned error: {error_msg}", flush=True)
+                        raise RuntimeError(f"Ollama returned error: {error_msg}")
+            
             if log_fn:
                 log_fn(f"[Ollama] complete() done — response_len={len(result)}")
             return result
@@ -120,6 +159,64 @@ class OllamaClient:
             if log_fn:
                 log_fn(msg, "error")
             raise RuntimeError(msg) from e
+
+    def _extract_from_thinking(self, thinking: str) -> str:
+        """
+        Extract final response from Qwen's thinking field.
+        
+        Qwen models often structure thinking like:
+        1. Analysis...
+        2. Draft Requirements...
+        3. Refine Requirements...
+        4. Select Best Requirements...
+        5. Output: <actual requirements list>
+        
+        We try to extract the final output section - numbered requirements.
+        """
+        # Try to find numbered list in thinking
+        lines = thinking.split('\n')
+        numbered_lines = []
+        
+        # Look for patterns like "1. ", "2. ", etc.
+        for line in lines:
+            # Match lines starting with number + dot + space + capital letter
+            if re.match(r'^\s*\d+\.\s+[A-ZА-Я]', line):
+                # Clean up the line
+                clean_line = line.strip()
+                numbered_lines.append(clean_line)
+        
+        # If we found numbered requirements (at least 3), return them
+        if len(numbered_lines) >= 3:
+            print(f"[DEBUG _extract_from_thinking] Found {len(numbered_lines)} numbered items", flush=True)
+            return '\n'.join(numbered_lines)
+        
+        # Fallback: look for the last section with numbered items
+        # Sometimes thinking ends with: "5. Select Best Requirements: 1. ..., 2. ..., ..."
+        for i in range(len(lines) - 1, -1, -1):
+            line = lines[i].strip()
+            if re.match(r'^\s*\d+\.\s+[A-ZА-Я]', line):
+                # Found a numbered item, collect all consecutive numbered items above and below
+                result_lines = []
+                # Go backwards
+                for j in range(i, -1, -1):
+                    if re.match(r'^\s*\d+\.\s+[A-ZА-Я]', lines[j].strip()):
+                        result_lines.insert(0, lines[j].strip())
+                    elif result_lines:  # Stop when we hit a non-numbered line after finding some
+                        break
+                # Go forwards from i
+                for j in range(i + 1, len(lines)):
+                    if re.match(r'^\s*\d+\.\s+[A-ZА-Я]', lines[j].strip()):
+                        result_lines.append(lines[j].strip())
+                    else:
+                        break
+                
+                if len(result_lines) >= 3:
+                    print(f"[DEBUG _extract_from_thinking] Found {len(result_lines)} consecutive numbered items", flush=True)
+                    return '\n'.join(result_lines)
+                break
+        
+        print(f"[DEBUG _extract_from_thinking] Could not find numbered list", flush=True)
+        return ""
 
     def complete_vision(
         self,
@@ -165,46 +262,51 @@ class OllamaClient:
         is_aborted: Optional[Callable[[], bool]] = None,
         max_tool_rounds: int = 40,
     ) -> tuple[list[dict], str, int]:
-        history = list(messages)
-        MAX_HISTORY_CHARS = 30000  # Увеличено для хранения 2-3 больших файлов в истории
-        _last_call: tuple[str, str] = ("", "")
-        _repeat_count: int = 0
+        """
+        Multi-turn chat with tool-calling loop.
+        Returns: (history, final_text, tool_calls_made)
+        """
         REPEAT_LIMIT = 3
-        _tool_calls_made: int = 0
+        _repeat_count = 0
+        _last_call = ("", "")
+
+        history = messages[:]
+        _tool_calls_made = 0
+
+        _rounds_without_write = 0
         _files_read: set[str] = set()
-        _rounds_without_write: int = 0
-        MAX_ROUNDS_WITHOUT_WRITE = 5  # Уменьшено с 8 до 5 для более быстрого срабатывания
 
         for _round in range(max_tool_rounds):
             if is_aborted and is_aborted():
                 raise RuntimeError("__ABORTED__")
 
-            # Cap history by character budget
-            if len(history) > 1:
-                first_msg  = history[:1]
-                rest       = history[1:]
-                budget     = MAX_HISTORY_CHARS
-                kept: list = []
-                for msg in reversed(rest):
-                    msg_size = len(str(msg.get("content", "")))
-                    if budget - msg_size < 0 and kept:
-                        break
-                    kept.append(msg)
-                    budget -= msg_size
-                capped_history = first_msg + list(reversed(kept))
-            else:
-                capped_history = history
+            # Apply message cap with truncation from the start
+            max_msg_len = 6000
+            capped_history = []
+            for msg in history:
+                if msg["role"] == "tool" and len(msg.get("content", "")) > max_msg_len:
+                    capped_history.append({
+                        "role": msg["role"],
+                        "content": (
+                            msg["content"][:max_msg_len]
+                            + f"\n\n[... truncated {len(msg['content']) - max_msg_len} chars ...]"
+                        )
+                    })
+                else:
+                    capped_history.append(msg)
 
-            # Write nudge with escalation
-            if _rounds_without_write >= MAX_ROUNDS_WITHOUT_WRITE:
-                already_read = sorted(_files_read)[:10]
-                
-                # Эскалация предупреждений
+            # Insert nudge if stuck (no writes for N rounds)
+            if _rounds_without_write > 0 and _rounds_without_write % 5 == 0:
+                already_read = ", ".join(sorted(_files_read)[:5])
+                if len(_files_read) > 5:
+                    already_read += f", ... and {len(_files_read) - 5} more"
+
                 if _rounds_without_write == 5:
                     nudge = (
-                        f"⚠️ You have read {len(_files_read)} files across {_round} rounds "
-                        f"without writing anything. You already have: {already_read}. "
-                        "Stop reading — write the required output file NOW using write_file."
+                        f"💡 Reminder: It's been {_round} rounds and you haven't called "
+                        f"write_file or modify_file yet. "
+                        f"Files you've read: {already_read}. "
+                        "Once you've gathered enough context, start writing code."
                     )
                 elif _rounds_without_write == 10:
                     nudge = (
@@ -220,7 +322,6 @@ class OllamaClient:
                     )
                 
                 capped_history = capped_history + [{"role": "user", "content": nudge}]
-                # НЕ сбрасываем счётчик - позволяем эскалировать
 
             payload: dict = {
                 "model":    model,
@@ -234,7 +335,7 @@ class OllamaClient:
                 payload["tools"] = tools
 
             if log_fn:
-                log_fn(f"[Ollama] Sending request (round {_round + 1})\u2026")
+                log_fn(f"[Ollama] Sending request (round {_round + 1})…")
 
             try:
                 resp = self._post(
@@ -279,7 +380,7 @@ class OllamaClient:
             tool_calls: list[dict] = message.get("tool_calls") or []
 
             if content and log_fn:
-                preview = content[:400] + ("\u2026" if len(content) > 400 else "")
+                preview = content[:400] + ("…" if len(content) > 400 else "")
                 log_fn(f"[Ollama] {preview}")
 
             if not tool_calls:
@@ -301,7 +402,7 @@ class OllamaClient:
                 _tool_calls_made += 1
                 if log_fn:
                     log_fn(
-                        f"[Tool \u25ba] {tool_name}"
+                        f"[Tool ►] {tool_name}"
                         f"({json.dumps(raw_args, ensure_ascii=False)[:200]})"
                     )
 
@@ -327,8 +428,8 @@ class OllamaClient:
 
                 if log_fn:
                     preview = str(result)[:300]
-                    suffix  = "\u2026" if len(str(result)) > 300 else ""
-                    log_fn(f"[Tool \u25c4] {preview}{suffix}")
+                    suffix  = "…" if len(str(result)) > 300 else ""
+                    log_fn(f"[Tool ◄] {preview}{suffix}")
 
                 # ══════════════════════════════════════════════════════
                 # FIX: Немедленный выход после confirm_task_done
@@ -372,8 +473,8 @@ class OllamaClient:
                 if _repeat_count >= REPEAT_LIMIT:
                     if log_fn:
                         log_fn(
-                            f"[WARN] Tool '{tool_name}' called {_repeat_count}\u00d7 in a row "
-                            "with identical args \u2014 breaking inner loop.",
+                            f"[WARN] Tool '{tool_name}' called {_repeat_count}× in a row "
+                            "with identical args — breaking inner loop.",
                             "warn",
                         )
                     history.append({"role": "user", "content": (

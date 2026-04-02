@@ -426,35 +426,37 @@ class PlanningPhase(BasePhase):
         """
         Extract a numbered checklist of specific, testable requirements
         from the task description for QA verification.
+        
+        FIX: Increased max_tokens from 800 to 3000 to accommodate Qwen's thinking mode.
         """
         self.log("  Extracting requirements checklist for QA verification...")
         
         prompt = f"""
-TASK TITLE: {self.task.title}
+    TASK TITLE: {self.task.title}
 
-TASK DESCRIPTION:
-{self.task.description}
+    TASK DESCRIPTION:
+    {self.task.description}
 
-Extract a numbered list of SPECIFIC, TESTABLE requirements that can be verified by examining the code.
+    Extract a numbered list of SPECIFIC, TESTABLE requirements that can be verified by examining the code.
 
-Requirements should be:
-1. Concrete and specific (not vague)
-2. Verifiable by code inspection
-3. Focused on user-visible functionality
-4. Independent (each requirement stands alone)
+    Requirements should be:
+    1. Concrete and specific (not vague)
+    2. Verifiable by code inspection
+    3. Focused on user-visible functionality
+    4. Independent (each requirement stands alone)
 
-Example:
-Task: "Add login form with email and password fields"
-Requirements:
-1. Login form HTML element exists
-2. Email input field is present in the form
-3. Password input field is present in the form
-4. Submit button exists in the form
-5. Form validation checks email format
-6. Error message displays on invalid credentials
+    Example:
+    Task: "Add login form with email and password fields"
+    Requirements:
+    1. Login form HTML element exists
+    2. Email input field is present in the form
+    3. Password input field is present in the form
+    4. Submit button exists in the form
+    5. Form validation checks email format
+    6. Error message displays on invalid credentials
 
-Now extract requirements for the task above. Output ONLY the numbered list, one requirement per line.
-"""
+    Now extract requirements for the task above. Output ONLY the numbered list, one requirement per line.
+    """
         
         try:
             # Prepend system instruction to prompt (complete() doesn't accept system arg)
@@ -463,32 +465,75 @@ Now extract requirements for the task above. Output ONLY the numbered list, one 
                 + prompt
             )
             
-            response = self.ollama.complete(
-                model=model,
-                prompt=full_prompt,
-                max_tokens=800
-            )
+            # RETRY LOGIC: Try up to 3 times before failing
+            max_attempts = 3
+            requirements = []
             
-            # Debug: log raw response
-            self.log(f"  [DEBUG] Raw Ollama response length: {len(response)} chars", "info")
-            self.log(f"  [DEBUG] First 200 chars: {response[:200]}...", "info")
+            self.log(f"  Starting extraction with up to {max_attempts} attempts...", "info")
             
-            # Parse numbered list
-            requirements = self._parse_requirements_list(response)
+            for attempt in range(1, max_attempts + 1):
+                self.log(f"  → Attempt {attempt}/{max_attempts}", "info")
+                
+                try:
+                    # FIX: Increased from 800 to 3000 to allow for thinking + response
+                    response = self.ollama.complete(
+                        model=model,
+                        prompt=full_prompt,
+                        max_tokens=6000  # ← ИСПРАВЛЕНИЕ: было 800, стало 3000
+                    )
+                    
+                    # Debug: log raw response
+                    self.log(f"  [DEBUG] Raw Ollama response length: {len(response)} chars", "info")
+                    if len(response) > 0:
+                        self.log(f"  [DEBUG] First 200 chars: {response[:200]}...", "info")
+                    
+                    # Parse numbered list
+                    requirements = self._parse_requirements_list(response)
+                    
+                    # If parsing failed, try alternative: just split by newlines
+                    if not requirements:
+                        self.log("  [DEBUG] Numbered list parsing failed, trying line-by-line", "warn")
+                        lines = [line.strip() for line in response.split('\n') if line.strip()]
+                        # Filter lines that look like requirements (not too short, not headers)
+                        requirements = [
+                            line for line in lines 
+                            if len(line) > 15 and not line.startswith('#') and not line.isupper()
+                        ][:10]  # Take max 10
+                    
+                    # If extraction succeeded - break retry loop
+                    if requirements:
+                        self.log(f"  ✓ Extraction succeeded on attempt {attempt}", "ok")
+                        break
+                    else:
+                        self.log(f"  ⚠️ Attempt {attempt} failed - no requirements extracted", "warn")
+                        if attempt < max_attempts:
+                            self.log(f"  Retrying... ({attempt + 1}/{max_attempts})", "info")
+                
+                except RuntimeError as e:
+                    # Ollama error (connection, timeout, etc.)
+                    self.log(f"  ⚠️ Attempt {attempt} failed with error: {e}", "warn")
+                    if attempt < max_attempts:
+                        self.log(f"  Retrying... ({attempt + 1}/{max_attempts})", "info")
+                    else:
+                        # Last attempt failed - re-raise
+                        raise
             
-            # If parsing failed, try alternative: just split by newlines
+            # CRITICAL: If all attempts failed - FAIL
             if not requirements:
-                self.log("  [DEBUG] Numbered list parsing failed, trying line-by-line", "warn")
-                lines = [line.strip() for line in response.split('\n') if line.strip()]
-                # Filter lines that look like requirements (not too short, not headers)
-                requirements = [
-                    line for line in lines 
-                    if len(line) > 15 and not line.startswith('#') and not line.isupper()
-                ][:10]  # Take max 10
-            
-            if not requirements:
-                self.log("  ⚠️ No requirements extracted, using task description as single requirement", "warn")
-                requirements = [self.task.description]
+                error_msg = (
+                    f"Requirements extraction FAILED after {max_attempts} attempts.\n"
+                    "Ollama did not return parseable requirements.\n\n"
+                    "Possible reasons:\n"
+                    "1. Model is in thinking mode and max_tokens is too low\n"
+                    "2. Model is not responding correctly to the prompt\n"
+                    "3. Model doesn't understand the task language\n\n"
+                    "Solutions:\n"
+                    "1. Check ollama_client.py has the latest fixes\n"
+                    "2. Try a different model (e.g., llama3.2 instead of qwen7.0)\n"
+                    "3. Increase max_tokens further if needed\n"
+                )
+                self.log(f"  ❌ {error_msg}", "error")
+                raise RuntimeError(error_msg)
             
             # Save to task as checklist
             self.task.requirements_checklist = [
@@ -504,10 +549,12 @@ Now extract requirements for the task above. Output ONLY the numbered list, one 
             
             return True
             
+        except RuntimeError:
+            # Re-raise extraction failures - these should fail the task
+            raise
         except Exception as e:
-            self.log(f"  ⚠️ Requirements extraction failed: {e}", "warn")
-            # Not critical - continue with empty checklist
-            return True
+            self.log(f"  ⚠️ Requirements extraction unexpected error: {e}", "error")
+            raise RuntimeError(f"Unexpected error in requirements extraction: {e}") from e
     
     def _step2_2_extract_user_flow(self, model: str) -> bool:
         """
@@ -546,30 +593,63 @@ Provide 5-15 concrete steps. Be specific about UI elements and user actions.
                 + prompt
             )
             
-            response = self.ollama.complete(
-                model=model,
-                prompt=full_prompt,
-                max_tokens=500
-            )
+            # RETRY LOGIC: Try up to 3 times
+            max_attempts = 3
+            user_flow = []
             
-            # Debug: log raw response
-            self.log(f"  [DEBUG] Raw response: {response[:200]}...", "info")
+            self.log(f"  Starting extraction with up to {max_attempts} attempts...", "info")
             
-            # Parse numbered list
-            user_flow = self._parse_requirements_list(response)
+            for attempt in range(1, max_attempts + 1):
+                self.log(f"  → Attempt {attempt}/{max_attempts}", "info")
+                
+                try:
+                    response = self.ollama.complete(
+                        model=model,
+                        prompt=full_prompt,
+                        max_tokens=6000
+                    )
+                    
+                    # Debug: log raw response
+                    self.log(f"  [DEBUG] Raw response: {response[:200]}...", "info")
+                    
+                    # Parse numbered list
+                    user_flow = self._parse_requirements_list(response)
+                    
+                    # Alternative parsing if failed
+                    if not user_flow:
+                        self.log("  [DEBUG] Numbered list parsing failed, trying line-by-line", "warn")
+                        lines = [line.strip() for line in response.split('\n') if line.strip()]
+                        user_flow = [
+                            line for line in lines 
+                            if len(line) > 20 and not line.startswith('#')
+                        ][:15]
+                    
+                    # Success - break retry loop
+                    if user_flow:
+                        self.log(f"  ✓ Extraction succeeded on attempt {attempt}", "ok")
+                        break
+                    else:
+                        self.log(f"  ⚠️ Attempt {attempt} failed - no user flow extracted", "warn")
+                        if attempt < max_attempts:
+                            self.log(f"  Retrying... ({attempt + 1}/{max_attempts})", "info")
+                
+                except RuntimeError as e:
+                    self.log(f"  ⚠️ Attempt {attempt} failed with error: {e}", "warn")
+                    if attempt < max_attempts:
+                        self.log(f"  Retrying... ({attempt + 1}/{max_attempts})", "info")
+                    else:
+                        raise
             
-            # Alternative parsing if failed
+            # CRITICAL: If all attempts failed - FAIL
             if not user_flow:
-                self.log("  [DEBUG] Numbered list parsing failed, trying line-by-line", "warn")
-                lines = [line.strip() for line in response.split('\n') if line.strip()]
-                user_flow = [
-                    line for line in lines 
-                    if len(line) > 20 and not line.startswith('#')
-                ][:15]
-            
-            if not user_flow:
-                self.log("  No user flow extracted, skipping", "warn")
-                return True
+                error_msg = (
+                    f"User Flow extraction FAILED after {max_attempts} attempts.\n"
+                    "Ollama did not return parseable steps.\n\n"
+                    "This is CRITICAL for QA verification.\n"
+                    "Task moved to Human Review."
+                )
+                self.log(f"  ❌ {error_msg}", "error")
+                raise RuntimeError(error_msg)
             
             # Save to task
             self.task.user_flow_steps = user_flow
@@ -583,9 +663,12 @@ Provide 5-15 concrete steps. Be specific about UI elements and user actions.
             
             return True
             
+        except RuntimeError:
+            # Re-raise extraction failures
+            raise
         except Exception as e:
-            self.log(f"  ⚠️ User flow extraction failed: {e}", "warn")
-            return True
+            self.log(f"  ⚠️ User flow extraction unexpected error: {e}", "error")
+            raise RuntimeError(f"Unexpected error in user flow extraction: {e}") from e
     
     def _step2_3_extract_system_flow(self, model: str) -> bool:
         """
@@ -642,30 +725,64 @@ Provide 5-15 concrete steps.
                 + prompt
             )
             
-            response = self.ollama.complete(
-                model=model,
-                prompt=full_prompt,
-                max_tokens=600
-            )
+            # RETRY LOGIC: Try up to 3 times
+            max_attempts = 3
+            system_flow = []
             
-            # Debug: log raw response
-            self.log(f"  [DEBUG] Raw response: {response[:200]}...", "info")
+            self.log(f"  Starting extraction with up to {max_attempts} attempts...", "info")
             
-            # Parse numbered list
-            system_flow = self._parse_requirements_list(response)
+            for attempt in range(1, max_attempts + 1):
+                self.log(f"  → Attempt {attempt}/{max_attempts}", "info")
+                
+                try:
+                    response = self.ollama.complete(
+                        model=model,
+                        prompt=full_prompt,
+                        max_tokens=6000
+                    )
+                    
+                    # Debug: log raw response
+                    self.log(f"  [DEBUG] Raw response: {response[:200]}...", "info")
+                    
+                    # Parse numbered list
+                    system_flow = self._parse_requirements_list(response)
+                    
+                    # Alternative parsing
+                    if not system_flow:
+                        self.log("  [DEBUG] Numbered list parsing failed, trying line-by-line", "warn")
+                        lines = [line.strip() for line in response.split('\n') if line.strip()]
+                        system_flow = [
+                            line for line in lines 
+                            if len(line) > 20 and not line.startswith('#')
+                        ][:15]
+                    
+                    # Success - break
+                    if system_flow:
+                        self.log(f"  ✓ Extraction succeeded on attempt {attempt}", "ok")
+                        break
+                    else:
+                        self.log(f"  ⚠️ Attempt {attempt} failed - no system flow extracted", "warn")
+                        if attempt < max_attempts:
+                            self.log(f"  Retrying... ({attempt + 1}/{max_attempts})", "info")
+                
+                except RuntimeError as e:
+                    self.log(f"  ⚠️ Attempt {attempt} failed with error: {e}", "warn")
+                    if attempt < max_attempts:
+                        self.log(f"  Retrying... ({attempt + 1}/{max_attempts})", "info")
+                    else:
+                        raise
             
-            # Alternative parsing
+            # CRITICAL: If data processing keywords found but no flow after all attempts - FAIL
             if not system_flow:
-                self.log("  [DEBUG] Numbered list parsing failed, trying line-by-line", "warn")
-                lines = [line.strip() for line in response.split('\n') if line.strip()]
-                system_flow = [
-                    line for line in lines 
-                    if len(line) > 20 and not line.startswith('#')
-                ][:15]
-            
-            if not system_flow:
-                self.log("  No system flow extracted", "warn")
-                return True
+                error_msg = (
+                    f"System Flow extraction FAILED after {max_attempts} attempts.\n"
+                    f"Task has data processing keywords but Ollama did not return steps.\n"
+                    f"Keywords found: {', '.join([kw for kw in keywords if kw in self.task.description.lower()])}\n\n"
+                    "This is CRITICAL - system flow verification will fail without this.\n"
+                    "Task moved to Human Review."
+                )
+                self.log(f"  ❌ {error_msg}", "error")
+                raise RuntimeError(error_msg)
             
             # Save to task
             self.task.system_flow_steps = system_flow
@@ -679,9 +796,12 @@ Provide 5-15 concrete steps.
             
             return True
             
+        except RuntimeError:
+            # Re-raise extraction failures
+            raise
         except Exception as e:
-            self.log(f"  ⚠️ System flow extraction failed: {e}", "warn")
-            return True
+            self.log(f"  ⚠️ System flow extraction unexpected error: {e}", "error")
+            raise RuntimeError(f"Unexpected error in system flow extraction: {e}") from e
     
     def _step2_4_extract_purpose(self, model: str) -> bool:
         """
@@ -712,46 +832,78 @@ Be concrete and specific.
                 + prompt
             )
             
-            response = self.ollama.complete(
-                model=model,
-                prompt=full_prompt,
-                max_tokens=400
-            )
+            # RETRY LOGIC: Try up to 3 times
+            max_attempts = 3
+            purpose = None
             
-            # Debug: log raw response
-            self.log(f"  [DEBUG] Raw response: {response[:300]}...", "info")
+            self.log(f"  Starting extraction with up to {max_attempts} attempts...", "info")
             
-            # Parse sections
-            purpose = {
-                "problem": "",
-                "solution": "",
-                "use_cases": ""
-            }
+            for attempt in range(1, max_attempts + 1):
+                self.log(f"  → Attempt {attempt}/{max_attempts}", "info")
+                
+                try:
+                    response = self.ollama.complete(
+                        model=model,
+                        prompt=full_prompt,
+                        max_tokens=6000
+                    )
+                    # Debug: log raw response
+                    self.log(f"  [DEBUG] Raw response: {response[:300]}...", "info")
+                    
+                    # Parse sections
+                    purpose = {
+                        "problem": "",
+                        "solution": "",
+                        "use_cases": ""
+                    }
+                    
+                    lines = response.split('\n')
+                    current_section = None
+                    
+                    for line in lines:
+                        line = line.strip()
+                        if line.startswith("PROBLEM:"):
+                            current_section = "problem"
+                            purpose["problem"] = line.replace("PROBLEM:", "").strip()
+                        elif line.startswith("SOLUTION:"):
+                            current_section = "solution"
+                            purpose["solution"] = line.replace("SOLUTION:", "").strip()
+                        elif line.startswith("USE CASES:") or line.startswith("USE CASE:"):
+                            current_section = "use_cases"
+                            purpose["use_cases"] = line.replace("USE CASES:", "").replace("USE CASE:", "").strip()
+                        elif current_section and line:
+                            purpose[current_section] += " " + line
+                    
+                    # Clean up
+                    for key in purpose:
+                        purpose[key] = purpose[key].strip()
+                    
+                    # Success - break if any section extracted
+                    if any(purpose.values()):
+                        self.log(f"  ✓ Extraction succeeded on attempt {attempt}", "ok")
+                        break
+                    else:
+                        self.log(f"  ⚠️ Attempt {attempt} failed - no purpose extracted", "warn")
+                        if attempt < max_attempts:
+                            self.log(f"  Retrying... ({attempt + 1}/{max_attempts})", "info")
+                
+                except RuntimeError as e:
+                    self.log(f"  ⚠️ Attempt {attempt} failed with error: {e}", "warn")
+                    if attempt < max_attempts:
+                        self.log(f"  Retrying... ({attempt + 1}/{max_attempts})", "info")
+                    else:
+                        raise
             
-            lines = response.split('\n')
-            current_section = None
-            
-            for line in lines:
-                line = line.strip()
-                if line.startswith("PROBLEM:"):
-                    current_section = "problem"
-                    purpose["problem"] = line.replace("PROBLEM:", "").strip()
-                elif line.startswith("SOLUTION:"):
-                    current_section = "solution"
-                    purpose["solution"] = line.replace("SOLUTION:", "").strip()
-                elif line.startswith("USE CASES:") or line.startswith("USE CASE:"):
-                    current_section = "use_cases"
-                    purpose["use_cases"] = line.replace("USE CASES:", "").replace("USE CASE:", "").strip()
-                elif current_section and line:
-                    purpose[current_section] += " " + line
-            
-            # Clean up
-            for key in purpose:
-                purpose[key] = purpose[key].strip()
-            
-            if not any(purpose.values()):
-                self.log("  No purpose extracted, skipping", "warn")
-                return True
+            # CRITICAL: If no purpose extracted after all attempts - FAIL
+            if not purpose or not any(purpose.values()):
+                error_msg = (
+                    f"Purpose extraction FAILED after {max_attempts} attempts.\n"
+                    "Ollama did not return problem/solution/use_cases.\n\n"
+                    "This is important for understanding task context.\n"
+                    "Task moved to Human Review."
+                )
+                self.log(f"  ❌ {error_msg}", "error")
+                raise RuntimeError(error_msg)
             
             # Save to task
             self.task.purpose = purpose
@@ -765,9 +917,12 @@ Be concrete and specific.
             
             return True
             
+        except RuntimeError:
+            # Re-raise extraction failures
+            raise
         except Exception as e:
-            self.log(f"  ⚠️ Purpose extraction failed: {e}", "warn")
-            return True
+            self.log(f"  ⚠️ Purpose extraction unexpected error: {e}", "error")
+            raise RuntimeError(f"Unexpected error in purpose extraction: {e}") from e
     
     def _parse_requirements_list(self, text: str) -> list[str]:
         """Parse numbered list from AI response."""
