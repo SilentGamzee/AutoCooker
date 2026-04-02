@@ -104,14 +104,22 @@ class OllamaClient:
             return result
         except requests.exceptions.ConnectionError as e:
             msg = f"[Ollama] complete() — connection error (is Ollama running?): {e}"
+            print(f"[DEBUG complete()] ERROR: {msg}", flush=True)
+            if log_fn:
+                log_fn(msg, "error")
+            raise RuntimeError(msg) from e
         except requests.exceptions.Timeout:
             msg = "[Ollama] complete() — timed out (300s). Ollama busy or overloaded."
+            print(f"[DEBUG complete()] ERROR: {msg}", flush=True)
+            if log_fn:
+                log_fn(msg, "error")
+            raise RuntimeError(msg)
         except Exception as e:
             msg = f"[Ollama] complete() failed: {type(e).__name__}: {e}"
-        print(f"[DEBUG complete()] ERROR: {msg}", flush=True)
-        if log_fn:
-            log_fn(msg, "warn")
-        return ""
+            print(f"[DEBUG complete()] ERROR: {msg}", flush=True)
+            if log_fn:
+                log_fn(msg, "error")
+            raise RuntimeError(msg) from e
 
     def complete_vision(
         self,
@@ -235,6 +243,25 @@ class OllamaClient:
                     (10, 900),
                 )
                 resp.raise_for_status()
+            except requests.exceptions.HTTPError as e:
+                # Ollama 500 error - usually context overflow or model crash
+                if e.response.status_code == 500:
+                    error_msg = (
+                        "Ollama returned 500 Internal Server Error. "
+                        "This usually means:\n"
+                        "  1. Context is too large for the model\n"
+                        "  2. Model ran out of memory\n"
+                        "  3. Request format issue\n\n"
+                        "Try:\n"
+                        "  - Using a smaller model\n"
+                        "  - Reducing number of files\n"
+                        "  - Increasing Ollama's num_ctx parameter\n"
+                    )
+                    print(f"\n[Ollama] {error_msg}", flush=True)
+                    raise RuntimeError(f"Ollama 500 error - {error_msg}") from e
+                else:
+                    # Other HTTP errors
+                    raise RuntimeError(f"Ollama HTTP {e.response.status_code} error: {e}")
             except requests.exceptions.ConnectionError as e:
                 # Session closed by abort() — treat as abort
                 if is_aborted and is_aborted():

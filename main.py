@@ -610,7 +610,39 @@ def start_task(task_id: str) -> dict:
             task.add_log("■ Task aborted by user", "system", "warn")
             task.column = "human_review"
             task.tags = list(set(task.tags + ["Aborted"]))
+        
+        except (TypeError, AttributeError, NameError, ValueError, KeyError, IndexError) as e:
+            # Python code errors - bugs in our code, not Ollama/runtime issues
+            err = traceback.format_exc()
+            error_type = type(e).__name__
+            print(f"\n[PYTHON ERROR] {error_type} in task {task_id}:\n{err}", flush=True)
+            
+            task.add_log(
+                f"[PYTHON ERROR - CODE BUG DETECTED]\n"
+                f"Error type: {error_type}\n"
+                f"Error: {e}\n\n"
+                f"This is a bug in the AutoCooker code, not an Ollama or task issue.\n"
+                f"Task moved to Human Review for investigation.\n\n"
+                f"Full traceback:\n{err}",
+                "system", 
+                "error"
+            )
+            
+            task.column = "human_review"
+            task.has_errors = True
+            task.tags = list(set(task.tags + ["Code Bug", "Needs Review", "Has Errors"]))
+            
+            print(f"\n{'='*60}", flush=True)
+            print(f"⚠️ PYTHON ERROR DETECTED - TASK MOVED TO HUMAN REVIEW", flush=True)
+            print(f"{'='*60}", flush=True)
+            print(f"Task: {task_id}", flush=True)
+            print(f"Error: {error_type}: {e}", flush=True)
+            print(f"This indicates a bug in AutoCooker code.", flush=True)
+            print(f"Please check the task logs for full traceback.", flush=True)
+            print(f"{'='*60}\n", flush=True)
+        
         except Exception:
+            # Other errors (RuntimeError, HTTPError, etc.) - expected runtime errors
             err = traceback.format_exc()
             print(f"\n[PIPELINE ERROR] Task {task_id}:\n{err}", flush=True)
             task.add_log(f"[PIPELINE ERROR]\n{err}", "system", "error")

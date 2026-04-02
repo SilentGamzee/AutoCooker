@@ -5,7 +5,7 @@ import os
 import shutil
 import time
 
-import eel
+import eel  # For UI updates via websocket
 
 from core.state import AppState, KanbanTask
 from core.tools import ToolExecutor, PLANNING_TOOLS
@@ -457,15 +457,34 @@ Now extract requirements for the task above. Output ONLY the numbered list, one 
 """
         
         try:
+            # Prepend system instruction to prompt (complete() doesn't accept system arg)
+            full_prompt = (
+                "You are a requirements analyst. Extract clear, testable requirements from task descriptions.\n\n"
+                + prompt
+            )
+            
             response = self.ollama.complete(
                 model=model,
-                system="You are a requirements analyst. Extract clear, testable requirements from task descriptions.",
-                prompt=prompt,
+                prompt=full_prompt,
                 max_tokens=800
             )
             
+            # Debug: log raw response
+            self.log(f"  [DEBUG] Raw Ollama response length: {len(response)} chars", "info")
+            self.log(f"  [DEBUG] First 200 chars: {response[:200]}...", "info")
+            
             # Parse numbered list
             requirements = self._parse_requirements_list(response)
+            
+            # If parsing failed, try alternative: just split by newlines
+            if not requirements:
+                self.log("  [DEBUG] Numbered list parsing failed, trying line-by-line", "warn")
+                lines = [line.strip() for line in response.split('\n') if line.strip()]
+                # Filter lines that look like requirements (not too short, not headers)
+                requirements = [
+                    line for line in lines 
+                    if len(line) > 15 and not line.startswith('#') and not line.isupper()
+                ][:10]  # Take max 10
             
             if not requirements:
                 self.log("  ⚠️ No requirements extracted, using task description as single requirement", "warn")
@@ -521,15 +540,32 @@ Format as numbered list:
 Provide 5-15 concrete steps. Be specific about UI elements and user actions.
 """
             
+            # Prepend system instruction to prompt
+            full_prompt = (
+                "You extract user interaction flows from task descriptions.\n\n"
+                + prompt
+            )
+            
             response = self.ollama.complete(
                 model=model,
-                system="You extract user interaction flows from task descriptions.",
-                prompt=prompt,
+                prompt=full_prompt,
                 max_tokens=500
             )
             
+            # Debug: log raw response
+            self.log(f"  [DEBUG] Raw response: {response[:200]}...", "info")
+            
             # Parse numbered list
             user_flow = self._parse_requirements_list(response)
+            
+            # Alternative parsing if failed
+            if not user_flow:
+                self.log("  [DEBUG] Numbered list parsing failed, trying line-by-line", "warn")
+                lines = [line.strip() for line in response.split('\n') if line.strip()]
+                user_flow = [
+                    line for line in lines 
+                    if len(line) > 20 and not line.startswith('#')
+                ][:15]
             
             if not user_flow:
                 self.log("  No user flow extracted, skipping", "warn")
@@ -600,15 +636,32 @@ Focus on DATA FLOW and PROCESSING, not UI. Be specific about:
 Provide 5-15 concrete steps.
 """
             
+            # Prepend system instruction to prompt
+            full_prompt = (
+                "You extract system data processing flows from task descriptions.\n\n"
+                + prompt
+            )
+            
             response = self.ollama.complete(
                 model=model,
-                system="You extract system data processing flows from task descriptions.",
-                prompt=prompt,
+                prompt=full_prompt,
                 max_tokens=600
             )
             
+            # Debug: log raw response
+            self.log(f"  [DEBUG] Raw response: {response[:200]}...", "info")
+            
             # Parse numbered list
             system_flow = self._parse_requirements_list(response)
+            
+            # Alternative parsing
+            if not system_flow:
+                self.log("  [DEBUG] Numbered list parsing failed, trying line-by-line", "warn")
+                lines = [line.strip() for line in response.split('\n') if line.strip()]
+                system_flow = [
+                    line for line in lines 
+                    if len(line) > 20 and not line.startswith('#')
+                ][:15]
             
             if not system_flow:
                 self.log("  No system flow extracted", "warn")
@@ -653,12 +706,20 @@ USE CASES: [specific scenarios where user benefits - 2-3 examples]
 Be concrete and specific.
 """
             
+            # Prepend system instruction to prompt
+            full_prompt = (
+                "You extract the purpose and value proposition of features.\n\n"
+                + prompt
+            )
+            
             response = self.ollama.complete(
                 model=model,
-                system="You extract the purpose and value proposition of features.",
-                prompt=prompt,
+                prompt=full_prompt,
                 max_tokens=400
             )
+            
+            # Debug: log raw response
+            self.log(f"  [DEBUG] Raw response: {response[:300]}...", "info")
             
             # Parse sections
             purpose = {

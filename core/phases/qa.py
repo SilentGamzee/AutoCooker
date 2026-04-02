@@ -408,38 +408,100 @@ EXPLANATION: [your explanation]
     
     def _get_changed_files_summary(self, workdir: str) -> str:
         """
-        Get FULL content of changed files (not truncated preview).
-        Uses larger limit (5KB instead of 1.5KB) to avoid "empty file" issues.
+        Get content of changed files with ADAPTIVE truncation.
+        Prevents Ollama 500 errors by limiting total context size.
+        
+        Strategy:
+        - Small number of files (1-2): 5KB each
+        - Medium number (3-5): 3KB each
+        - Many files (6+): 2KB each
+        - Total budget: 12KB (~3K tokens)
         """
         summary_parts = []
         
-        # Get scope from subtasks
+        # Collect all files first to determine truncation strategy
+        all_files = []
         for subtask in self.task.subtasks:
             if subtask.get("status") != "done":
                 continue
             
             files_created = subtask.get("files_to_create", [])
             files_modified = subtask.get("files_to_modify", [])
-            
-            for fpath in files_created + files_modified:
-                full_path = os.path.join(workdir, fpath)
-                if os.path.isfile(full_path):
-                    try:
-                        with open(full_path, 'r', encoding='utf-8', errors='replace') as f:
-                            content = f.read()  # Read FULL file
-                        
-                        # Truncate only very large files (5KB limit instead of 1.5KB)
-                        if len(content) > 5000:
-                            content = content[:5000] + "\n...(truncated for context, but file is complete)"
-                        
-                        summary_parts.append(f"\n=== {fpath} ===\n{content}")
-                    except Exception as e:
-                        summary_parts.append(f"\n=== {fpath} ===\n(error reading: {e})")
+            all_files.extend(files_created + files_modified)
         
-        if not summary_parts:
+        # Remove duplicates while preserving order
+        seen = set()
+        unique_files = []
+        for f in all_files:
+            if f not in seen:
+                seen.add(f)
+                unique_files.append(f)
+        
+        num_files = len(unique_files)
+        if num_files == 0:
             return "(no changed files found)"
         
-        return "\n".join(summary_parts)
+        # Adaptive truncation based on number of files
+        if num_files <= 2:
+            max_per_file = 5000  # Generous for few files
+        elif num_files <= 5:
+            max_per_file = 3000  # Medium truncation
+        else:
+            max_per_file = 2000  # Aggressive truncation for many files
+        
+        total_budget = 12000  # ~3K tokens total (safe for most models)
+        total_size = 0
+        
+        for fpath in unique_files:
+            full_path = os.path.join(workdir, fpath)
+            if os.path.isfile(full_path):
+                try:
+                    with open(full_path, 'r', encoding='utf-8', errors='replace') as f:
+                        content = f.read()
+                    
+                    # Check if we've exceeded total budget
+                    if total_size >= total_budget:
+                        summary_parts.append(
+                            f"\n=== {fpath} ===\n"
+                            "(skipped - context budget exceeded, too many files)"
+                        )
+                        continue
+                    
+                    # Truncate per-file based on adaptive limit
+                    if len(content) > max_per_file:
+                        content = content[:max_per_file] + "\n...(truncated for context)"
+                    
+                    # Check if adding this file would exceed total budget
+                    if total_size + len(content) > total_budget:
+                        # Take only what fits in remaining budget
+                        remaining = total_budget - total_size
+                        if remaining > 500:  # Only if meaningful amount remains
+                            content = content[:remaining] + "\n...(truncated - budget limit)"
+                            summary_parts.append(f"\n=== {fpath} ===\n{content}")
+                            total_size += len(content)
+                        else:
+                            summary_parts.append(
+                                f"\n=== {fpath} ===\n"
+                                "(skipped - insufficient budget remaining)"
+                            )
+                        break  # Stop adding more files
+                    
+                    summary_parts.append(f"\n=== {fpath} ===\n{content}")
+                    total_size += len(content)
+                    
+                except Exception as e:
+                    summary_parts.append(f"\n=== {fpath} ===\n(error reading: {e})")
+        
+        result = "\n".join(summary_parts)
+        
+        # Log context size for debugging
+        self.log(
+            f"  Context summary: {len(summary_parts)} files, "
+            f"{total_size} chars (~{total_size//4} tokens)",
+            "info"
+        )
+        
+        return result
     
     def _verify_user_flow(self, model: str) -> tuple[bool, list[str]]:
         """
