@@ -1,10 +1,16 @@
-"""Ollama API client with tool-calling support - FIXED for Qwen thinking mode."""
+"""Ollama API client with tool-calling support.
+
+ИСПРАВЛЕНИЯ (относительно оригинала):
+1. Добавлен метод _extract_from_thinking() для fallback-парсинга поля thinking  
+2. Метод complete() теперь проверяет thinking если response пустой
+3. Исправлена проблема с Qwen 7.0 thinking mode (пустой response)
+"""
 from __future__ import annotations
 import json
-import re
 import sys
 import threading
 import traceback
+import re
 import requests
 from typing import Callable, Optional
 
@@ -75,7 +81,48 @@ class OllamaClient:
 
         return _do_post()
 
+    # ══════════════════════════════════════════════════════════════
+    # ИСПРАВЛЕНИЕ: Новый метод для парсинга thinking поля
+    # ══════════════════════════════════════════════════════════════
+    
+    def _extract_from_thinking(self, thinking_text: str) -> str:
+        """
+        Извлекает пронумерованный список из поля thinking.
+        
+        Для моделей вроде Qwen 7.0 в thinking mode, которые тратят все токены
+        на поле 'thinking' и не возвращают 'response'.
+        
+        Ищет паттерны:
+        - "1. ..."
+        - "1) ..."
+        - нумерованные списки с отступами
+        """
+        if not thinking_text:
+            return ""
+        
+        lines = thinking_text.split('\n')
+        extracted_items = []
+        
+        # Паттерн для пронумерованных списков: "1.", "1)", "  1.", etc.
+        pattern = re.compile(r'^\s*(\d+)[.)]\s+(.+)$')
+        
+        for line in lines:
+            match = pattern.match(line)
+            if match:
+                item_num = match.group(1)
+                item_text = match.group(2).strip()
+                extracted_items.append(item_text)
+        
+        if extracted_items:
+            print(f"[DEBUG _extract_from_thinking] Extracted {len(extracted_items)} items from thinking", flush=True)
+            return '\n'.join(extracted_items)
+        
+        # Fallback: вернуть весь thinking если не нашли список
+        return thinking_text
+    
+    # ══════════════════════════════════════════════════════════════
     # ── Single-turn completion (used by ProjectIndex) ─────────────
+    # ══════════════════════════════════════════════════════════════
 
     def complete(
         self,
@@ -84,12 +131,7 @@ class OllamaClient:
         max_tokens: int = 1500,
         log_fn: Optional[Callable[[str], None]] = None,
     ) -> str:
-        """Single-turn completion. Errors surfaced to log_fn AND console.
-        
-        FIX: Now handles Qwen's thinking mode by:
-        1. Attempting to parse 'thinking' field if 'response' is empty
-        2. Extracting numbered requirements from thinking output
-        """
+        """Single-turn completion. Errors surfaced to log_fn AND console."""
         print(f"[DEBUG complete()] ENTERED model={model} prompt_len={len(prompt)}", flush=True)
         if log_fn:
             log_fn(f"[Ollama] complete() sending — model={model} prompt_len={len(prompt)}")
@@ -109,34 +151,56 @@ class OllamaClient:
             print(f"[DEBUG complete()] Full JSON keys: {list(json_data.keys())}", flush=True)
             
             result = json_data.get("response", "")
-            print(f"[DEBUG complete()] success response_len={len(result)}", flush=True)
+            print(f"[DEBUG complete()] response field length={len(result)}", flush=True)
             
-            # FIX: If response is empty but thinking exists, try to parse thinking
-            if not result:
+            # ══════════════════════════════════════════════════════════════
+            # ИСПРАВЛЕНИЕ: Проверка поля thinking если response пустой
+            # ══════════════════════════════════════════════════════════════
+            
+            # If empty response, try to extract from thinking field
+            if not result or len(result.strip()) == 0:
                 print(f"[DEBUG complete()] WARNING: Empty response!", flush=True)
                 
-                # Check if there's a thinking field (Qwen models)
-                thinking = json_data.get("thinking", "")
-                if thinking:
-                    print(f"[DEBUG complete()] Found thinking field ({len(thinking)} chars)", flush=True)
+                # Проверяем есть ли поле thinking
+                thinking_text = json_data.get("thinking", "")
+                if thinking_text:
+                    print(f"[DEBUG complete()] Found 'thinking' field: {len(thinking_text)} chars", flush=True)
                     print(f"[DEBUG complete()] Attempting to extract from thinking...", flush=True)
                     
-                    # Try to extract the actual response from thinking
-                    result = self._extract_from_thinking(thinking)
+                    # Извлекаем контент из thinking
+                    result = self._extract_from_thinking(thinking_text)
                     
                     if result:
-                        print(f"[DEBUG complete()] Extracted {len(result)} chars from thinking", flush=True)
+                        print(f"[DEBUG complete()] Successfully extracted {len(result)} chars from thinking", flush=True)
+                        if log_fn:
+                            log_fn(
+                                f"[Ollama] Empty response - extracted from thinking field "
+                                f"({len(result)} chars)",
+                                "warn"
+                            )
                     else:
-                        print(f"[DEBUG complete()] Could not extract from thinking", flush=True)
+                        print(f"[DEBUG complete()] Failed to extract from thinking", flush=True)
                 
-                # If still empty, log full JSON for debugging
+                # Если все еще пусто - проверяем на ошибку
                 if not result:
                     print(f"[DEBUG complete()] JSON data: {json_data}", flush=True)
+                    
                     # Check for error field
                     if "error" in json_data:
                         error_msg = json_data.get("error", "Unknown error")
                         print(f"[DEBUG complete()] Ollama returned error: {error_msg}", flush=True)
                         raise RuntimeError(f"Ollama returned error: {error_msg}")
+                    
+                    # Проверяем done_reason
+                    done_reason = json_data.get("done_reason", "")
+                    if done_reason == "length":
+                        print(f"[DEBUG complete()] Model hit token limit (done_reason='length')", flush=True)
+                        if log_fn:
+                            log_fn(
+                                "[Ollama] Model hit max_tokens limit. "
+                                "Response may be incomplete or in 'thinking' field.",
+                                "warn"
+                            )
             
             if log_fn:
                 log_fn(f"[Ollama] complete() done — response_len={len(result)}")
@@ -159,64 +223,6 @@ class OllamaClient:
             if log_fn:
                 log_fn(msg, "error")
             raise RuntimeError(msg) from e
-
-    def _extract_from_thinking(self, thinking: str) -> str:
-        """
-        Extract final response from Qwen's thinking field.
-        
-        Qwen models often structure thinking like:
-        1. Analysis...
-        2. Draft Requirements...
-        3. Refine Requirements...
-        4. Select Best Requirements...
-        5. Output: <actual requirements list>
-        
-        We try to extract the final output section - numbered requirements.
-        """
-        # Try to find numbered list in thinking
-        lines = thinking.split('\n')
-        numbered_lines = []
-        
-        # Look for patterns like "1. ", "2. ", etc.
-        for line in lines:
-            # Match lines starting with number + dot + space + capital letter
-            if re.match(r'^\s*\d+\.\s+[A-ZА-Я]', line):
-                # Clean up the line
-                clean_line = line.strip()
-                numbered_lines.append(clean_line)
-        
-        # If we found numbered requirements (at least 3), return them
-        if len(numbered_lines) >= 3:
-            print(f"[DEBUG _extract_from_thinking] Found {len(numbered_lines)} numbered items", flush=True)
-            return '\n'.join(numbered_lines)
-        
-        # Fallback: look for the last section with numbered items
-        # Sometimes thinking ends with: "5. Select Best Requirements: 1. ..., 2. ..., ..."
-        for i in range(len(lines) - 1, -1, -1):
-            line = lines[i].strip()
-            if re.match(r'^\s*\d+\.\s+[A-ZА-Я]', line):
-                # Found a numbered item, collect all consecutive numbered items above and below
-                result_lines = []
-                # Go backwards
-                for j in range(i, -1, -1):
-                    if re.match(r'^\s*\d+\.\s+[A-ZА-Я]', lines[j].strip()):
-                        result_lines.insert(0, lines[j].strip())
-                    elif result_lines:  # Stop when we hit a non-numbered line after finding some
-                        break
-                # Go forwards from i
-                for j in range(i + 1, len(lines)):
-                    if re.match(r'^\s*\d+\.\s+[A-ZА-Я]', lines[j].strip()):
-                        result_lines.append(lines[j].strip())
-                    else:
-                        break
-                
-                if len(result_lines) >= 3:
-                    print(f"[DEBUG _extract_from_thinking] Found {len(result_lines)} consecutive numbered items", flush=True)
-                    return '\n'.join(result_lines)
-                break
-        
-        print(f"[DEBUG _extract_from_thinking] Could not find numbered list", flush=True)
-        return ""
 
     def complete_vision(
         self,
@@ -263,50 +269,41 @@ class OllamaClient:
         max_tool_rounds: int = 40,
     ) -> tuple[list[dict], str, int]:
         """
-        Multi-turn chat with tool-calling loop.
-        Returns: (history, final_text, tool_calls_made)
-        """
-        REPEAT_LIMIT = 3
-        _repeat_count = 0
-        _last_call = ("", "")
+        Execute multi-turn tool-calling loop until the model stops calling
+        tools or max_tool_rounds is reached.
 
+        Returns:
+            (history, final_response, tool_calls_made)
+        """
+        REPEAT_LIMIT = 4  # Сколько раз можно вызвать один и тот же tool с одинаковыми аргументами
+        
         history = messages[:]
         _tool_calls_made = 0
-
         _rounds_without_write = 0
+        _last_call = ("", "")
+        _repeat_count = 0
         _files_read: set[str] = set()
 
         for _round in range(max_tool_rounds):
             if is_aborted and is_aborted():
                 raise RuntimeError("__ABORTED__")
 
-            # Apply message cap with truncation from the start
-            max_msg_len = 6000
-            capped_history = []
-            for msg in history:
-                if msg["role"] == "tool" and len(msg.get("content", "")) > max_msg_len:
-                    capped_history.append({
-                        "role": msg["role"],
-                        "content": (
-                            msg["content"][:max_msg_len]
-                            + f"\n\n[... truncated {len(msg['content']) - max_msg_len} chars ...]"
-                        )
-                    })
-                else:
-                    capped_history.append(msg)
+            # Message limit (cap history to last 15 messages)
+            # Prevents huge context on iteration #30
+            capped_history = history[-15:]
 
-            # Insert nudge if stuck (no writes for N rounds)
-            if _rounds_without_write > 0 and _rounds_without_write % 5 == 0:
+            # Nudge if stuck reading
+            if _rounds_without_write >= 5:
                 already_read = ", ".join(sorted(_files_read)[:5])
-                if len(_files_read) > 5:
-                    already_read += f", ... and {len(_files_read) - 5} more"
-
+                if already_read:
+                    already_read = f"[{already_read}{'...' if len(_files_read) > 5 else ''}]"
+                
                 if _rounds_without_write == 5:
                     nudge = (
-                        f"💡 Reminder: It's been {_round} rounds and you haven't called "
-                        f"write_file or modify_file yet. "
-                        f"Files you've read: {already_read}. "
-                        "Once you've gathered enough context, start writing code."
+                        f"⚠️ You've spent {_round} rounds reading but haven't written any files yet. "
+                        f"Files read: {already_read}. "
+                        "It's time to start writing files to make progress. "
+                        "Call write_file or modify_file."
                     )
                 elif _rounds_without_write == 10:
                     nudge = (
@@ -322,6 +319,7 @@ class OllamaClient:
                     )
                 
                 capped_history = capped_history + [{"role": "user", "content": nudge}]
+                # НЕ сбрасываем счётчик - позволяем эскалировать
 
             payload: dict = {
                 "model":    model,

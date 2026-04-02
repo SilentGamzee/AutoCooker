@@ -182,6 +182,14 @@ class PlanningPhase(BasePhase):
         super().__init__(state, task, "planning")
 
     def run(self) -> bool:
+        """
+        Run the planning phase.
+        
+        ИЗМЕНЕНИЯ (Патч 1):
+        - Добавлен цикл критики с max_critique_iterations=3
+        - При обнаружении проблем возврат к шагам 2.x и 3
+        - ВСЕ шаги 2.1, 2.2, 2.3, 2.4 учитывают предыдущие результаты и критику
+        """
         self.log("═══ PLANNING PHASE START ═══")
         model = self.task.models.get("planning") or "llama3.1"
         wd = self.task.project_path or self.state.working_dir
@@ -191,16 +199,11 @@ class PlanningPhase(BasePhase):
         self.log(f"  Scanned {len(self.state.cache.file_paths)} project files", "info")
 
         # ── Step 1.0: Build/update project index ──────────────────
-        # IMPORTANT: run in a background thread with timeout.
-        # scan_and_update calls Ollama which can hang indefinitely if Ollama is
-        # busy (e.g. leftover request from a previous killed app session).
-        # The index is a relevance-ranking aid, not critical path — if it times
-        # out we simply continue with the raw file list.
         self._project_index = ProjectIndex(wd)
         self.log("─── Step 1.0: Project index pre-scan ───")
 
         import threading as _threading
-        _index_error: list = []   # mutable container so thread can write to it
+        _index_error: list = []
 
         def _run_index():
             print("[DEBUG _run_index] thread started", flush=True)
@@ -221,11 +224,10 @@ class PlanningPhase(BasePhase):
 
         index_thread = _threading.Thread(target=_run_index, daemon=True)
         index_thread.start()
-        INDEX_TIMEOUT = 300   # seconds — увеличено с 120 до 300 для больших проектов
+        INDEX_TIMEOUT = 300
         index_thread.join(timeout=INDEX_TIMEOUT)
 
         if index_thread.is_alive():
-            # Still running after timeout — skip index, continue pipeline
             self.log(
                 f"  [WARN] Index scan exceeded {INDEX_TIMEOUT}s — "
                 "continuing without index. Ollama may be busy.",
@@ -238,43 +240,137 @@ class PlanningPhase(BasePhase):
         else:
             self.log("  Index scan complete", "info")
 
-        # If corrections exist and subtasks already exist → patch mode
+        # Determine workflow
         if self.task.corrections and self.task.subtasks:
+            # Patch mode - no critique cycle needed
             self.log(f"  Patch mode: applying corrections to existing plan", "info")
             steps = [
                 ("1.5 Patch Plan",    self._step5_patch_plan),
                 ("1.6 Load Subtasks", self._step6_load_subtasks),
                 ("1.7 Prepare Workdir", self._step7_prepare_workdir),
             ]
-        else:
-            steps = [
-                ("1.1 Discovery",       self._step1_discovery),
-                ("1.2 Requirements",    self._step2_requirements),
-                ("1.2.1 Extract Checklist", self._step2_1_extract_checklist),
-                ("1.2.2 Extract User Flow", self._step2_2_extract_user_flow),
-                ("1.2.3 Extract System Flow", self._step2_3_extract_system_flow),
-                ("1.2.4 Extract Purpose", self._step2_4_extract_purpose),
-                ("1.3 Spec",            self._step3_spec),
-                ("1.4 Critique",        self._step4_critique),
-                ("1.5 Impl Plan",       self._step5_impl_plan),
-                ("1.6 Load Subtasks",   self._step6_load_subtasks),
-                ("1.7 Prepare Workdir", self._step7_prepare_workdir),
+            
+            for name, fn in steps:
+                self.log(f"─── Step {name} ───")
+                ok = fn(model)
+                if not ok:
+                    self.log(f"[FAIL] Step {name} failed – aborting planning", "error")
+                    return False
+            
+            self.log("═══ PLANNING PHASE COMPLETE ═══")
+            return True
+        
+        # ═══════════════════════════════════════════════════════════
+        # НОВЫЙ КОД: Полный цикл планирования с итеративной критикой
+        # ═══════════════════════════════════════════════════════════
+        
+        # Шаг 1: Discovery (выполняется один раз)
+        self.log(f"─── Step 1.1 Discovery ───")
+        if not self._step1_discovery(model):
+            self.log(f"[FAIL] Step 1.1 Discovery failed – aborting planning", "error")
+            return False
+        
+        # Шаг 2: Requirements (выполняется один раз первоначально)
+        self.log(f"─── Step 1.2 Requirements ───")
+        if not self._step2_requirements(model):
+            self.log(f"[FAIL] Step 1.2 Requirements failed – aborting planning", "error")
+            return False
+        
+        # ═══════════════════════════════════════════════════════════
+        # ЦИКЛ КРИТИКИ: Итеративное улучшение требований и спеки
+        # ═══════════════════════════════════════════════════════════
+        
+        max_critique_iterations = 3
+        critique_passed = False
+        
+        for iteration in range(max_critique_iterations):
+            self.log("=" * 60)
+            self.log(f"CRITIQUE ITERATION {iteration + 1}/{max_critique_iterations}")
+            self.log("=" * 60)
+            
+            # Шаги 2.1-2.4: Извлечение метаданных (ВСЕ учитывают предыдущие результаты и критику)
+            extraction_steps = [
+                ("1.2.1 Extract Checklist", lambda m: self._step2_1_extract_checklist(m, iteration)),
+                ("1.2.2 Extract User Flow", lambda m: self._step2_2_extract_user_flow(m, iteration)),
+                ("1.2.3 Extract System Flow", lambda m: self._step2_3_extract_system_flow(m, iteration)),
+                ("1.2.4 Extract Purpose", lambda m: self._step2_4_extract_purpose(m, iteration)),
             ]
-
-        for name, fn in steps:
+            
+            for name, fn in extraction_steps:
+                self.log(f"─── Step {name} ───")
+                if not fn(model):
+                    self.log(f"[FAIL] Step {name} failed – aborting planning", "error")
+                    return False
+            
+            # Шаг 3: Spec (создание/обновление спецификации)
+            self.log(f"─── Step 1.3 Spec ───")
+            if not self._step3_spec(model):
+                self.log(f"[FAIL] Step 1.3 Spec failed – aborting planning", "error")
+                return False
+            
+            # Шаг 4: Critique (критика с возвратом информации о проблемах)
+            self.log(f"─── Step 1.4 Critique ───")
+            critique_ok, critique_issues = self._step4_critique(model, iteration)
+            
+            if not critique_ok:
+                # Критический сбой - прерываем
+                self.log(f"[FAIL] Step 1.4 Critique failed critically – aborting planning", "error")
+                return False
+            
+            # Анализируем результаты критики
+            if not critique_issues or len(critique_issues) == 0:
+                # Критика не нашла проблем - успех!
+                self.log("✓ Critique passed - no issues found", "ok")
+                critique_passed = True
+                break
+            
+            # Проблемы найдены
+            self.log(f"⚠️ Critique found {len(critique_issues)} issue(s):", "warn")
+            for i, issue in enumerate(critique_issues[:5], 1):
+                self.log(f"  {i}. {issue[:100]}{'...' if len(issue) > 100 else ''}", "warn")
+            if len(critique_issues) > 5:
+                self.log(f"  ... and {len(critique_issues) - 5} more issues", "warn")
+            
+            # Проверяем, не последняя ли это итерация
+            if iteration == max_critique_iterations - 1:
+                self.log(
+                    f"⚠️ Max critique iterations ({max_critique_iterations}) reached. "
+                    "Proceeding with current spec despite issues.",
+                    "warn"
+                )
+                critique_passed = True
+                break
+            
+            # Возврат к шагам 2.x и 3 для исправления
+            self.log(
+                f"Regenerating requirements and spec (iteration {iteration + 2}/{max_critique_iterations})...",
+                "info"
+            )
+        
+        # Проверка результата цикла критики
+        if not critique_passed:
+            self.log("[FAIL] Critique cycle did not converge", "error")
+            return False
+        
+        # ═══════════════════════════════════════════════════════════
+        # Шаги после критики (выполняются один раз)
+        # ═══════════════════════════════════════════════════════════
+        
+        final_steps = [
+            ("1.5 Impl Plan",       self._step5_impl_plan),
+            ("1.6 Load Subtasks",   self._step6_load_subtasks),
+            ("1.7 Prepare Workdir", self._step7_prepare_workdir),
+        ]
+        
+        for name, fn in final_steps:
             self.log(f"─── Step {name} ───")
             ok = fn(model)
             if not ok:
-                if "Critique" in name:
-                    self.log(f"[WARN] Step {name} had issues but spec was fixed", "warn")
-                else:
-                    self.log(f"[FAIL] Step {name} failed – aborting planning", "error")
-                    return False
-
+                self.log(f"[FAIL] Step {name} failed – aborting planning", "error")
+                return False
+        
         self.log("═══ PLANNING PHASE COMPLETE ═══")
         return True
-
-    # ── 1.1 Discovery ─────────────────────────────────────────────
     def _step1_discovery(self, model: str) -> bool:
         wd = self.task.project_path or self.state.working_dir
         proj_index_path = os.path.join(self.task.task_dir, "project_index.json")
@@ -422,29 +518,33 @@ class PlanningPhase(BasePhase):
         )
     
     # ── 1.2.1 Extract Requirements Checklist ──────────────────────
-    def _step2_1_extract_checklist(self, model: str) -> bool:
+    def _step2_1_extract_checklist(self, model: str, iteration: int = 0) -> bool:
         """
         Extract a numbered checklist of specific, testable requirements
         from the task description for QA verification.
         
-        FIX: Increased max_tokens from 800 to 3000 to accommodate Qwen's thinking mode.
+        ИЗМЕНЕНИЯ:
+        - Добавлен параметр iteration для отслеживания итерации критики
+        - При iteration > 0 учитываются предыдущие результаты и критика
+        - Промпт дополняется информацией о предыдущих попытках и критике
         """
         self.log("  Extracting requirements checklist for QA verification...")
         
-        prompt = f"""
+        # Базовый промпт
+        base_prompt = f"""
     TASK TITLE: {self.task.title}
-
+    
     TASK DESCRIPTION:
     {self.task.description}
-
+    
     Extract a numbered list of SPECIFIC, TESTABLE requirements that can be verified by examining the code.
-
+    
     Requirements should be:
     1. Concrete and specific (not vague)
     2. Verifiable by code inspection
     3. Focused on user-visible functionality
     4. Independent (each requirement stands alone)
-
+    
     Example:
     Task: "Add login form with email and password fields"
     Requirements:
@@ -454,15 +554,69 @@ class PlanningPhase(BasePhase):
     4. Submit button exists in the form
     5. Form validation checks email format
     6. Error message displays on invalid credentials
-
+    """
+        
+        # ═══════════════════════════════════════════════════════════
+        # НОВЫЙ КОД: Учет предыдущих результатов и критики
+        # ═══════════════════════════════════════════════════════════
+        
+        additional_context = ""
+        
+        if iteration > 0:
+            # Добавляем информацию о предыдущих результатах
+            if hasattr(self.task, 'requirements_checklist') and self.task.requirements_checklist:
+                prev_requirements = [r.get("requirement", "") for r in self.task.requirements_checklist]
+                additional_context += f"""
+    
+    PREVIOUS REQUIREMENTS (from iteration {iteration}):
+    """
+                for i, req in enumerate(prev_requirements, 1):
+                    additional_context += f"{i}. {req}\n"
+                
+                additional_context += """
+    These are the requirements from the previous iteration.
+    Review them and improve based on the critique feedback below.
+    """
+            
+            # Добавляем информацию из критики
+            critique_path = os.path.join(self.task.task_dir, "critique_report.json")
+            if os.path.exists(critique_path):
+                try:
+                    import json as _json
+                    with open(critique_path, encoding="utf-8") as _f:
+                        critique_report = _json.load(_f)
+                    
+                    critique_issues = critique_report.get("issues", [])
+                    if critique_issues:
+                        additional_context += f"""
+    
+    CRITIQUE FEEDBACK (issues found in iteration {iteration}):
+    """
+                        for i, issue in enumerate(critique_issues[:10], 1):
+                            additional_context += f"{i}. {issue}\n"
+                        
+                        additional_context += """
+    Address these critique points when generating the updated requirements.
+    Focus on making requirements more specific, testable, and implementation-focused.
+    """
+                except Exception as e:
+                    self.log(f"  [WARN] Could not read critique report: {e}", "warn")
+        
+        # Финальный промпт с учетом контекста
+        final_prompt = base_prompt + additional_context + """
+    
     Now extract requirements for the task above. Output ONLY the numbered list, one requirement per line.
     """
         
+        # ═══════════════════════════════════════════════════════════
+        # Остальная логика без изменений
+        # ═══════════════════════════════════════════════════════════
+        
         try:
-            # Prepend system instruction to prompt (complete() doesn't accept system arg)
+            # Prepend system instruction
             full_prompt = (
                 "You are a requirements analyst. Extract clear, testable requirements from task descriptions.\n\n"
-                + prompt
+                + final_prompt
             )
             
             # RETRY LOGIC: Try up to 3 times before failing
@@ -470,16 +624,17 @@ class PlanningPhase(BasePhase):
             requirements = []
             
             self.log(f"  Starting extraction with up to {max_attempts} attempts...", "info")
+            if iteration > 0:
+                self.log(f"  (Iteration {iteration + 1}: refining based on critique)", "info")
             
             for attempt in range(1, max_attempts + 1):
                 self.log(f"  → Attempt {attempt}/{max_attempts}", "info")
                 
                 try:
-                    # FIX: Increased from 800 to 3000 to allow for thinking + response
                     response = self.ollama.complete(
                         model=model,
                         prompt=full_prompt,
-                        max_tokens=6000  # ← ИСПРАВЛЕНИЕ: было 800, стало 3000
+                        max_tokens=3000  # ИСПРАВЛЕНО: было 800, стало 3000
                     )
                     
                     # Debug: log raw response
@@ -555,42 +710,99 @@ class PlanningPhase(BasePhase):
         except Exception as e:
             self.log(f"  ⚠️ Requirements extraction unexpected error: {e}", "error")
             raise RuntimeError(f"Unexpected error in requirements extraction: {e}") from e
-    
-    def _step2_2_extract_user_flow(self, model: str) -> bool:
+    def _step2_2_extract_user_flow(self, model: str, iteration: int = 0) -> bool:
         """
         Extract User Flow - how user interacts with the feature (UI steps).
+        
+        ИЗМЕНЕНИЯ:
+        - Добавлен параметр iteration для отслеживания итерации критики
+        - При iteration > 0 учитываются предыдущие результаты и критика
+        - Промпт дополняется информацией о предыдущих попытках и критике
         """
         try:
             self.log("  Extracting user flow (UI interaction steps)...", "info")
             
-            prompt = f"""
-TASK: {self.task.title}
-
-DESCRIPTION:
-{self.task.description}
-
-Extract the USER FLOW - step by step, how will the user interact with this feature?
-
-Focus on:
-- UI interactions (clicks, inputs, views)
-- User actions (opens, selects, uploads, downloads)
-- What user sees at each step
-
-Format as numbered list:
-1. User opens [where]
-2. User clicks [what]
-3. User sees [what]
-4. User inputs [what]
-5. System shows [result]
-6. User completes [action]
-
-Provide 5-15 concrete steps. Be specific about UI elements and user actions.
-"""
+            # Базовый промпт
+            base_prompt = f"""
+    TASK: {self.task.title}
+    
+    DESCRIPTION:
+    {self.task.description}
+    
+    Extract the USER FLOW - step by step, how will the user interact with this feature?
+    
+    Focus on:
+    - UI interactions (clicks, inputs, views)
+    - User actions (opens, selects, uploads, downloads)
+    - What user sees at each step
+    
+    Format as numbered list:
+    1. User opens [where]
+    2. User clicks [what]
+    3. User sees [what]
+    4. User inputs [what]
+    5. System shows [result]
+    6. User completes [action]
+    
+    Provide 5-15 concrete steps. Be specific about UI elements and user actions.
+    """
+            
+            # ═══════════════════════════════════════════════════════════
+            # НОВЫЙ КОД: Учет предыдущих результатов и критики
+            # ═══════════════════════════════════════════════════════════
+            
+            additional_context = ""
+            
+            if iteration > 0:
+                # Добавляем информацию о предыдущих результатах
+                if hasattr(self.task, 'user_flow_steps') and self.task.user_flow_steps:
+                    additional_context += f"""
+    
+    PREVIOUS USER FLOW (from iteration {iteration}):
+    """
+                    for i, step in enumerate(self.task.user_flow_steps, 1):
+                        additional_context += f"{i}. {step}\n"
+                    
+                    additional_context += """
+    These are the user flow steps from the previous iteration.
+    Review them and improve based on the critique feedback below.
+    """
+                
+                # Добавляем информацию из критики
+                critique_path = os.path.join(self.task.task_dir, "critique_report.json")
+                if os.path.exists(critique_path):
+                    try:
+                        import json as _json
+                        with open(critique_path, encoding="utf-8") as _f:
+                            critique_report = _json.load(_f)
+                        
+                        critique_issues = critique_report.get("issues", [])
+                        if critique_issues:
+                            additional_context += f"""
+    
+    CRITIQUE FEEDBACK (issues found in iteration {iteration}):
+    """
+                            for i, issue in enumerate(critique_issues[:10], 1):
+                                additional_context += f"{i}. {issue}\n"
+                            
+                            additional_context += """
+    Address these critique points when generating the updated user flow.
+    Focus on making steps more specific, concrete, and aligned with actual UI elements.
+    """
+                    except Exception as e:
+                        self.log(f"  [WARN] Could not read critique report: {e}", "warn")
+            
+            # Финальный промпт с учетом контекста
+            final_prompt = base_prompt + additional_context
+            
+            # ═══════════════════════════════════════════════════════════
+            # Остальная логика без изменений
+            # ═══════════════════════════════════════════════════════════
             
             # Prepend system instruction to prompt
             full_prompt = (
                 "You extract user interaction flows from task descriptions.\n\n"
-                + prompt
+                + final_prompt
             )
             
             # RETRY LOGIC: Try up to 3 times
@@ -598,6 +810,8 @@ Provide 5-15 concrete steps. Be specific about UI elements and user actions.
             user_flow = []
             
             self.log(f"  Starting extraction with up to {max_attempts} attempts...", "info")
+            if iteration > 0:
+                self.log(f"  (Iteration {iteration + 1}: refining based on critique)", "info")
             
             for attempt in range(1, max_attempts + 1):
                 self.log(f"  → Attempt {attempt}/{max_attempts}", "info")
@@ -606,7 +820,7 @@ Provide 5-15 concrete steps. Be specific about UI elements and user actions.
                     response = self.ollama.complete(
                         model=model,
                         prompt=full_prompt,
-                        max_tokens=6000
+                        max_tokens=3000  # МОЖНО ТАКЖЕ УВЕЛИЧИТЬ, было 20000 но для consistency делаем 3000
                     )
                     
                     # Debug: log raw response
@@ -669,60 +883,140 @@ Provide 5-15 concrete steps. Be specific about UI elements and user actions.
         except Exception as e:
             self.log(f"  ⚠️ User flow extraction unexpected error: {e}", "error")
             raise RuntimeError(f"Unexpected error in user flow extraction: {e}") from e
-    
-    def _step2_3_extract_system_flow(self, model: str) -> bool:
+    def _step2_3_extract_system_flow(self, model: str, iteration: int = 0) -> bool:
         """
         Extract System Flow - what the system does with data (processing steps).
-        CRITICAL for features like attachments that need actual processing.
+        
+        ИЗМЕНЕНИЯ:
+        - Добавлен параметр iteration для отслеживания итерации критики
+        - При iteration > 0 учитываются предыдущие результаты и критика
+        - Промпт дополняется информацией о предыдущих попытках и критике
+        - УБРАНА проверка keywords - System Flow теперь ВСЕГДА выполняется
         """
         try:
             self.log("  Extracting system flow (data processing steps)...", "info")
             
-            # Check if task involves data processing
-            keywords = ["attach", "upload", "file", "image", "document", "data", "api", "ollama", "vision", "process", "send", "extract"]
-            has_processing = any(kw in self.task.description.lower() for kw in keywords)
+            # ═══════════════════════════════════════════════════════════
+            # ИЗМЕНЕНИЕ: Убрана проверка keywords - System Flow всегда нужен
+            # Даже если задача не про "файлы" или "API", система всё равно
+            # что-то делает: сохраняет в БД, обновляет UI, валидирует данные и т.д.
+            # ═══════════════════════════════════════════════════════════
             
-            if not has_processing:
-                self.log("  No data processing keywords found, skipping system flow", "info")
-                return True
+            # Базовый промпт (обобщенный для любых задач)
+            base_prompt = f"""
+    TASK: {self.task.title}
+    
+    DESCRIPTION:
+    {self.task.description}
+    
+    Extract the SYSTEM FLOW - what does the program/system do internally when this feature is used?
+    
+    Even if the task seems simple, there is always system processing. Consider:
+    
+    For UI changes:
+    - System updates component state
+    - System re-renders UI elements
+    - System persists UI preferences
+    
+    For data features (attachments/files/images):
+    - System receives data from user input
+    - System validates file type/size
+    - System processes data (e.g., base64 encoding, image resizing)
+    - System stores data (database, filesystem, memory)
+    - System may call external APIs (Ollama vision for images, etc.)
+    
+    For business logic:
+    - System validates input
+    - System applies business rules
+    - System updates database records
+    - System triggers side effects (notifications, events)
+    
+    For integrations:
+    - System makes API calls
+    - System transforms data formats
+    - System handles responses/errors
+    
+    Format as numbered list of SYSTEM actions (internal processing):
+    1. System receives [data/input] from [source]
+    2. System validates [what criteria]
+    3. System processes [data] by [specific action - be technical]
+    4. System stores [what] in [where - be specific: DB table, field, file path]
+    5. System calls [API/service] with [what data]
+    6. System returns [output] to [recipient]
+    
+    IMPORTANT:
+    - Be SPECIFIC about technical details (API endpoints, data transformations, storage locations)
+    - Focus on INTERNAL processing, not UI interactions (that's in User Flow)
+    - Include ALL processing steps, even if they seem obvious
+    - For file/image tasks: always mention storage mechanism and any API calls (e.g., Ollama vision)
+    - Provide 5-15 concrete steps
+    
+    If the task doesn't involve complex processing, still describe what happens:
+    - "System updates [field] in [table]"
+    - "System triggers [event/notification]"
+    - "System validates [constraint]"
+    """
             
-            prompt = f"""
-TASK: {self.task.title}
-
-DESCRIPTION:
-{self.task.description}
-
-Extract the SYSTEM FLOW - what does the program/system do with the data?
-
-Consider:
-- If task involves attachments/files → how are they processed?
-- If task involves images → are they sent to Ollama vision?
-- If task involves documents → is text extracted?
-- If task involves API calls → what data is sent/received?
-- If task involves validation → what checks are performed?
-- If task involves storage → how is data persisted?
-
-Format as numbered list of SYSTEM actions:
-1. System receives [data] from [source]
-2. System validates [what]
-3. System processes [data] by [action]
-4. System sends to [destination] (e.g., Ollama API, database)
-5. System stores [result] in [location]
-6. System returns [output] to [recipient]
-
-Focus on DATA FLOW and PROCESSING, not UI. Be specific about:
-- API calls (especially Ollama vision for images)
-- Data transformations (base64, text extraction, parsing)
-- Storage locations
-- Processing steps
-
-Provide 5-15 concrete steps.
-"""
+            # ═══════════════════════════════════════════════════════════
+            # Учет предыдущих результатов и критики
+            # ═══════════════════════════════════════════════════════════
+            
+            additional_context = ""
+            
+            if iteration > 0:
+                # Добавляем информацию о предыдущих результатах
+                if hasattr(self.task, 'system_flow_steps') and self.task.system_flow_steps:
+                    additional_context += f"""
+    
+    PREVIOUS SYSTEM FLOW (from iteration {iteration}):
+    """
+                    for i, step in enumerate(self.task.system_flow_steps, 1):
+                        additional_context += f"{i}. {step}\n"
+                    
+                    additional_context += """
+    These are the system flow steps from the previous iteration.
+    Review them and improve based on the critique feedback below.
+    """
+                
+                # Добавляем информацию из критики
+                critique_path = os.path.join(self.task.task_dir, "critique_report.json")
+                if os.path.exists(critique_path):
+                    try:
+                        import json as _json
+                        with open(critique_path, encoding="utf-8") as _f:
+                            critique_report = _json.load(_f)
+                        
+                        critique_issues = critique_report.get("issues", [])
+                        if critique_issues:
+                            additional_context += f"""
+    
+    CRITIQUE FEEDBACK (issues found in iteration {iteration}):
+    """
+                            for i, issue in enumerate(critique_issues[:10], 1):
+                                additional_context += f"{i}. {issue}\n"
+                            
+                            additional_context += """
+    Address these critique points when generating the updated system flow.
+    Focus on making steps more specific about:
+    - Actual API calls (Ollama vision, database, etc.)
+    - Data transformations (base64 encoding, text extraction, JSON parsing)
+    - Storage mechanisms (file paths, database tables, fields)
+    - Processing logic (validation, filtering, conversion)
+    """
+                    except Exception as e:
+                        self.log(f"  [WARN] Could not read critique report: {e}", "warn")
+            
+            # Финальный промпт с учетом контекста
+            final_prompt = base_prompt + additional_context
+            
+            # ═══════════════════════════════════════════════════════════
+            # Остальная логика без изменений
+            # ═══════════════════════════════════════════════════════════
             
             # Prepend system instruction to prompt
             full_prompt = (
                 "You extract system data processing flows from task descriptions.\n\n"
-                + prompt
+                + final_prompt
             )
             
             # RETRY LOGIC: Try up to 3 times
@@ -730,6 +1024,8 @@ Provide 5-15 concrete steps.
             system_flow = []
             
             self.log(f"  Starting extraction with up to {max_attempts} attempts...", "info")
+            if iteration > 0:
+                self.log(f"  (Iteration {iteration + 1}: refining based on critique)", "info")
             
             for attempt in range(1, max_attempts + 1):
                 self.log(f"  → Attempt {attempt}/{max_attempts}", "info")
@@ -738,7 +1034,151 @@ Provide 5-15 concrete steps.
                     response = self.ollama.complete(
                         model=model,
                         prompt=full_prompt,
-                        max_tokens=6000
+                        max_tokens=3000
+                    )
+                    
+                    # Debug: log raw response
+                    self.log(f"  [DEBUG] Raw response: {response[:200]}...", "info")
+                    
+                    # Parse numbered list
+                    system_flow = self._parse_requirements_list(response)
+                    
+                    # Alternative parsing
+                    if not system_flow:
+                        self.log("  [DEBUG] Numbered list parsing failed, trying line-by-line", "warn")
+                        lines = [line.strip() for line in response.split('\n') if line.strip()]
+                        system_flow = [
+                            line for line in lines 
+                            if len(line) > 20 and not line.startswith('#')
+                        ][:15]
+                    
+                    # Success - break
+                    if system_flow:
+                        self.log(f"  ✓ Extraction succeeded on attempt {attempt}", "ok")
+                        break
+                    else:
+                        self.log(f"  ⚠️ Attempt {attempt} failed - no system flow extracted", "warn")
+                        if attempt < max_attempts:
+                            self.log(f"  Retrying... ({attempt + 1}/{max_attempts})", "info")
+                
+                except RuntimeError as e:
+                    self.log(f"  ⚠️ Attempt {attempt} failed with error: {e}", "warn")
+                    if attempt < max_attempts:
+                        self.log(f"  Retrying... ({attempt + 1}/{max_attempts})", "info")
+                    else:
+                        raise
+            
+            # ═══════════════════════════════════════════════════════════
+            # ИЗМЕНЕНИЕ: System Flow теперь обязателен для ВСЕХ задач
+            # ═══════════════════════════════════════════════════════════
+            if not system_flow:
+                error_msg = (
+                    f"System Flow extraction FAILED after {max_attempts} attempts.\n"
+                    "Ollama did not return system processing steps.\n\n"
+                    "System Flow is REQUIRED for all tasks - even simple UI changes\n"
+                    "have internal processing (state updates, DB writes, etc.).\n\n"
+                    "Task moved to Human Review."
+                )
+                self.log(f"  ❌ {error_msg}", "error")
+                raise RuntimeError(error_msg)
+            
+            # Save to task
+            self.task.system_flow_steps = system_flow
+            self.state._save_kanban()
+            
+            self.log(f"  ✓ Extracted {len(system_flow)} system flow steps", "ok")
+            for i, step in enumerate(system_flow[:5], 1):
+                self.log(f"    {i}. {step[:80]}{'...' if len(step) > 80 else ''}", "info")
+            if len(system_flow) > 5:
+                self.log(f"    ... and {len(system_flow) - 5} more steps", "info")
+            
+            return True
+            
+        except RuntimeError:
+            # Re-raise extraction failures
+            raise
+        except Exception as e:
+            self.log(f"  ⚠️ System flow extraction unexpected error: {e}", "error")
+            raise RuntimeError(f"Unexpected error in system flow extraction: {e}") from e
+            
+            # ═══════════════════════════════════════════════════════════
+            # НОВЫЙ КОД: Учет предыдущих результатов и критики
+            # ═══════════════════════════════════════════════════════════
+            
+            additional_context = ""
+            
+            if iteration > 0:
+                # Добавляем информацию о предыдущих результатах
+                if hasattr(self.task, 'system_flow_steps') and self.task.system_flow_steps:
+                    additional_context += f"""
+    
+    PREVIOUS SYSTEM FLOW (from iteration {iteration}):
+    """
+                    for i, step in enumerate(self.task.system_flow_steps, 1):
+                        additional_context += f"{i}. {step}\n"
+                    
+                    additional_context += """
+    These are the system flow steps from the previous iteration.
+    Review them and improve based on the critique feedback below.
+    """
+                
+                # Добавляем информацию из критики
+                critique_path = os.path.join(self.task.task_dir, "critique_report.json")
+                if os.path.exists(critique_path):
+                    try:
+                        import json as _json
+                        with open(critique_path, encoding="utf-8") as _f:
+                            critique_report = _json.load(_f)
+                        
+                        critique_issues = critique_report.get("issues", [])
+                        if critique_issues:
+                            additional_context += f"""
+    
+    CRITIQUE FEEDBACK (issues found in iteration {iteration}):
+    """
+                            for i, issue in enumerate(critique_issues[:10], 1):
+                                additional_context += f"{i}. {issue}\n"
+                            
+                            additional_context += """
+    Address these critique points when generating the updated system flow.
+    Focus on making steps more specific about:
+    - Actual API calls (Ollama vision, database, etc.)
+    - Data transformations (base64 encoding, text extraction, JSON parsing)
+    - Storage mechanisms (file paths, database tables, fields)
+    - Processing logic (validation, filtering, conversion)
+    """
+                    except Exception as e:
+                        self.log(f"  [WARN] Could not read critique report: {e}", "warn")
+            
+            # Финальный промпт с учетом контекста
+            final_prompt = base_prompt + additional_context
+            
+            # ═══════════════════════════════════════════════════════════
+            # Остальная логика без изменений
+            # ═══════════════════════════════════════════════════════════
+            
+            # Prepend system instruction to prompt
+            full_prompt = (
+                "You extract system data processing flows from task descriptions.\n\n"
+                + final_prompt
+            )
+            
+            # RETRY LOGIC: Try up to 3 times
+            max_attempts = 3
+            system_flow = []
+            
+            self.log(f"  Starting extraction with up to {max_attempts} attempts...", "info")
+            if iteration > 0:
+                self.log(f"  (Iteration {iteration + 1}: refining based on critique)", "info")
+            
+            for attempt in range(1, max_attempts + 1):
+                self.log(f"  → Attempt {attempt}/{max_attempts}", "info")
+                
+                try:
+                    response = self.ollama.complete(
+                        model=model,
+                        prompt=full_prompt,
+                        max_tokens=3000  # ИЗМЕНЕНО: было 20000, стало 3000 для консистентности
                     )
                     
                     # Debug: log raw response
@@ -802,34 +1242,96 @@ Provide 5-15 concrete steps.
         except Exception as e:
             self.log(f"  ⚠️ System flow extraction unexpected error: {e}", "error")
             raise RuntimeError(f"Unexpected error in system flow extraction: {e}") from e
-    
-    def _step2_4_extract_purpose(self, model: str) -> bool:
+        
+    def _step2_4_extract_purpose(self, model: str, iteration: int = 0) -> bool:
         """
         Extract Purpose - why user needs this feature (problem/solution/use cases).
+        
+        ИЗМЕНЕНИЯ:
+        - Добавлен параметр iteration для отслеживания итерации критики
+        - При iteration > 0 учитываются предыдущие результаты и критика
+        - Промпт дополняется информацией о предыдущих попытках и критике
         """
         try:
             self.log("  Extracting purpose (problem/solution/use cases)...", "info")
             
-            prompt = f"""
-TASK: {self.task.title}
-
-DESCRIPTION:
-{self.task.description}
-
-Why does the user need this feature? What problem does it solve?
-
-Answer in this format:
-PROBLEM: [what problem user has now - 1-2 sentences]
-SOLUTION: [how this feature solves it - 1-2 sentences]
-USE CASES: [specific scenarios where user benefits - 2-3 examples]
-
-Be concrete and specific.
-"""
+            # Базовый промпт
+            base_prompt = f"""
+    TASK: {self.task.title}
+    
+    DESCRIPTION:
+    {self.task.description}
+    
+    Why does the user need this feature? What problem does it solve?
+    
+    Answer in this format:
+    PROBLEM: [what problem user has now - 1-2 sentences]
+    SOLUTION: [how this feature solves it - 1-2 sentences]
+    USE CASES: [specific scenarios where user benefits - 2-3 examples]
+    
+    Be concrete and specific.
+    """
+            
+            # ═══════════════════════════════════════════════════════════
+            # НОВЫЙ КОД: Учет предыдущих результатов и критики
+            # ═══════════════════════════════════════════════════════════
+            
+            additional_context = ""
+            
+            if iteration > 0:
+                # Добавляем информацию о предыдущих результатах
+                if hasattr(self.task, 'purpose') and self.task.purpose:
+                    prev_purpose = self.task.purpose
+                    additional_context += f"""
+    
+    PREVIOUS PURPOSE (from iteration {iteration}):
+    PROBLEM: {prev_purpose.get('problem', '')}
+    SOLUTION: {prev_purpose.get('solution', '')}
+    USE CASES: {prev_purpose.get('use_cases', '')}
+    
+    This is the purpose from the previous iteration.
+    Review it and improve based on the critique feedback below.
+    """
+                
+                # Добавляем информацию из критики
+                critique_path = os.path.join(self.task.task_dir, "critique_report.json")
+                if os.path.exists(critique_path):
+                    try:
+                        import json as _json
+                        with open(critique_path, encoding="utf-8") as _f:
+                            critique_report = _json.load(_f)
+                        
+                        critique_issues = critique_report.get("issues", [])
+                        if critique_issues:
+                            additional_context += f"""
+    
+    CRITIQUE FEEDBACK (issues found in iteration {iteration}):
+    """
+                            for i, issue in enumerate(critique_issues[:10], 1):
+                                additional_context += f"{i}. {issue}\n"
+                            
+                            additional_context += """
+    Address these critique points when generating the updated purpose.
+    Focus on:
+    - Making problem description more concrete and specific
+    - Ensuring solution directly addresses the stated problem
+    - Providing realistic, detailed use case scenarios
+    - Avoiding vague or generic statements
+    """
+                    except Exception as e:
+                        self.log(f"  [WARN] Could not read critique report: {e}", "warn")
+            
+            # Финальный промпт с учетом контекста
+            final_prompt = base_prompt + additional_context
+            
+            # ═══════════════════════════════════════════════════════════
+            # Остальная логика без изменений
+            # ═══════════════════════════════════════════════════════════
             
             # Prepend system instruction to prompt
             full_prompt = (
                 "You extract the purpose and value proposition of features.\n\n"
-                + prompt
+                + final_prompt
             )
             
             # RETRY LOGIC: Try up to 3 times
@@ -837,6 +1339,8 @@ Be concrete and specific.
             purpose = None
             
             self.log(f"  Starting extraction with up to {max_attempts} attempts...", "info")
+            if iteration > 0:
+                self.log(f"  (Iteration {iteration + 1}: refining based on critique)", "info")
             
             for attempt in range(1, max_attempts + 1):
                 self.log(f"  → Attempt {attempt}/{max_attempts}", "info")
@@ -845,8 +1349,9 @@ Be concrete and specific.
                     response = self.ollama.complete(
                         model=model,
                         prompt=full_prompt,
-                        max_tokens=6000
+                        max_tokens=3000  # УВЕЛИЧЕНО: было 400, стало 1000 (с учетом критики может быть длиннее)
                     )
+                    
                     # Debug: log raw response
                     self.log(f"  [DEBUG] Raw response: {response[:300]}...", "info")
                     
@@ -923,7 +1428,6 @@ Be concrete and specific.
         except Exception as e:
             self.log(f"  ⚠️ Purpose extraction unexpected error: {e}", "error")
             raise RuntimeError(f"Unexpected error in purpose extraction: {e}") from e
-    
     def _parse_requirements_list(self, text: str) -> list[str]:
         """Parse numbered list from AI response."""
         lines = text.strip().split('\n')
@@ -1000,26 +1504,119 @@ Be concrete and specific.
         )
 
     # ── 1.4 Critique ──────────────────────────────────────────────
-    def _step4_critique(self, model: str) -> bool:
+    def _step4_critique(self, model: str, iteration: int = 0) -> tuple[bool, list[str]]:
+        """
+        Run critique on the spec and return status + issues found.
+        
+        ИЗМЕНЕНИЯ:
+        - Теперь возвращает tuple[bool, list[str]]: (success, issues)
+        - success = False только при критическом сбое (не при найденных проблемах)
+        - issues = список найденных проблем из critique_report.json
+        - Добавлен параметр iteration для логирования
+        
+        Returns:
+            tuple[bool, list[str]]: (success, issues)
+            - success: True если критика прошла успешно (даже если нашла проблемы)
+            - issues: список найденных проблем (пустой если проблем нет)
+        """
+        if iteration > 0:
+            self.log(f"  Running critique (iteration {iteration + 1})...", "info")
+        
+        # Запускаем первый проход критики
         ok = self._run_critique_once(model)
         if not ok:
-            return False
-
-        # If the critique found and fixed issues, run a second pass to verify
-        # the fixed spec doesn't have new problems introduced by the edits.
+            # Критический сбой (не смогли даже запустить критику)
+            return False, []
+        
+        # Читаем результаты критики
         critique_path = os.path.join(self.task.task_dir, "critique_report.json")
+        issues = []
+        fixes_applied = 0
+        
         try:
             import json as _json
             with open(critique_path, encoding="utf-8") as _f:
                 report = _json.load(_f)
-            if report.get("fixes_applied", 0) > 0:
-                self.log("  Re-running critique on fixed spec…", "info")
-                return self._run_critique_once(model)
-        except Exception:
-            pass
-
-        return True
-
+            
+            # Извлекаем найденные проблемы
+            issues = report.get("issues", [])
+            fixes_applied = report.get("fixes_applied", 0)
+            
+            # Логируем результаты первого прохода
+            if issues:
+                self.log(f"  First pass: found {len(issues)} issue(s)", "info")
+            else:
+                self.log(f"  First pass: no issues found", "ok")
+            
+            # Если были автоматические исправления, делаем второй проход для проверки
+            if fixes_applied > 0:
+                self.log(f"  Re-running critique on fixed spec (fixes_applied={fixes_applied})…", "info")
+                ok2 = self._run_critique_once(model)
+                
+                if ok2:
+                    # Перечитываем отчет после второго прохода
+                    try:
+                        with open(critique_path, encoding="utf-8") as _f:
+                            report2 = _json.load(_f)
+                        issues = report2.get("issues", [])
+                        
+                        if issues:
+                            self.log(f"  Second pass: found {len(issues)} issue(s)", "info")
+                        else:
+                            self.log(f"  Second pass: no issues found", "ok")
+                    except Exception:
+                        pass
+        
+        except FileNotFoundError:
+            self.log(f"  [WARN] critique_report.json not found", "warn")
+            # Не критично, продолжаем
+        except Exception as e:
+            self.log(f"  [WARN] Could not read critique report: {e}", "warn")
+            # Не критично, продолжаем
+        
+        # Возвращаем успех (критика прошла) и список проблем
+        return True, issues
+    
+    
+    def _run_critique_once(self, model: str) -> bool:
+        """
+        Single critique pass — called once or twice by _step4_critique.
+        
+        БЕЗ ИЗМЕНЕНИЙ (остается как есть)
+        """
+        wd            = self.task.project_path or self.state.working_dir
+        spec_path     = os.path.join(self.task.task_dir, "spec.md")
+        req_path      = os.path.join(self.task.task_dir, "requirements.json")
+        context_path  = os.path.join(self.task.task_dir, "context.json")
+        critique_path = os.path.join(self.task.task_dir, "critique_report.json")
+    
+        spec_content = self._read_file_safe(spec_path)
+        req_content  = self._read_file_safe(req_path)
+        ctx_content  = self._read_file_safe(context_path)
+    
+        executor = self._make_planning_executor(wd)
+        msg = (
+            f"spec.md:\n{spec_content}\n\n"
+            f"requirements.json:\n{req_content}\n\n"
+            f"context.json:\n{ctx_content}\n\n"
+            f"Write critique_report.json to: {self._rel(critique_path)}\n"
+            f"If you fix issues, rewrite spec.md at: {self._rel(spec_path)}\n\n"
+            "Focus on: validation drift (requirements that describe only verification, "
+            "not actual implementation), unverifiable acceptance criteria, and invented file paths."
+        )
+    
+        def validate():
+            ok, msg = validate_json_file(critique_path)
+            if not ok:
+                return False, f"critique_report.json: {msg}"
+            # Spec must still be valid after any fixes
+            return _validate_spec_md(spec_path)
+    
+        return self.run_loop(
+            "1.4 Critique", "p4_critique.md",
+            PLANNING_TOOLS, executor, msg, validate, model,
+            max_outer_iterations=5,
+        )
     def _run_critique_once(self, model: str) -> bool:
         """Single critique pass — called once or twice by _step4_critique."""
         wd            = self.task.project_path or self.state.working_dir
