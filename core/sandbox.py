@@ -29,7 +29,6 @@ PLANNING_ALLOWED_FILES = {
     'implementation_plan.json',
 }
 
-
 class Sandbox:
     def __init__(self, task_dir: str, project_path: str):
         self.task_dir     = os.path.abspath(task_dir)
@@ -51,6 +50,9 @@ class Sandbox:
         """
         target_abs = os.path.abspath(target_path)
         task_abs   = self.task_dir
+
+        if target_abs.find("__pycache__") != -1:
+            return False, "Write blocked: writing to __pycache__ is not allowed."
 
         # ═══════════════════════════════════════════════════════════
         # ИСПРАВЛЕНИЕ: Проверка что путь внутри task_dir
@@ -121,6 +123,9 @@ class Sandbox:
         """Block reads from other tasks' directories."""
         target_abs  = os.path.abspath(target_path)
         tasks_root  = os.path.dirname(self.task_dir)
+        
+        if target_abs.find("__pycache__") != -1:
+            return False, "Read blocked: reading from __pycache__ is not allowed."
 
         if target_abs.startswith(tasks_root + os.sep):
             m = re.search(r'task_(\d+)', target_abs)

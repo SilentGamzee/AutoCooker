@@ -16,7 +16,7 @@ from typing import Callable, Optional
 
 
 class OllamaClient:
-    def __init__(self, base_url: str = "http://localhost:11434"):
+    def __init__(self, base_url: str = "http://localhost:1234"):
         self.base_url = base_url.rstrip("/")
         # Persistent session — closed on abort() to cancel in-flight requests
         self._session = requests.Session()
@@ -42,6 +42,17 @@ class OllamaClient:
     def _sess(self) -> requests.Session:
         with self._session_lock:
             return self._session
+
+    def _api_base(self) -> str:
+        """LM Studio OpenAI-compatible base URL."""
+        base = self.base_url.rstrip("/")
+        return base if base.endswith("/v1") else f"{base}/v1"
+
+    def _chat_completions_url(self) -> str:
+        return f"{self._api_base()}/chat/completions"
+
+    def _models_url(self) -> str:
+        return f"{self._api_base()}/models"
 
     def _post(self, url: str, json_payload: dict, timeout) -> requests.Response:
         """
@@ -138,72 +149,42 @@ class OllamaClient:
         try:
             print(f"[DEBUG complete()] calling self._post() ...", flush=True)
             resp = self._post(
-                f"{self.base_url}/api/generate",
-                {"model": model, "prompt": prompt, "stream": False,
-                 "options": {"temperature": 0.1, "num_predict": max_tokens}},
+                self._chat_completions_url(),
+                {
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "stream": False,
+                    "temperature": 0.1,
+                    "max_tokens": max_tokens,
+                },
                 (10, 6000),
             )
             print(f"[DEBUG complete()] POST returned status={resp.status_code}", flush=True)
             resp.raise_for_status()
-            
-            # Parse JSON response
+
             json_data = resp.json()
             print(f"[DEBUG complete()] Full JSON keys: {list(json_data.keys())}", flush=True)
-            
-            result = json_data.get("response", "")
-            print(f"[DEBUG complete()] response field length={len(result)}", flush=True)
-            
-            # ══════════════════════════════════════════════════════════════
-            # ИСПРАВЛЕНИЕ: Проверка поля thinking если response пустой
-            # ══════════════════════════════════════════════════════════════
-            
-            # If empty response, try to extract from thinking field
-            if not result or len(result.strip()) == 0:
+
+            choice0 = (json_data.get("choices") or [{}])[0]
+            message = choice0.get("message") or {}
+            result = message.get("content") or ""
+            tool_calls = message.get("tool_calls") or []
+            print(f"[DEBUG complete()] content length={len(result)} tool_calls={len(tool_calls)}", flush=True)
+
+            if not result.strip() and tool_calls:
+                result = json.dumps(tool_calls, ensure_ascii=False)
+
+            if not result.strip():
                 print(f"[DEBUG complete()] WARNING: Empty response!", flush=True)
-                
-                # Проверяем есть ли поле thinking
-                thinking_text = json_data.get("thinking", "")
-                if thinking_text:
-                    print(f"[DEBUG complete()] Found 'thinking' field: {len(thinking_text)} chars", flush=True)
-                    print(f"[DEBUG complete()] Attempting to extract from thinking...", flush=True)
-                    
-                    # Извлекаем контент из thinking
-                    result = self._extract_from_thinking(thinking_text)
-                    
-                    if result:
-                        print(f"[DEBUG complete()] Successfully extracted {len(result)} chars from thinking", flush=True)
-                        if log_fn:
-                            log_fn(
-                                f"[Ollama] Empty response - extracted from thinking field "
-                                f"({len(result)} chars)",
-                                "warn"
-                            )
-                    else:
-                        print(f"[DEBUG complete()] Failed to extract from thinking", flush=True)
-                
-                # Если все еще пусто - проверяем на ошибку
-                if not result:
-                    print(f"[DEBUG complete()] JSON data: {json_data}", flush=True)
-                    
-                    # Check for error field
-                    if "error" in json_data:
-                        error_msg = json_data.get("error", "Unknown error")
-                        print(f"[DEBUG complete()] Ollama returned error: {error_msg}", flush=True)
-                        raise RuntimeError(f"Ollama returned error: {error_msg}")
-                    
-                    # Проверяем done_reason
-                    done_reason = json_data.get("done_reason", "")
-                    if done_reason == "length":
-                        print(f"[DEBUG complete()] Model hit token limit (done_reason='length')", flush=True)
-                        if log_fn:
-                            log_fn(
-                                "[Ollama] Model hit max_tokens limit. "
-                                "Response may be incomplete or in 'thinking' field.",
-                                "warn"
-                            )
-            
+                if "error" in json_data:
+                    error_msg = json_data.get("error", "Unknown error")
+                    raise RuntimeError(f"LM Studio returned error: {error_msg}")
+                if choice0.get("finish_reason") == "length":
+                    if log_fn:
+                        log_fn("[LM Studio] Model hit max_tokens limit.", "warn")
+
             if log_fn:
-                log_fn(f"[Ollama] complete() done — response_len={len(result)}")
+                log_fn(f"[LM Studio] complete() done — response_len={len(result)}")
             return result
         except requests.exceptions.ConnectionError as e:
             msg = f"[Ollama] complete() — connection error (is Ollama running?): {e}"
@@ -235,23 +216,39 @@ class OllamaClient:
         """Vision completion for image description."""
         try:
             resp = self._post(
-                f"{self.base_url}/api/generate",
-                {"model": model, "prompt": prompt, "images": [image_b64],
-                 "stream": False,
-                 "options": {"temperature": 0.1, "num_predict": max_tokens}},
+                self._chat_completions_url(),
+                {
+                    "model": model,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": prompt},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {"url": f"data:{mime_type};base64,{image_b64}"},
+                                },
+                            ],
+                        }
+                    ],
+                    "stream": False,
+                    "temperature": 0.1,
+                    "max_tokens": max_tokens,
+                },
                 (10, 120),
             )
             resp.raise_for_status()
-            return resp.json().get("response", "")
+            data = resp.json()
+            return (((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "")
         except Exception as e:
             print(f"[OllamaClient.complete_vision] failed: {e}", flush=True)
             return ""
 
     def list_models(self) -> list[str]:
         try:
-            r = requests.get(f"{self.base_url}/api/tags", timeout=5)
+            r = requests.get(self._models_url(), timeout=5)
             r.raise_for_status()
-            return [m["name"] for m in r.json().get("models", [])]
+            return [m["id"] for m in r.json().get("data", [])]
         except Exception:
             return []
 
@@ -277,7 +274,7 @@ class OllamaClient:
         """
         REPEAT_LIMIT = 4  # Сколько раз можно вызвать один и тот же tool с одинаковыми аргументами
         
-        history = messages[:]
+        history = messages[-5:]
         _tool_calls_made = 0
         _rounds_without_write = 0
         _last_call = ("", "")
@@ -337,7 +334,7 @@ class OllamaClient:
 
             try:
                 resp = self._post(
-                    f"{self.base_url}/api/chat",
+                    self._chat_completions_url(),
                     payload,
                     (10, 900),
                 )
@@ -371,15 +368,37 @@ class OllamaClient:
                 traceback.print_exc(file=sys.stdout)
                 raise
 
-            data       = resp.json()
-            message    = data.get("message", {})
-            history.append(message)
-            content    = message.get("content") or ""
+            data = resp.json()
+            choice0 = (data.get("choices") or [{}])[0]
+            message = choice0.get("message") or {}
+            content = message.get("content") or ""
             tool_calls: list[dict] = message.get("tool_calls") or []
+
+            # ══════════════════════════════════════════════════════════════
+            # FIX: Detect text-only responses (no tool calls)
+            # Return immediately so base.py retry logic can handle it
+            # This prevents creating malformed conversation with double user messages
+            # ══════════════════════════════════════════════════════════════
+            if not tool_calls:
+                # Model sent text but no tools - let outer loop retry
+                assistant_message = {"role": "assistant", "content": content}
+                history.append(assistant_message)
+                
+                if log_fn and content:
+                    preview = content[:400] + ("…" if len(content) > 400 else "")
+                    log_fn(f"[LM Studio] {preview}")
+                
+                # Return immediately - validation will fail and retry
+                return history, content, _tool_calls_made
+            
+            # Build assistant message with tool calls
+            assistant_message = {"role": "assistant", "content": content}
+            assistant_message["tool_calls"] = tool_calls
+            history.append(assistant_message)
 
             if content and log_fn:
                 preview = content[:400] + ("…" if len(content) > 400 else "")
-                log_fn(f"[Ollama] {preview}")
+                log_fn(f"[LM Studio] {preview}")
 
             if not tool_calls:
                 return history, content, _tool_calls_made
@@ -425,8 +444,8 @@ class OllamaClient:
                     result = f"ERROR: {e}"
 
                 if log_fn:
-                    preview = str(result)[:300]
-                    suffix  = "…" if len(str(result)) > 300 else ""
+                    preview = result#str(result)[:300]
+                    suffix  = ""#"…" if len(str(result)) > 300 else ""
                     log_fn(f"[Tool ◄] {preview}{suffix}")
 
                 # ══════════════════════════════════════════════════════
@@ -440,12 +459,18 @@ class OllamaClient:
                             "  → confirm_task_done called - exiting for validation check",
                             "info"
                         )
-                    history.append({"role": "tool", "content": str(result)})
+                    tool_message = {"role": "tool", "content": str(result)}
+                    if tc.get("id"):
+                        tool_message["tool_call_id"] = tc["id"]
+                    history.append(tool_message)
                     # Немедленно завершить chat_with_tools
                     # Управление вернётся в run_loop для проверки validate_fn
                     return history, "", _tool_calls_made
 
-                history.append({"role": "tool", "content": str(result)})
+                tool_message = {"role": "tool", "content": str(result)}
+                if tc.get("id"):
+                    tool_message["tool_call_id"] = tc["id"]
+                history.append(tool_message)
 
                 call_key = (tool_name, json.dumps(raw_args, sort_keys=True))
                 if call_key == _last_call:

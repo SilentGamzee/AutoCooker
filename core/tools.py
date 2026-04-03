@@ -536,7 +536,7 @@ class ToolExecutor:
         """Emit a read_file log entry after a write so the cache refresh is visible."""
         if not self.log_fn:
             return
-        preview = content[:300] + ("…" if len(content) > 300 else "")
+        preview = content#content[:300] + ("…" if len(content) > 300 else "")
         self.log_fn('[Tool ►] read_file({"path": "' + path_rel + '"})', "tool_read")
         self.log_fn(f"[Tool ◄] {preview}", "tool_result")
 

@@ -6,6 +6,56 @@ You are the **Implementation Planner Agent**. You read `spec.md` and `context.js
 
 Write `implementation_plan.json` using `write_file`.
 
+## ⚠️ CRITICAL REQUIREMENT: EVERY RESPONSE MUST CALL A TOOL
+
+**YOU MUST CALL AT LEAST ONE TOOL IN EVERY SINGLE RESPONSE.**
+
+Valid tool calls during Planning phase:
+- `read_file` - to verify file locations, check if elements exist, inspect current content
+- `write_file` - to create or overwrite implementation_plan.json with complete content
+
+❌ **FORBIDDEN**: Responding with ONLY text (explanations, descriptions, analysis)
+✅ **REQUIRED**: Every response must include at least one read_file OR write_file call
+
+If validation fails or a write is blocked:
+1. **DO NOT** just explain what went wrong in text
+2. **DO** immediately call write_file again with corrected path/content
+3. If you need to check something first - call read_file, THEN write_file in the same response
+
+**This is non-negotiable. Text-only responses will cause the task to fail.**
+
+## ⚠️ CRITICAL: JSON FILES - NO COMMENTS ALLOWED
+
+When writing implementation_plan.json:
+
+❌ **ABSOLUTELY FORBIDDEN** - Comments in JSON:
+```json
+{
+  "phases": [  // NO COMMENTS
+    {
+      "id": "phase-1",  /* NO COMMENTS */
+      "subtasks": []
+    }
+  ]
+}
+```
+
+✅ **REQUIRED** - Pure JSON only:
+```json
+{
+  "phases": [
+    {
+      "id": "phase-1",
+      "subtasks": []
+    }
+  ]
+}
+```
+
+**JSON does NOT support comments (//, /* */).** 
+Any comment will cause "Expecting property name enclosed in double quotes" error.
+Write PURE JSON only - no explanatory comments.
+
 ---
 
 ## CORE PRINCIPLE: Subtasks = Units of Real Work

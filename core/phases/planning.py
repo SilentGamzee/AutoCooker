@@ -1213,7 +1213,8 @@ Focus on making steps more specific about:
                     )
                     
                     # Debug: log raw response
-                    self.log(f"  [DEBUG] Raw response: {response[:300]}...", "info")
+                    resp = response#response[:300]
+                    self.log(f"  [DEBUG] Raw response: {resp}...", "info")
                     
                     # Parse sections
                     purpose = {

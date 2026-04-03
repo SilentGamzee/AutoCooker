@@ -158,7 +158,7 @@ def _format_qa_as_corrections(
     lines = [
         "QA FAILED — the implemented changes did not fully satisfy the task.",
         f"Task: {task_title}",
-        f"Original description: {task_description[:300]}",
+        f"Original description: {task_description}",
         "",
         f"Issues found ({len(qa_issues)}):",
     ]
