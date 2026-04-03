@@ -6,12 +6,28 @@ Coding   : working_dir = task_dir/workdir  (writes stay inside workdir)
 QA       : working_dir = task_dir/workdir  (same)
 
 workdir is pre-populated by planning phase before coding starts.
+
+ИСПРАВЛЕНИЕ: Добавлена строгая проверка для Planning фазы - разрешена запись
+ТОЛЬКО в файлы планирования (.json, .md) внутри task_dir.
 """
 from __future__ import annotations
 import os
 import re
 
 WORKDIR_NAME = "workdir"
+
+# Разрешенные файлы планирования (только эти расширения)
+PLANNING_ALLOWED_EXTENSIONS = {'.json', '.md'}
+
+# Разрешенные имена файлов планирования
+PLANNING_ALLOWED_FILES = {
+    'project_index.json',
+    'context.json',
+    'requirements.json',
+    'spec.md',
+    'critique_report.json',
+    'implementation_plan.json',
+}
 
 
 class Sandbox:
@@ -30,29 +46,75 @@ class Sandbox:
         """
         For coding/QA phases working_dir IS workdir, so _safe_path already
         guarantees the path is inside workdir. This is a secondary check.
+        
+        ИСПРАВЛЕНИЕ: Добавлена строгая проверка для Planning файлов.
         """
         target_abs = os.path.abspath(target_path)
         task_abs   = self.task_dir
 
-        # Allow anything inside task_dir (workdir + planning artifacts)
-        if target_abs.startswith(task_abs + os.sep) or target_abs == task_abs:
+        # ═══════════════════════════════════════════════════════════
+        # ИСПРАВЛЕНИЕ: Проверка что путь внутри task_dir
+        # ═══════════════════════════════════════════════════════════
+        if not (target_abs.startswith(task_abs + os.sep) or target_abs == task_abs):
+            # Путь вне task_dir - точно блокируем
+            try:
+                filename = os.path.basename(target_abs)
+                correct  = os.path.join(self.task_dir, filename).replace("\\", "/")
+                task_rel = self.task_dir.replace("\\", "/")
+            except Exception:
+                correct  = self.task_dir
+                task_rel = self.task_dir
+
+            return False, (
+                f"Write blocked: path is outside the task directory. "
+                f"You must write inside: '{task_rel}/' — "
+                f"e.g. use path: '{correct}'. "
+                f"Always use paths relative to the working directory."
+            )
+        
+        # ═══════════════════════════════════════════════════════════
+        # НОВАЯ ПРОВЕРКА: Если внутри task_dir, но НЕ в workdir,
+        # значит это Planning фаза - разрешаем только файлы планирования
+        # ═══════════════════════════════════════════════════════════
+        
+        # Если путь внутри workdir - всегда разрешаем (Coding/QA фаза)
+        if target_abs.startswith(self.workdir + os.sep) or target_abs == self.workdir:
             return True, "OK"
-
-        # Show the correct task_dir path using just the filename
-        try:
-            filename = os.path.basename(target_abs)
-            correct  = os.path.join(self.task_dir, filename).replace("\\", "/")
-            task_rel = self.task_dir.replace("\\", "/")
-        except Exception:
-            correct  = self.task_dir
-            task_rel = self.task_dir
-
-        return False, (
-            f"Write blocked: path is outside the task directory. "
-            f"You must write inside: '{task_rel}/' — "
-            f"e.g. use path: '{correct}'. "
-            f"Always use paths relative to the working directory."
-        )
+        
+        # Путь внутри task_dir, но ВНЕ workdir - это Planning файлы
+        # Разрешаем только разрешенные файлы планирования
+        filename = os.path.basename(target_abs)
+        file_ext = os.path.splitext(filename)[1]
+        
+        # Проверяем расширение
+        if file_ext not in PLANNING_ALLOWED_EXTENSIONS:
+            return False, (
+                f"Write blocked: during planning phase you can only write .json and .md files. "
+                f"File '{filename}' has extension '{file_ext}'. "
+                f"Planning artifacts must be .json or .md files inside {self.task_dir.replace(os.sep, '/')}/"
+            )
+        
+        # Проверяем имя файла (должно быть в списке разрешенных)
+        if filename not in PLANNING_ALLOWED_FILES:
+            allowed_list = ', '.join(sorted(PLANNING_ALLOWED_FILES))
+            return False, (
+                f"Write blocked: '{filename}' is not a valid planning artifact file. "
+                f"During planning phase you can only write these files: {allowed_list}. "
+                f"All files must be inside {self.task_dir.replace(os.sep, '/')}/"
+            )
+        
+        # Проверяем что файл находится прямо в task_dir, а не в подпапке
+        parent_dir = os.path.dirname(target_abs)
+        if parent_dir != self.task_dir:
+            return False, (
+                f"Write blocked: planning artifacts must be directly inside task directory, "
+                f"not in subdirectories. "
+                f"Use path: {os.path.join(self.task_dir, filename).replace(os.sep, '/')} "
+                f"(not {target_abs.replace(os.sep, '/')})"
+            )
+        
+        # Все проверки пройдены
+        return True, "OK"
 
     # ── Read guard ────────────────────────────────────────────────────
     def should_allow_read(self, target_path: str) -> tuple[bool, str]:

@@ -327,7 +327,9 @@ class PlanningPhase(BasePhase):
             # Проблемы найдены
             self.log(f"⚠️ Critique found {len(critique_issues)} issue(s):", "warn")
             for i, issue in enumerate(critique_issues[:5], 1):
-                self.log(f"  {i}. {issue[:100]}{'...' if len(issue) > 100 else ''}", "warn")
+                self.log(f"DEBUG issue type: {type(issue)}, value: {issue}", "warn")
+                text = issue if isinstance(issue, str) else str(issue)
+                self.log(f"  {i}. {text[:100]}{'...' if len(text) > 100 else ''}", "warn")
             if len(critique_issues) > 5:
                 self.log(f"  ... and {len(critique_issues) - 5} more issues", "warn")
             
