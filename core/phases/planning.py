@@ -634,7 +634,7 @@ class PlanningPhase(BasePhase):
                     response = self.ollama.complete(
                         model=model,
                         prompt=full_prompt,
-                        max_tokens=3000  # ИСПРАВЛЕНО: было 800, стало 3000
+                        max_tokens=6000 
                     )
                     
                     # Debug: log raw response
@@ -820,7 +820,7 @@ class PlanningPhase(BasePhase):
                     response = self.ollama.complete(
                         model=model,
                         prompt=full_prompt,
-                        max_tokens=3000  # МОЖНО ТАКЖЕ УВЕЛИЧИТЬ, было 20000 но для consistency делаем 3000
+                        max_tokens=6000 
                     )
                     
                     # Debug: log raw response
@@ -904,202 +904,58 @@ class PlanningPhase(BasePhase):
             
             # Базовый промпт (обобщенный для любых задач)
             base_prompt = f"""
-    TASK: {self.task.title}
-    
-    DESCRIPTION:
-    {self.task.description}
-    
-    Extract the SYSTEM FLOW - what does the program/system do internally when this feature is used?
-    
-    Even if the task seems simple, there is always system processing. Consider:
-    
-    For UI changes:
-    - System updates component state
-    - System re-renders UI elements
-    - System persists UI preferences
-    
-    For data features (attachments/files/images):
-    - System receives data from user input
-    - System validates file type/size
-    - System processes data (e.g., base64 encoding, image resizing)
-    - System stores data (database, filesystem, memory)
-    - System may call external APIs (Ollama vision for images, etc.)
-    
-    For business logic:
-    - System validates input
-    - System applies business rules
-    - System updates database records
-    - System triggers side effects (notifications, events)
-    
-    For integrations:
-    - System makes API calls
-    - System transforms data formats
-    - System handles responses/errors
-    
-    Format as numbered list of SYSTEM actions (internal processing):
-    1. System receives [data/input] from [source]
-    2. System validates [what criteria]
-    3. System processes [data] by [specific action - be technical]
-    4. System stores [what] in [where - be specific: DB table, field, file path]
-    5. System calls [API/service] with [what data]
-    6. System returns [output] to [recipient]
-    
-    IMPORTANT:
-    - Be SPECIFIC about technical details (API endpoints, data transformations, storage locations)
-    - Focus on INTERNAL processing, not UI interactions (that's in User Flow)
-    - Include ALL processing steps, even if they seem obvious
-    - For file/image tasks: always mention storage mechanism and any API calls (e.g., Ollama vision)
-    - Provide 5-15 concrete steps
-    
-    If the task doesn't involve complex processing, still describe what happens:
-    - "System updates [field] in [table]"
-    - "System triggers [event/notification]"
-    - "System validates [constraint]"
-    """
-            
-            # ═══════════════════════════════════════════════════════════
-            # Учет предыдущих результатов и критики
-            # ═══════════════════════════════════════════════════════════
-            
-            additional_context = ""
-            
-            if iteration > 0:
-                # Добавляем информацию о предыдущих результатах
-                if hasattr(self.task, 'system_flow_steps') and self.task.system_flow_steps:
-                    additional_context += f"""
-    
-    PREVIOUS SYSTEM FLOW (from iteration {iteration}):
-    """
-                    for i, step in enumerate(self.task.system_flow_steps, 1):
-                        additional_context += f"{i}. {step}\n"
-                    
-                    additional_context += """
-    These are the system flow steps from the previous iteration.
-    Review them and improve based on the critique feedback below.
-    """
-                
-                # Добавляем информацию из критики
-                critique_path = os.path.join(self.task.task_dir, "critique_report.json")
-                if os.path.exists(critique_path):
-                    try:
-                        import json as _json
-                        with open(critique_path, encoding="utf-8") as _f:
-                            critique_report = _json.load(_f)
-                        
-                        critique_issues = critique_report.get("issues", [])
-                        if critique_issues:
-                            additional_context += f"""
-    
-    CRITIQUE FEEDBACK (issues found in iteration {iteration}):
-    """
-                            for i, issue in enumerate(critique_issues[:10], 1):
-                                additional_context += f"{i}. {issue}\n"
-                            
-                            additional_context += """
-    Address these critique points when generating the updated system flow.
-    Focus on making steps more specific about:
-    - Actual API calls (Ollama vision, database, etc.)
-    - Data transformations (base64 encoding, text extraction, JSON parsing)
-    - Storage mechanisms (file paths, database tables, fields)
-    - Processing logic (validation, filtering, conversion)
-    """
-                    except Exception as e:
-                        self.log(f"  [WARN] Could not read critique report: {e}", "warn")
-            
-            # Финальный промпт с учетом контекста
-            final_prompt = base_prompt + additional_context
-            
-            # ═══════════════════════════════════════════════════════════
-            # Остальная логика без изменений
-            # ═══════════════════════════════════════════════════════════
-            
-            # Prepend system instruction to prompt
-            full_prompt = (
-                "You extract system data processing flows from task descriptions.\n\n"
-                + final_prompt
-            )
-            
-            # RETRY LOGIC: Try up to 3 times
-            max_attempts = 3
-            system_flow = []
-            
-            self.log(f"  Starting extraction with up to {max_attempts} attempts...", "info")
-            if iteration > 0:
-                self.log(f"  (Iteration {iteration + 1}: refining based on critique)", "info")
-            
-            for attempt in range(1, max_attempts + 1):
-                self.log(f"  → Attempt {attempt}/{max_attempts}", "info")
-                
-                try:
-                    response = self.ollama.complete(
-                        model=model,
-                        prompt=full_prompt,
-                        max_tokens=3000
-                    )
-                    
-                    # Debug: log raw response
-                    self.log(f"  [DEBUG] Raw response: {response[:200]}...", "info")
-                    
-                    # Parse numbered list
-                    system_flow = self._parse_requirements_list(response)
-                    
-                    # Alternative parsing
-                    if not system_flow:
-                        self.log("  [DEBUG] Numbered list parsing failed, trying line-by-line", "warn")
-                        lines = [line.strip() for line in response.split('\n') if line.strip()]
-                        system_flow = [
-                            line for line in lines 
-                            if len(line) > 20 and not line.startswith('#')
-                        ][:15]
-                    
-                    # Success - break
-                    if system_flow:
-                        self.log(f"  ✓ Extraction succeeded on attempt {attempt}", "ok")
-                        break
-                    else:
-                        self.log(f"  ⚠️ Attempt {attempt} failed - no system flow extracted", "warn")
-                        if attempt < max_attempts:
-                            self.log(f"  Retrying... ({attempt + 1}/{max_attempts})", "info")
-                
-                except RuntimeError as e:
-                    self.log(f"  ⚠️ Attempt {attempt} failed with error: {e}", "warn")
-                    if attempt < max_attempts:
-                        self.log(f"  Retrying... ({attempt + 1}/{max_attempts})", "info")
-                    else:
-                        raise
-            
-            # ═══════════════════════════════════════════════════════════
-            # ИЗМЕНЕНИЕ: System Flow теперь обязателен для ВСЕХ задач
-            # ═══════════════════════════════════════════════════════════
-            if not system_flow:
-                error_msg = (
-                    f"System Flow extraction FAILED after {max_attempts} attempts.\n"
-                    "Ollama did not return system processing steps.\n\n"
-                    "System Flow is REQUIRED for all tasks - even simple UI changes\n"
-                    "have internal processing (state updates, DB writes, etc.).\n\n"
-                    "Task moved to Human Review."
-                )
-                self.log(f"  ❌ {error_msg}", "error")
-                raise RuntimeError(error_msg)
-            
-            # Save to task
-            self.task.system_flow_steps = system_flow
-            self.state._save_kanban()
-            
-            self.log(f"  ✓ Extracted {len(system_flow)} system flow steps", "ok")
-            for i, step in enumerate(system_flow[:5], 1):
-                self.log(f"    {i}. {step[:80]}{'...' if len(step) > 80 else ''}", "info")
-            if len(system_flow) > 5:
-                self.log(f"    ... and {len(system_flow) - 5} more steps", "info")
-            
-            return True
-            
-        except RuntimeError:
-            # Re-raise extraction failures
-            raise
-        except Exception as e:
-            self.log(f"  ⚠️ System flow extraction unexpected error: {e}", "error")
-            raise RuntimeError(f"Unexpected error in system flow extraction: {e}") from e
+TASK: {self.task.title}
+
+DESCRIPTION:
+{self.task.description}
+
+Extract the SYSTEM FLOW - what does the program/system do internally when this feature is used?
+
+Even if the task seems simple, there is always system processing. Consider:
+
+For UI changes:
+- System updates component state
+- System re-renders UI elements
+- System persists UI preferences
+
+For data features (attachments/files/images):
+- System receives data from user input
+- System validates file type/size
+- System processes data (e.g., base64 encoding, image resizing)
+- System stores data (database, filesystem, memory)
+- System may call external APIs (Ollama vision for images, etc.)
+
+For business logic:
+- System validates input
+- System applies business rules
+- System updates database records
+- System triggers side effects (notifications, events)
+
+For integrations:
+- System makes API calls
+- System transforms data formats
+- System handles responses/errors
+
+Format as numbered list of SYSTEM actions (internal processing):
+1. System receives [data/input] from [source]
+2. System validates [what criteria]
+3. System processes [data] by [specific action - be technical]
+4. System stores [what] in [where - be specific: DB table, field, file path]
+5. System calls [API/service] with [what data]
+6. System returns [output] to [recipient]
+
+IMPORTANT:
+- Be SPECIFIC about technical details (API endpoints, data transformations, storage locations)
+- Focus on INTERNAL processing, not UI interactions (that's in User Flow)
+- Include ALL processing steps, even if they seem obvious
+- For file/image tasks: always mention storage mechanism and any API calls (e.g., Ollama vision)
+- Provide 5-15 concrete steps
+
+If the task doesn't involve complex processing, still describe what happens:
+- "System updates [field] in [table]"
+- "System triggers [event/notification]"
+- "System validates [constraint]"
+"""
             
             # ═══════════════════════════════════════════════════════════
             # НОВЫЙ КОД: Учет предыдущих результатов и критики
@@ -1111,16 +967,16 @@ class PlanningPhase(BasePhase):
                 # Добавляем информацию о предыдущих результатах
                 if hasattr(self.task, 'system_flow_steps') and self.task.system_flow_steps:
                     additional_context += f"""
-    
-    PREVIOUS SYSTEM FLOW (from iteration {iteration}):
-    """
+
+PREVIOUS SYSTEM FLOW (from iteration {iteration}):
+"""
                     for i, step in enumerate(self.task.system_flow_steps, 1):
                         additional_context += f"{i}. {step}\n"
                     
                     additional_context += """
-    These are the system flow steps from the previous iteration.
-    Review them and improve based on the critique feedback below.
-    """
+These are the system flow steps from the previous iteration.
+Review them and improve based on the critique feedback below.
+"""
                 
                 # Добавляем информацию из критики
                 critique_path = os.path.join(self.task.task_dir, "critique_report.json")
@@ -1133,20 +989,20 @@ class PlanningPhase(BasePhase):
                         critique_issues = critique_report.get("issues", [])
                         if critique_issues:
                             additional_context += f"""
-    
-    CRITIQUE FEEDBACK (issues found in iteration {iteration}):
-    """
+
+CRITIQUE FEEDBACK (issues found in iteration {iteration}):
+"""
                             for i, issue in enumerate(critique_issues[:10], 1):
                                 additional_context += f"{i}. {issue}\n"
                             
                             additional_context += """
-    Address these critique points when generating the updated system flow.
-    Focus on making steps more specific about:
-    - Actual API calls (Ollama vision, database, etc.)
-    - Data transformations (base64 encoding, text extraction, JSON parsing)
-    - Storage mechanisms (file paths, database tables, fields)
-    - Processing logic (validation, filtering, conversion)
-    """
+Address these critique points when generating the updated system flow.
+Focus on making steps more specific about:
+- Actual API calls (Ollama vision, database, etc.)
+- Data transformations (base64 encoding, text extraction, JSON parsing)
+- Storage mechanisms (file paths, database tables, fields)
+- Processing logic (validation, filtering, conversion)
+"""
                     except Exception as e:
                         self.log(f"  [WARN] Could not read critique report: {e}", "warn")
             
@@ -1178,7 +1034,7 @@ class PlanningPhase(BasePhase):
                     response = self.ollama.complete(
                         model=model,
                         prompt=full_prompt,
-                        max_tokens=3000  # ИЗМЕНЕНО: было 20000, стало 3000 для консистентности
+                        max_tokens=6000
                     )
                     
                     # Debug: log raw response
@@ -1212,13 +1068,15 @@ class PlanningPhase(BasePhase):
                     else:
                         raise
             
-            # CRITICAL: If data processing keywords found but no flow after all attempts - FAIL
+            # ═══════════════════════════════════════════════════════════
+            # ИСПРАВЛЕНИЕ: Убрано упоминание keywords (переменная не существует)
+            # ═══════════════════════════════════════════════════════════
             if not system_flow:
                 error_msg = (
                     f"System Flow extraction FAILED after {max_attempts} attempts.\n"
-                    f"Task has data processing keywords but Ollama did not return steps.\n"
-                    f"Keywords found: {', '.join([kw for kw in keywords if kw in self.task.description.lower()])}\n\n"
-                    "This is CRITICAL - system flow verification will fail without this.\n"
+                    "Ollama did not return system processing steps.\n\n"
+                    "System Flow is REQUIRED for all tasks - even simple UI changes\n"
+                    "have internal processing (state updates, DB writes, etc.).\n\n"
                     "Task moved to Human Review."
                 )
                 self.log(f"  ❌ {error_msg}", "error")
@@ -1349,7 +1207,7 @@ class PlanningPhase(BasePhase):
                     response = self.ollama.complete(
                         model=model,
                         prompt=full_prompt,
-                        max_tokens=3000  # УВЕЛИЧЕНО: было 400, стало 1000 (с учетом критики может быть длиннее)
+                        max_tokens=6000 
                     )
                     
                     # Debug: log raw response
