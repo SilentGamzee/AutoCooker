@@ -315,6 +315,44 @@ def start_task(task_id: str) -> dict:
         _push_board()
         _push_task(task)
 
+        # ══════════════════════════════════════════════════════════════
+        # Auto-increment max_patches when corrections added to exhausted task
+        # ══════════════════════════════════════════════════════════════
+        if task.corrections.strip():  # Есть corrections от пользователя
+            current_patch = task.patch_count
+            max_patches_before = task.max_patches or 2
+            
+            # Все патчи использованы?
+            if current_patch >= max_patches_before:
+                # Автоматически добавляем ещё один патч
+                task.max_patches = max_patches_before + 1
+                
+                task.add_log(
+                    f"  📝 Corrections detected with all patches used ({current_patch}/{max_patches_before})",
+                    "system", "info"
+                )
+                task.add_log(
+                    f"  📈 Auto-incrementing max_patches: {max_patches_before} → {task.max_patches}",
+                    "system", "info"
+                )
+                task.add_log(
+                    f"  ♻️ Will create new subtasks for patch {task.max_patches} in Planning phase",
+                    "system", "info"
+                )
+                
+                # Сброс в Planning для создания новых подзадач
+                task.phase_status["planning"] = "pending"
+                task.phase_status["coding"] = "pending"
+                task.phase_status["qa"] = "pending"
+                task.resume_from_phase = "planning"
+                task.can_resume = True
+                
+                # Очистить флаги ошибок
+                task.has_errors = False
+                task.tags = [t for t in task.tags if t not in ("Has Errors", "QA Failed", "Needs Review")]
+                
+                _push_task(task)
+
         phases = task.phases_selected or ["planning", "coding", "qa"]
         max_patches = task.max_patches or 2
         has_qa = "qa" in phases
