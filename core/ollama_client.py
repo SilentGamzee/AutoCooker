@@ -364,6 +364,25 @@ class OllamaClient:
                     raise RuntimeError("__ABORTED__")
                 raise RuntimeError(f"Ollama connection error: {e}")
             except BaseException as e:
+                error_str = str(e)
+                # Channel Error is a fatal LM Studio error - stop retrying
+                if "Channel Error" in error_str or "channel error" in error_str.lower():
+                    fatal_msg = (
+                        "LM Studio Channel Error - this is usually caused by:\n"
+                        "  1. Model not understanding tool/JSON format requirements\n"
+                        "  2. Conversation structure becoming malformed\n"
+                        "  3. Model capability limitations\n\n"
+                        "SOLUTION: Try a different model:\n"
+                        "  - llama-3.1-8b-instruct (better tool use)\n"
+                        "  - qwen-2.5-14b-instruct (excellent JSON)\n"
+                        "  - mistral-7b-instruct-v0.3 (good balance)\n\n"
+                        f"Current model '{model}' cannot handle this task.\n"
+                    )
+                    if log_fn:
+                        log_fn(f"[FATAL] {fatal_msg}", "error")
+                    print(f"\n[FATAL ERROR] {fatal_msg}", flush=True)
+                    raise RuntimeError(f"FATAL: Channel Error - {fatal_msg}") from e
+                
                 print(f"\n[Ollama] Request failed ({type(e).__name__}): {e!r}", flush=True)
                 traceback.print_exc(file=sys.stdout)
                 raise
