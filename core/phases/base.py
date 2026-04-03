@@ -7,6 +7,7 @@ import eel
 
 from core.state import AppState, KanbanTask, TaskAbortedError
 from core.ollama_client import OllamaClient
+from core.tools import ToolExecutor
 
 PROMPTS_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "prompts")
 
