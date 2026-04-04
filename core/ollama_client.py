@@ -74,7 +74,14 @@ class OllamaClient:
         import requests as _req   # local import so no circular dep issues
 
         def _do_post():
-            return self._sess().post(url, json=json_payload, timeout=timeout)
+            try:
+                print(f"[THREAD] Starting HTTP POST to {url[:50]}... (timeout={timeout}s)", flush=True)
+                result = self._sess().post(url, json=json_payload, timeout=timeout)
+                print(f"[THREAD] HTTP POST completed: status={result.status_code}", flush=True)
+                return result
+            except Exception as e:
+                print(f"[THREAD] HTTP POST failed: {type(e).__name__}: {e}", flush=True)
+                raise
 
         try:
             import gevent.hub as _gh
@@ -82,14 +89,20 @@ class OllamaClient:
             hub = _gh.get_hub()
             # getcurrent() is not hub → we're inside a greenlet, not the hub itself
             if hub is not None and _gevent.getcurrent() is not hub:
+                print(f"[GEVENT] Using threadpool for async POST", flush=True)
                 # threadpool.apply() runs _do_post in a real OS thread
                 # and yields the current greenlet back to the hub while waiting
-                return hub.threadpool.apply(_do_post)
+                result = hub.threadpool.apply(_do_post)
+                print(f"[GEVENT] Threadpool returned result", flush=True)
+                return result
         except ImportError:
+            print(f"[GEVENT] gevent not available, using direct call", flush=True)
             pass   # gevent not installed — running without eel, call directly
-        except Exception:
+        except Exception as e:
+            print(f"[GEVENT] Exception in gevent setup: {type(e).__name__}: {e}, falling back to direct call", flush=True)
             pass   # anything else → fall through to direct call
 
+        print(f"[DIRECT] Using direct POST call (no gevent)", flush=True)
         return _do_post()
 
     # ══════════════════════════════════════════════════════════════
@@ -458,8 +471,14 @@ class OllamaClient:
                     _files_read.add(_path_arg)
 
                 try:
+                    if log_fn:
+                        log_fn(f"[EXEC] Executing tool: {tool_name}", "debug")
                     result = tool_executor(tool_name, raw_args)
+                    if log_fn:
+                        log_fn(f"[EXEC] Tool completed successfully: {tool_name}", "debug")
                 except Exception as e:
+                    if log_fn:
+                        log_fn(f"[EXEC] Tool execution failed: {tool_name} - {type(e).__name__}: {e}", "error")
                     result = f"ERROR: {e}"
 
                 if log_fn:

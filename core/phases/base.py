@@ -33,9 +33,22 @@ class BasePhase:
         """Schedule fn() inside gevent's event loop (thread-safe)."""
         try:
             import gevent as _gevent
+            # Try to spawn in gevent greenlet
             _gevent.spawn(fn)
-        except Exception:
-            fn()
+        except ImportError:
+            # gevent not available - call directly
+            try:
+                fn()
+            except Exception as e:
+                # Log to console if eel call fails
+                print(f"[GEVENT] Direct call failed: {type(e).__name__}: {e}", flush=True)
+        except Exception as e:
+            # gevent.spawn failed - try direct call as fallback
+            print(f"[GEVENT] spawn failed: {type(e).__name__}: {e}, trying direct call", flush=True)
+            try:
+                fn()
+            except Exception as e2:
+                print(f"[GEVENT] Direct call also failed: {type(e2).__name__}: {e2}", flush=True)
 
     # ── Logging ──────────────────────────────────────────────────
     def log(self, msg: str, log_type: Optional[str] = None):
@@ -307,6 +320,11 @@ class BasePhase:
             self.log(f"  [Loop {outer+1}/{max_outer_iterations}] → Ollama…", "info")
             tool_calls_made = 0   # reset each outer iteration
             try:
+                # Детальное логирование перед вызовом
+                msg_count = len(messages)
+                system_len = len(system) if system else 0
+                print(f"[RUN_LOOP] Starting chat_with_tools: messages={msg_count}, system_len={system_len}, tools={len(tools)}", flush=True)
+                
                 messages, final_text, tool_calls_made = self.ollama.chat_with_tools(
                     model=model,
                     system=system,
@@ -316,15 +334,29 @@ class BasePhase:
                     log_fn=self.log,
                     is_aborted=lambda: self.task.id in self.state.abort_requested,
                 )
+                
+                # Логирование после успешного завершения
+                print(f"[RUN_LOOP] chat_with_tools completed: tool_calls_made={tool_calls_made}, final_text_len={len(final_text)}", flush=True)
+                
             except RuntimeError as e:
+                print(f"[RUN_LOOP] RuntimeError in chat_with_tools: {type(e).__name__}: {e}", flush=True)
                 if "__ABORTED__" in str(e):
                     # Propagate as TaskAbortedError so the pipeline handler catches it
                     self.state.abort_requested.discard(self.task.id)
                     raise TaskAbortedError(self.task.id)
                 self.log(f"  [ERROR] Ollama: {e}", "error")
                 continue
+            except Exception as e:
+                # Логирование неожиданных ошибок
+                print(f"[RUN_LOOP] Unexpected exception in chat_with_tools: {type(e).__name__}: {e}", flush=True)
+                import traceback
+                traceback.print_exc()
+                self.log(f"  [ERROR] Unexpected error: {type(e).__name__}: {e}", "error")
+                raise
 
+            print(f"[RUN_LOOP] Starting validation for {step_name}", flush=True)
             ok, reason = validate_fn()
+            print(f"[RUN_LOOP] Validation result: ok={ok}", flush=True)
             if ok:
                 self.log(f"  ✓ Validation passed: {step_name}", "ok")
                 return True
