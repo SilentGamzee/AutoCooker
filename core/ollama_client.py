@@ -4,6 +4,9 @@
 1. Добавлен метод _extract_from_thinking() для fallback-парсинга поля thinking  
 2. Метод complete() теперь проверяет thinking если response пустой
 3. Исправлена проблема с Qwen 7.0 thinking mode (пустой response)
+4. Добавлен механизм graceful shutdown: _SHUTDOWN event + shutdown_all_clients()
+   Вызовите shutdown_all_clients() из eel close-callback чтобы прервать
+   все зависшие HTTP-запросы к Ollama при закрытии браузера.
 """
 from __future__ import annotations
 import json
@@ -11,8 +14,46 @@ import sys
 import threading
 import traceback
 import re
+import weakref
 import requests
 from typing import Callable, Optional
+
+# ─────────────────────────────────────────────────────────────────
+# Module-level shutdown coordination
+# ─────────────────────────────────────────────────────────────────
+
+# Set this event to signal all active OllamaClients to abort immediately.
+# Wire up in main.py:  eel.start(..., close_callback=on_eel_close)
+#   def on_eel_close(route, websockets):
+#       if not websockets:
+#           from core.ollama_client import shutdown_all_clients
+#           shutdown_all_clients()
+_SHUTDOWN = threading.Event()
+
+# Weak references to all living OllamaClient instances so shutdown_all_clients()
+# can reach them without creating circular-reference memory leaks.
+_active_clients: weakref.WeakSet = weakref.WeakSet()
+_clients_lock   = threading.Lock()
+
+
+def shutdown_all_clients() -> None:
+    """
+    Abort every active OllamaClient's in-flight HTTP request so the gevent
+    threadpool threads unblock and Python can exit cleanly.
+
+    Call this from eel's close_callback (see module docstring).
+
+    NOTE: This calls abort() on each client, which closes the in-flight
+    session so blocked OS threads unblock immediately.  New clients
+    (new pipeline runs) are unaffected — they start with a fresh session.
+    """
+    print("[SHUTDOWN] shutdown_all_clients() called — aborting in-flight requests", flush=True)
+    with _clients_lock:
+        for client in list(_active_clients):
+            try:
+                client.abort()
+            except Exception:
+                pass
 
 
 class OllamaClient:
@@ -22,14 +63,25 @@ class OllamaClient:
         self._session = requests.Session()
         self._session.trust_env = False   # ignore system HTTP_PROXY
         self._session_lock = threading.Lock()
+        # Register in the global weak-reference set so shutdown_all_clients()
+        # can find this instance without preventing garbage collection.
+        with _clients_lock:
+            _active_clients.add(self)
 
     # ── Session management ────────────────────────────────────────
 
     def abort(self) -> None:
         """
-        Cancel any in-flight HTTP request by closing+replacing the session.
-        Must be called from abort_task() in main.py so Ollama stops the old
-        request and is immediately available for the next pipeline run.
+        Cancel any in-flight HTTP request by closing and replacing the session.
+
+        Closing the session causes requests to raise ConnectionError in whatever
+        OS thread is blocked on socket.readinto — the threadpool thread unblocks
+        immediately and chat_with_tools catches it as __ABORTED__.
+
+        A fresh session is created so that the client is immediately usable again
+        (important for reconnect after a browser refresh).  No persistent "aborted"
+        flag is set — whether the TASK should continue is controlled by the
+        is_aborted() callback passed to chat_with_tools, not by this method.
         """
         with self._session_lock:
             try:
@@ -38,6 +90,10 @@ class OllamaClient:
                 pass
             self._session = requests.Session()
             self._session.trust_env = False
+
+    def reset_abort(self) -> None:
+        """No-op kept for API compatibility — abort() no longer sets a persistent flag."""
+        pass
 
     def _sess(self) -> requests.Session:
         with self._session_lock:
@@ -58,20 +114,25 @@ class OllamaClient:
         """
         Execute requests.post without blocking gevent's event loop.
 
-        When called from inside a gevent greenlet (the normal case with eel):
-          - Submits the HTTP request to a real OS thread via gevent's thread pool
-          - Suspends the current greenlet so the event loop can process WebSocket
-            messages, eel calls, timers, etc. while Ollama is working
-          - Resumes the greenlet when the response arrives
+        Abort handling:
+          - In-flight: abort() closes self._session → ConnectionError is raised
+            in the OS thread → caught by chat_with_tools as __ABORTED__.
+          - Between rounds: chat_with_tools calls is_aborted() at the start of
+            every round BEFORE calling _post(), so we never need to check an
+            abort flag inside _post() itself.
 
-        When called from a real OS thread (fallback):
-          - Executes requests.post directly
-
-        This is the standard gevent pattern for blocking I/O from greenlets.
-        Without it, requests.post blocks the entire event loop and eel loses
-        its WebSocket heartbeat → _detect_shutdown → sys.exit().
+        This design avoids race conditions where abort() fires just as a request
+        completes successfully — the response is used normally, and the task
+        stops at the next is_aborted() check in chat_with_tools.
         """
-        import requests as _req   # local import so no circular dep issues
+        # ── Normalise timeout ──────────────────────────────────────
+        MAX_READ_TIMEOUT = 600   # 10 minutes upper bound per request
+        if isinstance(timeout, tuple):
+            connect_t, read_t = timeout
+            read_t = min(float(read_t), MAX_READ_TIMEOUT)
+            timeout = (connect_t, read_t)
+        elif timeout is None or float(timeout) > MAX_READ_TIMEOUT:
+            timeout = (10, MAX_READ_TIMEOUT)
 
         def _do_post():
             try:
@@ -87,20 +148,15 @@ class OllamaClient:
             import gevent.hub as _gh
             import gevent as _gevent
             hub = _gh.get_hub()
-            # getcurrent() is not hub → we're inside a greenlet, not the hub itself
             if hub is not None and _gevent.getcurrent() is not hub:
                 print(f"[GEVENT] Using threadpool for async POST", flush=True)
-                # threadpool.apply() runs _do_post in a real OS thread
-                # and yields the current greenlet back to the hub while waiting
                 result = hub.threadpool.apply(_do_post)
                 print(f"[GEVENT] Threadpool returned result", flush=True)
                 return result
         except ImportError:
             print(f"[GEVENT] gevent not available, using direct call", flush=True)
-            pass   # gevent not installed — running without eel, call directly
         except Exception as e:
             print(f"[GEVENT] Exception in gevent setup: {type(e).__name__}: {e}, falling back to direct call", flush=True)
-            pass   # anything else → fall through to direct call
 
         print(f"[DIRECT] Using direct POST call (no gevent)", flush=True)
         return _do_post()
@@ -170,7 +226,7 @@ class OllamaClient:
                     "temperature": 0.1,
                     "max_tokens": max_tokens,
                 },
-                (10, 12000),
+                (10, 6000),
             )
             print(f"[DEBUG complete()] POST returned status={resp.status_code}", flush=True)
             resp.raise_for_status()
@@ -248,7 +304,7 @@ class OllamaClient:
                     "temperature": 0.1,
                     "max_tokens": max_tokens,
                 },
-                (10, 12000),
+                (10, 6000),
             )
             resp.raise_for_status()
             data = resp.json()
@@ -349,7 +405,7 @@ class OllamaClient:
                 resp = self._post(
                     self._chat_completions_url(),
                     payload,
-                    (10, 12000),
+                    (10, 6000),
                 )
                 resp.raise_for_status()
             except requests.exceptions.HTTPError as e:
@@ -372,7 +428,9 @@ class OllamaClient:
                     # Other HTTP errors
                     raise RuntimeError(f"Ollama HTTP {e.response.status_code} error: {e}")
             except requests.exceptions.ConnectionError as e:
-                # Session closed by abort() — treat as abort
+                # Session was closed by abort() (user clicked Abort or browser closed).
+                # Treat any connection error as __ABORTED__ if the task abort flag is set;
+                # otherwise re-raise as a regular connection error.
                 if is_aborted and is_aborted():
                     raise RuntimeError("__ABORTED__")
                 raise RuntimeError(f"Ollama connection error: {e}")

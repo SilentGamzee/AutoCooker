@@ -20,7 +20,7 @@ sys.stderr.reconfigure(line_buffering=True)
 import eel
 
 from core.state import AppState, KanbanTask, COLUMNS, TaskAbortedError
-from core.ollama_client import OllamaClient
+from core.ollama_client import OllamaClient, shutdown_all_clients
 from core.phases.planning import PlanningPhase
 from core.phases.coding import CodingPhase
 from core.phases.qa import QAPhase
@@ -976,6 +976,10 @@ def get_workdir_diff(task_id: str) -> dict:
         "total": len(diffs),
     }
 
+def on_eel_close(route, websockets):
+    """Вызывается eel когда браузер закрывается."""
+    if not websockets:          # последняя вкладка закрыта
+        shutdown_all_clients()  # прерывает все HTTP-запросы к Ollama
 
 @eel.expose
 def merge_workdir(task_id: str) -> dict:
@@ -1054,7 +1058,7 @@ if __name__ == "__main__":
         pass   # SIGUSR1 not available on Windows — that's fine
 
     try:
-        eel.start("index.html", size=(1400, 900), port=8765, block=True)
+        eel.start("index.html", size=(1400, 900), port=8765, block=True, close_callback=on_eel_close)
     except SystemExit:
         # eel calls sys.exit() on browser disconnect — print all thread stacks
         print("\n[EEL] Server stopped (browser disconnected or window closed).", flush=True)

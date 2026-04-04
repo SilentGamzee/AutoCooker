@@ -108,10 +108,29 @@ class QAPhase(BasePhase):
         self.log("─── QA Goal Verification ───")
         goal_passed, goal_issues = self._verify_task_goal(model, branch_diff)
 
+        # ── Surgical changes verification ────────────────────────────────
+        # For each subtask: check that ONLY the changes described were made,
+        # and no unrequested refactoring / architecture changes snuck in.
+        self.log("─── QA Surgical Changes Verification ───")
+        surgical_passed, surgical_issues = self._verify_surgical_changes(model)
+        if not surgical_passed:
+            self.log(
+                f"  ⚠️ {len(surgical_issues)} out-of-scope change(s) detected",
+                "warn",
+            )
+            all_issues.extend(surgical_issues)
+
         # ── Final verdict combines all checks ──────────────────────────
-        final_passed = tests_ok and subtask_passed and checklist_passed and user_flow_passed and system_flow_passed and goal_passed
-        final_issues = all_issues + checklist_issues + user_flow_issues + system_flow_issues + goal_issues
-        
+        final_passed = (
+            tests_ok and subtask_passed and checklist_passed
+            and user_flow_passed and system_flow_passed
+            and goal_passed and surgical_passed
+        )
+        final_issues = (
+            all_issues + checklist_issues + user_flow_issues
+            + system_flow_issues + goal_issues
+        )
+
         if not final_passed:
             reasons = []
             if not tests_ok:
@@ -124,7 +143,9 @@ class QAPhase(BasePhase):
                 reasons.append(f"{len(system_flow_issues)} system flow steps missing")
             if not goal_passed:
                 reasons.append("goal not achieved")
-            
+            if not surgical_passed:
+                reasons.append(f"{len(surgical_issues)} out-of-scope change(s)")
+
             reason_str = ", ".join(reasons)
             self.log(f"═══ QA PHASE COMPLETE — FAILED ({reason_str}) ═══", "error")
             self.task.has_errors = True
@@ -392,7 +413,7 @@ EXPLANATION: [your explanation]
                     model=model,
                     system="You are a QA engineer verifying requirements against implementation.",
                     prompt=prompt,
-                    max_tokens=12000
+                    max_tokens=6000
                 )
                 
                 # Parse response
@@ -585,7 +606,7 @@ REASON: [brief explanation]
                     model=model,
                     system="You verify user flow steps against implementation.",
                     prompt=prompt,
-                    max_tokens=12000
+                    max_tokens=6000
                 )
                 
                 verdict = "NO"
@@ -654,7 +675,7 @@ EVIDENCE: [what code you found or what's missing]
                     model=model,
                     system="You verify system data processing against implementation.",
                     prompt=prompt,
-                    max_tokens=12000
+                    max_tokens=6000
                 )
                 
                 verdict = "NO"
@@ -673,6 +694,165 @@ EVIDENCE: [what code you found or what's missing]
                 all_passed = False
         
         return all_passed, failed_steps
+
+    # ── Surgical changes verification ────────────────────────────────
+    def _verify_surgical_changes(self, model: str) -> tuple[bool, list[str]]:
+        """
+        For every DONE subtask, compute the diff of its files against the
+        target branch and ask the LLM:
+
+          "Given the subtask description, are ALL changes in the diff
+           justified?  Or did extra / unrequested changes sneak in?"
+
+        Issues reported here become patch corrections, so the next coding
+        cycle can clean up the out-of-scope lines.
+
+        Returns (all_ok, list_of_issues).
+        """
+        workdir      = os.path.join(self.task.task_dir, WORKDIR_NAME)
+        project_path = self.task.project_path or self.state.working_dir
+        git_branch   = self.task.git_branch or "main"
+
+        done_subtasks = [
+            s for s in self.task.subtasks
+            if s.get("status") == "done"
+            and (s.get("files_to_create") or s.get("files_to_modify"))
+        ]
+
+        if not done_subtasks:
+            self.log("  No completed subtasks with file changes — skipping", "info")
+            return True, []
+
+        all_ok     = True
+        all_issues: list[str] = []
+
+        for subtask in done_subtasks:
+            sid         = subtask.get("id", "?")
+            title       = subtask.get("title", "")
+            description = subtask.get("description", "")
+            creates     = subtask.get("files_to_create") or []
+            modifies    = subtask.get("files_to_modify") or []
+            scope_files = list(dict.fromkeys(modifies + creates))  # modifies first
+
+            self.log(
+                f"  Checking surgical scope for {sid}: {title[:60]}…",
+                "info",
+            )
+
+            # ── Compute per-subtask diff ───────────────────────────────
+            try:
+                diff_text = get_workdir_diff(
+                    project_path=project_path,
+                    git_branch=git_branch,
+                    workdir=workdir,
+                    files=scope_files,
+                    max_total_chars=5_000,
+                )
+            except Exception as exc:
+                self.log(f"  [WARN] Diff failed for {sid}: {exc}", "warn")
+                continue
+
+            # Skip if diff is empty / unavailable
+            if not diff_text or "(no " in diff_text or "(project is not" in diff_text:
+                self.log(f"  ℹ No diff available for {sid} — skipping", "info")
+                continue
+
+            # ── Ask LLM to judge scope ─────────────────────────────────
+            prompt = f"""You are a strict code reviewer verifying that a developer made ONLY the changes requested in the subtask and nothing more.
+
+SUBTASK ID: {sid}
+SUBTASK TITLE: {title}
+SUBTASK DESCRIPTION:
+{description}
+
+FILES ALLOWED TO CHANGE:
+  Create: {', '.join(creates) if creates else '(none)'}
+  Modify: {', '.join(modifies) if modifies else '(none)'}
+
+ACTUAL DIFF (workdir vs target branch `{git_branch}`):
+{diff_text}
+
+REVIEW CRITERIA — flag a change as OUT-OF-SCOPE if it:
+1. Modifies lines unrelated to the subtask description
+2. Renames, moves, or restructures existing code not mentioned in the description
+3. Refactors logic that was not asked to be changed
+4. Changes formatting/style of lines that don't need to change
+5. Touches files not listed in FILES ALLOWED TO CHANGE
+6. Adds new abstractions, classes, or helpers not required by the description
+
+Do NOT flag as out-of-scope:
+- Any change directly required by the description
+- Necessary imports for new code
+- Minor surrounding context lines (diff context lines starting with space)
+
+Respond with this exact format:
+VERDICT: PASS  (all changes are within scope)
+  OR
+VERDICT: FAIL
+OUT_OF_SCOPE:
+- <file>:<line_approx> — <what changed> — <why it's out of scope>
+- ...
+"""
+
+            try:
+                response = self.ollama.complete(
+                    model=model,
+                    system=(
+                        "You are a senior code reviewer. "
+                        "Your job is to detect changes that go beyond the stated task scope. "
+                        "Be strict but fair — only flag genuinely out-of-scope changes."
+                    ),
+                    prompt=prompt,
+                    max_tokens=2000,
+                )
+            except Exception as exc:
+                self.log(f"  [WARN] LLM call failed for {sid}: {exc}", "warn")
+                continue
+
+            # ── Parse response ─────────────────────────────────────────
+            verdict = "PASS"
+            if "VERDICT: FAIL" in response or "VERDICT:FAIL" in response:
+                verdict = "FAIL"
+
+            if verdict == "PASS":
+                self.log(f"  ✓ {sid}: all changes are within scope", "ok")
+            else:
+                # Extract the list of out-of-scope items
+                items: list[str] = []
+                in_list = False
+                for line in response.splitlines():
+                    stripped = line.strip()
+                    if "OUT_OF_SCOPE:" in stripped:
+                        in_list = True
+                        continue
+                    if in_list and stripped.startswith("-"):
+                        item = stripped.lstrip("- ").strip()
+                        if item:
+                            items.append(f"[{sid}] {item}")
+                    elif in_list and stripped and not stripped.startswith("-"):
+                        # Stop at blank line or non-list content
+                        if not stripped:
+                            break
+
+                if not items:
+                    # Fallback: include raw response fragment
+                    items = [
+                        f"[{sid}] Out-of-scope changes detected in "
+                        f"{', '.join(scope_files[:3])} — "
+                        f"review diff manually"
+                    ]
+
+                self.log(
+                    f"  ✗ {sid}: {len(items)} out-of-scope change(s) found",
+                    "warn",
+                )
+                for issue in items:
+                    self.log(f"    • {issue}", "warn")
+
+                all_issues.extend(items)
+                all_ok = False
+
+        return all_ok, all_issues
 
     # ── Branch diff helper ────────────────────────────────────────────
     def _get_workdir_diff(self) -> str:

@@ -8,6 +8,7 @@ from core.sandbox import WORKDIR_NAME
 from core.tools import ToolExecutor, CODING_TOOLS
 from core.validator import validate_readme
 from core.phases.base import BasePhase
+from core.git_utils import get_workdir_diff
 
 
 class CodingPhase(BasePhase):
@@ -269,6 +270,33 @@ class CodingPhase(BasePhase):
             if s.get("status") == "done"
         )
 
+        # ── Branch diff for in-scope files ────────────────────────────
+        # Show the model exactly what has already changed in the workdir
+        # compared to the target branch.  This prevents:
+        #   - re-applying changes that are already there
+        #   - undoing work done by earlier subtasks
+        #   - making unnecessary changes outside the task scope
+        branch_diff_section = ""
+        try:
+            diff_files = list(dict.fromkeys(files_to_modify + files_to_create))
+            if diff_files:
+                diff_text = get_workdir_diff(
+                    project_path=wd,
+                    git_branch=self.task.git_branch or "main",
+                    workdir=workdir,
+                    files=diff_files,
+                    max_total_chars=4_000,
+                )
+                if diff_text and "(no " not in diff_text and "(project is not" not in diff_text:
+                    branch_diff_section = (
+                        f"\n## Current diff vs branch `{self.task.git_branch or 'main'}`\n"
+                        "This shows what has already changed in workdir relative to the "
+                        "target branch.  Only make changes BEYOND what is already here.\n\n"
+                        f"{diff_text}\n"
+                    )
+        except Exception as _diff_exc:
+            pass  # diff is informational — never block execution
+
         msg = (
             (
                 f"=== ALREADY COMPLETED IN THIS SESSION ===\n"
@@ -288,6 +316,7 @@ class CodingPhase(BasePhase):
             + f"\n\nExisting code patterns (use ONLY what you see here):\n"
             + (pattern_previews if pattern_previews else
                ("\n".join(f"  - {f}" for f in patterns_from) if patterns_from else "  (none)"))
+            + branch_diff_section
             + f"\n\nCompletion condition:\n  {completion_cond}\n\n"
             f"Quality condition:\n  {subtask_dict.get('completion_with_ollama', '')}\n\n"
             "RULES:\n"
@@ -299,8 +328,16 @@ class CodingPhase(BasePhase):
             "- Do NOT invent new classes, data structures, or API patterns that are not already\n"
             "  present in the existing code. Only use patterns, classes, and functions you can\n"
             "  see in the files listed above. If you reference something that does not exist,\n"
-            "  QA will catch it as a NameError/undefined variable.\n\n"
-            "Procedure:\n"
+            "  QA will catch it as a NameError/undefined variable.\n"
+            "- STRICTLY follow the subtask description above — implement exactly what is described,\n"
+            "  nothing more and nothing less.\n"
+            "- Do NOT refactor, rename, restructure, or reorganise existing code.\n"
+            "  Preserve the current architecture, file layout, class hierarchy, and naming.\n"
+            "- Make SURGICAL changes only: add or modify the specific lines required by the task.\n"
+            "  Every line you change must be directly justified by the subtask description.\n"
+            + ("- The diff above shows what is already changed — do NOT re-apply those lines.\n"
+               if branch_diff_section else "")
+            + "\nProcedure:\n"
             "1. Read pattern reference files to understand code style.\n"
             "2. The current content of files_to_modify is shown above — no need to read them again.\n"
             "3. For MODIFY files: call modify_file with the exact old_text to replace.\n"
