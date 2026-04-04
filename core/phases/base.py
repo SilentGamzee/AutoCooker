@@ -361,120 +361,26 @@ class BasePhase:
                 self.log(f"  ✓ Validation passed: {step_name}", "ok")
                 return True
             else:
-                self.log(f"  ✗ Validation failed: {reason}", "warn")
-
-                file_snapshot = self._snapshot_written_files(executor)
-
-                retry_msg = f"VALIDATION FAILED: {reason}\n\n"
-
-                # Detect JSON comment errors
-                if "Expecting property name" in reason or "Expecting" in reason:
-                    # Check if file starts with table format
-                    if file_snapshot and ("|" in file_snapshot[:200] or "path" in file_snapshot[:50].lower()):
-                        retry_msg += (
-                            "🚫 FATAL ERROR: You wrote a TABLE instead of JSON!\n\n"
-                            "❌ WRONG (what you wrote):\n"
-                            "  path | description | symbols\n"
-                            "  core/main.py | Main entry | ...\n\n"
-                            "✅ CORRECT (what you MUST write):\n"
-                            '  {"services": {"backend": {"type": "python"}}}\n\n'
-                            "JSON MUST start with { and end with }.\n"
-                            "NO pipes (|), NO markdown, ONLY pure JSON.\n\n"
-                        )
-                    else:
-                        retry_msg += (
-                            "🚫 JSON SYNTAX ERROR DETECTED\n"
-                            "This error usually means you used COMMENTS in JSON.\n\n"
-                            "❌ FORBIDDEN in JSON:\n"
-                            '  {"key": "value",  // comment}\n'
-                            '  {"key": /* comment */ "value"}\n\n'
-                            "✅ CORRECT - Pure JSON only:\n"
-                            '  {"key": "value"}\n\n'
-                            "JSON does NOT support // or /* */ comments.\n"
-                            "Remove ALL comments and write pure JSON.\n\n"
-                        )
-
-                if tool_calls_made == 0:
-                    retry_msg += (
-                        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                        "❌ CRITICAL ERROR: YOU DID NOT CALL ANY TOOLS\n"
-                        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                        "You responded with TEXT ONLY. The file was NOT created.\n"
-                        "Describing what you would do does NOTHING.\n\n"
-                        "YOU MUST CALL write_file IN YOUR VERY NEXT RESPONSE.\n\n"
-                        "Example of correct response:\n"
-                        "  <tool_call>\n"
-                        '    write_file(path=".tasks/task_015/project_index.json",\n'
-                        '               content="{\\"services\\": {...}}")\n'
-                        "  </tool_call>\n\n"
-                        "NO TEXT DESCRIPTIONS. ONLY TOOL CALLS.\n"
-                        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                # ИЗМЕНЕНО: Валидация failed
+                # Показываем ошибку только на последней итерации или если outer == 0
+                if outer == max_outer_iterations - 1:
+                    # Последняя итерация - показываем ошибку и выходим
+                    self.log(f"  ✗ Validation failed: {reason}", "error")
+                    self.log(
+                        f"  [WARN] Step '{step_name}' exhausted {max_outer_iterations} iterations",
+                        "warn",
                     )
+                    return False
+                
+                # НЕ последняя итерация - логируем как debug и продолжаем
+                print(f"[RUN_LOOP] Validation failed on iteration {outer + 1}/{max_outer_iterations}, continuing...", flush=True)
+                self.log(f"  ⚙️ Iteration {outer + 1}/{max_outer_iterations} - continuing...", "info")
+                
+                # НЕ добавляем retry_msg - просто продолжаем следующую итерацию
+                # Модель продолжит работать без явного указания на ошибку
+                continue
 
-                # ═══════════════════════════════════════════════════════════
-                # НОВАЯ ЛОГИКА: Извлечение пути к файлу и чтение его содержимого
-                # ═══════════════════════════════════════════════════════════
-                failed_file_path = self._extract_file_path_from_error(reason)
-                failed_file_content = ""
-                if failed_file_path:
-                    failed_file_content = self._read_failed_file_content_batched(failed_file_path)
-
-                # Show file content - prioritize direct file read over snapshot
-                if failed_file_content:
-                    retry_msg += f"{failed_file_content}\n\n"
-                    retry_msg += (
-                        "ACTION REQUIRED:\n"
-                        "1. Review the CURRENT FILE CONTENT above\n"
-                        "2. Identify what fields are missing or incorrect based on the validation error\n"
-                        "3. Call write_file with the COMPLETE corrected content\n"
-                        "4. Include ALL required fields that are mentioned in the validation error\n\n"
-                    )
-                elif file_snapshot:
-                    retry_msg += (
-                        "CURRENT FILE ON DISK (from cache - top-level keys show what fields exist):\n"
-                        f"{file_snapshot}\n\n"
-                    )
-                else:
-                    retry_msg += "No files written to disk yet.\n\n"
-
-                has_modify_only = bool(getattr(executor, "modify_only_files", set()))
-                if has_modify_only:
-                    retry_msg += (
-                        "ACTION REQUIRED: Some files are modify-only — do NOT use write_file "
-                        "on them (it will be blocked). Instead:\n"
-                        "1. Call read_file to see the current full content.\n"
-                        "2. Call modify_file with exact old_text → new_text.\n"
-                        "For new files (files_to_create), use write_file as normal.\n\n"
-                        "MANDATORY: Your next response MUST include a tool call (read_file or modify_file)."
-                    )
-                else:
-                    retry_msg += (
-                        "ACTION REQUIRED NOW:\n"
-                        "Call write_file with the COMPLETE corrected content.\n"
-                        "Include ALL required fields in one single write.\n\n"
-                    )
-                    
-                    # ═══════════════════════════════════════════════════════════
-                    # НОВАЯ ЛОГИКА: Более конкретные инструкции о пути к файлу
-                    # ═══════════════════════════════════════════════════════════
-                    if failed_file_path:
-                        retry_msg += (
-                            f"PATH TO USE: {failed_file_path}\n"
-                            "This is the exact path from the validation error.\n\n"
-                        )
-                    else:
-                        retry_msg += (
-                            "PATH TO USE: The exact path from the validation error above.\n"
-                            "If the error said 'Not found: /path/to/file.json' - use that exact path.\n\n"
-                        )
-                    
-                    retry_msg += (
-                        "FOR JSON FILES: Write PURE JSON with NO COMMENTS (//, /* */).\n\n"
-                        "REMEMBER: Describing the fix in text does NOTHING.\n"
-                        "You MUST call the write_file tool in your response."
-                    )
-                messages.append({"role": "user", "content": retry_msg})
-
+        # Если дошли сюда - все итерации прошли без успешной валидации
         self.log(
             f"  [WARN] Step '{step_name}' exhausted {max_outer_iterations} iterations",
             "warn",
