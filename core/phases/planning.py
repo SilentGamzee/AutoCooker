@@ -385,6 +385,7 @@ class PlanningPhase(BasePhase):
         # ═══════════════════════════════════════════════════════════
         
         max_critique_iterations = 3
+        min_critique_iterations = 3  # НОВОЕ: Минимум 3 попытки исправить
         critique_passed = False
         
         for iteration in range(max_critique_iterations):
@@ -423,35 +424,61 @@ class PlanningPhase(BasePhase):
             
             # Анализируем результаты критики
             if not critique_issues or len(critique_issues) == 0:
-                # Критика не нашла проблем - успех!
-                self.log("✓ Critique passed - no issues found", "ok")
-                critique_passed = True
-                break
-            
-            # Проблемы найдены
-            self.log(f"⚠️ Critique found {len(critique_issues)} issue(s):", "warn")
-            for i, issue in enumerate(critique_issues[:5], 1):
-                self.log(f"DEBUG issue type: {type(issue)}, value: {issue}", "warn")
-                text = issue if isinstance(issue, str) else str(issue)
-                self.log(f"  {i}. {text[:100]}{'...' if len(text) > 100 else ''}", "warn")
-            if len(critique_issues) > 5:
-                self.log(f"  ... and {len(critique_issues) - 5} more issues", "warn")
-            
-            # Проверяем, не последняя ли это итерация
-            if iteration == max_critique_iterations - 1:
-                self.log(
-                    f"⚠️ Max critique iterations ({max_critique_iterations}) reached. "
-                    "Proceeding with current spec despite issues.",
-                    "warn"
-                )
-                critique_passed = True
-                break
-            
-            # Возврат к шагам 2.x и 3 для исправления
-            self.log(
-                f"Regenerating requirements and spec (iteration {iteration + 2}/{max_critique_iterations})...",
-                "info"
-            )
+                # Критика не нашла проблем
+                if iteration < min_critique_iterations - 1:
+                    # ИЗМЕНЕНО: Слишком рано - продолжаем минимум до min_critique_iterations
+                    self.log(
+                        f"✓ Critique passed on iteration {iteration + 1}, "
+                        f"but continuing to iteration {min_critique_iterations} (minimum required) "
+                        f"to ensure thorough review.",
+                        "info"
+                    )
+                    # НЕ break - продолжаем цикл
+                else:
+                    # Достигли минимума и нет проблем - успех!
+                    self.log(
+                        f"✓ Critique passed after {iteration + 1} iteration(s) - no issues found",
+                        "ok"
+                    )
+                    critique_passed = True
+                    break
+            else:
+                # Проблемы найдены
+                self.log(f"⚠️ Critique found {len(critique_issues)} issue(s):", "warn")
+                for i, issue in enumerate(critique_issues[:5], 1):
+                    self.log(f"DEBUG issue type: {type(issue)}, value: {issue}", "warn")
+                    text = issue if isinstance(issue, str) else str(issue)
+                    self.log(f"  {i}. {text[:100]}{'...' if len(text) > 100 else ''}", "warn")
+                if len(critique_issues) > 5:
+                    self.log(f"  ... and {len(critique_issues) - 5} more issues", "warn")
+                
+                # ИЗМЕНЕНО: Проверяем достигли ли минимума попыток
+                if iteration < min_critique_iterations - 1:
+                    # Еще не достигли минимума - ОБЯЗАТЕЛЬНО продолжаем
+                    self.log(
+                        f"🔄 Critique found issues on iteration {iteration + 1}. "
+                        f"Must complete at least {min_critique_iterations} iterations. "
+                        f"Regenerating requirements and spec...",
+                        "warn"
+                    )
+                    # НЕ break - продолжаем цикл
+                elif iteration == max_critique_iterations - 1:
+                    # Последняя итерация и достигли минимума - пропускаем к реализации
+                    self.log(
+                        f"⚠️ Completed {iteration + 1} critique iteration(s) (minimum: {min_critique_iterations}). "
+                        f"Proceeding with current spec despite {len(critique_issues)} remaining issue(s). "
+                        f"Issues will be addressed during implementation or QA.",
+                        "warn"
+                    )
+                    critique_passed = True
+                    break
+                else:
+                    # Не последняя итерация - продолжаем исправлять
+                    self.log(
+                        f"🔄 Regenerating requirements and spec to fix issues "
+                        f"(iteration {iteration + 2}/{max_critique_iterations})...",
+                        "info"
+                    )
         
         # Проверка результата цикла критики
         if not critique_passed:
