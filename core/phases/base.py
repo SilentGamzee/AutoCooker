@@ -325,7 +325,7 @@ Return ONLY the JSON array, no explanation:
 Maximum {max_files} files."""
 
         try:
-            response = self.ollama.complete(model=model, prompt=prompt, max_tokens=500, temperature=0.0)
+            response = self.ollama.complete(model=model, prompt=prompt, max_tokens=6000, temperature=0.0)
             
             json_match = re.search(r'\[.*\]', response, re.DOTALL)
             if json_match:
@@ -787,9 +787,30 @@ Token count: {token_count} / {config['max_total_tokens']}
                 file_snapshot = self._snapshot_written_files(executor)
                 retry_msg = f"VALIDATION FAILED: {reason}\n\n"
                 
-                # Detect JSON comment errors
+                # Detect JSON comment errors OR incomplete JSON
                 if "Expecting property name" in reason or "Expecting" in reason:
-                    if file_snapshot and ("|" in file_snapshot[:200] or "path" in file_snapshot[:50].lower()):
+                    # Check if it's incomplete JSON (missing closing braces/brackets)
+                    if "Expecting ',' delimiter" in reason or "Expecting '}'" in reason or "Expecting ']'" in reason:
+                        retry_msg += (
+                            "🚫 INCOMPLETE JSON FILE DETECTED\n"
+                            "The JSON file was CUT OFF before completion!\n\n"
+                            "❌ PROBLEM: File ends abruptly:\n"
+                            '  {"phases": [...]}]  ← INCOMPLETE!\n'
+                            "  Missing closing brackets/braces\n\n"
+                            "✅ SOLUTION:\n"
+                            "1. Count your opening braces { and brackets [\n"
+                            "2. Make sure EVERY { has a matching }\n"
+                            "3. Make sure EVERY [ has a matching ]\n"
+                            "4. Proper structure:\n"
+                            '   {"phases": [{...}]}  ← Complete!\n'
+                            "      ^           ^^^\n"
+                            "      |           ||└─ closes phases array\n"
+                            "      |           |└── closes phase object\n"
+                            "      |           └─── closes root object\n\n"
+                            "CRITICAL: Write the COMPLETE file with ALL closing brackets.\n"
+                            "Do NOT cut off the JSON in the middle.\n\n"
+                        )
+                    elif file_snapshot and ("|" in file_snapshot[:200] or "path" in file_snapshot[:50].lower()):
                         retry_msg += (
                             "🚫 FATAL ERROR: You wrote a TABLE instead of JSON!\n\n"
                             "❌ WRONG (what you wrote):\n"

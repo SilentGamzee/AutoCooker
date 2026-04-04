@@ -213,7 +213,7 @@ class QAPhase(BasePhase):
     def _verify_task_goal(self, model: str) -> tuple[bool, list[str]]:
         """
         Ask Ollama: 'Does the sum of changes actually solve the original task?'
-        Reads requirements.json / spec.md from the task planning dir and the
+        Reads requirements.json / spec.json from the task planning dir and the
         actual changed files from workdir, then asks for a PASS/FAIL verdict.
         """
         workdir  = os.path.join(self.task.task_dir, WORKDIR_NAME)
@@ -221,7 +221,7 @@ class QAPhase(BasePhase):
 
         # Load acceptance criteria from planning artefacts
         req_path  = os.path.join(task_dir, "requirements.json")
-        spec_path = os.path.join(task_dir, "spec.md")
+        spec_path = os.path.join(task_dir, "spec.json")
 
         def _read(p: str, maxlen: int = 2000) -> str:
             try:
@@ -358,7 +358,7 @@ EXPLANATION: [your explanation]
                     model=model,
                     system="You are a QA engineer verifying requirements against implementation.",
                     prompt=prompt,
-                    max_tokens=300
+                    max_tokens=6000
                 )
                 
                 # Parse response
@@ -551,7 +551,7 @@ REASON: [brief explanation]
                     model=model,
                     system="You verify user flow steps against implementation.",
                     prompt=prompt,
-                    max_tokens=200
+                    max_tokens=6000
                 )
                 
                 verdict = "NO"
@@ -620,7 +620,7 @@ EVIDENCE: [what code you found or what's missing]
                     model=model,
                     system="You verify system data processing against implementation.",
                     prompt=prompt,
-                    max_tokens=300
+                    max_tokens=6000
                 )
                 
                 verdict = "NO"

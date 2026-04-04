@@ -248,7 +248,7 @@ class OllamaClient:
                     "temperature": 0.1,
                     "max_tokens": max_tokens,
                 },
-                (10, 120),
+                (10, 6000),
             )
             resp.raise_for_status()
             data = resp.json()
@@ -349,7 +349,7 @@ class OllamaClient:
                 resp = self._post(
                     self._chat_completions_url(),
                     payload,
-                    (10, 900),
+                    (10, 6000),
                 )
                 resp.raise_for_status()
             except requests.exceptions.HTTPError as e:

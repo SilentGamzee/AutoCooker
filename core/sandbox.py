@@ -24,7 +24,7 @@ PLANNING_ALLOWED_FILES = {
     'project_index.json',
     'context.json',
     'requirements.json',
-    'spec.md',
+    'spec.json',
     'critique_report.json',
     'implementation_plan.json',
 }

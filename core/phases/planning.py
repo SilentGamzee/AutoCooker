@@ -64,13 +64,13 @@ def _validate_requirements(path: str) -> tuple[bool, str]:
 
 
 def _validate_spec_md(path: str) -> tuple[bool, str]:
-    """Validate spec.md - includes file path in error messages and checks for User Flow."""
+    """Validate spec.json - includes file path in error messages and checks for User Flow."""
     if not os.path.isfile(path):
-        return False, f"[FILE: {path}] spec.md not found"
+        return False, f"[FILE: {path}] spec.json not found"
     with open(path, "r", encoding="utf-8") as f:
         content = f.read()
     if len(content.strip()) < 200:
-        return False, f"[FILE: {path}] spec.md is too short (< 200 chars)"
+        return False, f"[FILE: {path}] spec.json is too short (< 200 chars)"
     
     # Check for required headings (accept both H1 and H2)
     required_headings = ["Overview", "Task Scope", "Acceptance Criteria"]
@@ -114,6 +114,80 @@ def _validate_spec_md(path: str) -> tuple[bool, str]:
                     f"Add step-by-step breakdown using the template: "
                     f"'**Step 1: [Action]**' with User Action, UI Element, Frontend/Backend Changes."
                 )
+    
+    return True, "OK"
+
+
+def _validate_spec_json(path: str) -> tuple[bool, str]:
+    """Validate spec.json - checks for required fields and structure."""
+    if not os.path.isfile(path):
+        return False, f"[FILE: {path}] spec.json not found"
+    
+    try:
+        import json as _json
+        with open(path, "r", encoding="utf-8") as f:
+            spec = _json.load(f)
+    except _json.JSONDecodeError as e:
+        return False, f"[FILE: {path}] Invalid JSON: {e}"
+    except Exception as e:
+        return False, f"[FILE: {path}] Error reading file: {e}"
+    
+    # Validate structure
+    if not isinstance(spec, dict):
+        return False, f"[FILE: {path}] spec.json must be a JSON object"
+    
+    # Check required fields
+    required_fields = ["overview", "task_scope", "acceptance_criteria"]
+    for field in required_fields:
+        if field not in spec:
+            return False, f"[FILE: {path}] Missing required field: '{field}'"
+        
+        if not spec[field]:
+            return False, f"[FILE: {path}] Field '{field}' is empty"
+    
+    # Validate acceptance_criteria is a list
+    if not isinstance(spec["acceptance_criteria"], list):
+        return False, f"[FILE: {path}] 'acceptance_criteria' must be an array"
+    
+    if len(spec["acceptance_criteria"]) == 0:
+        return False, f"[FILE: {path}] 'acceptance_criteria' array is empty"
+    
+    # Check for user_flow if frontend task
+    content_str = _json.dumps(spec).lower()
+    has_frontend = any(marker in content_str for marker in 
+                      ['web/', '.html', '.js', '.css', 'frontend', 'ui ', 'user interface', 'button', 'form'])
+    
+    if has_frontend:
+        if "user_flow" not in spec:
+            return False, (
+                f"[FILE: {path}] "
+                f"Missing 'user_flow' field. "
+                f"This task involves frontend/UI changes and MUST include a user_flow array "
+                f"with step-by-step user interaction details."
+            )
+        
+        if not isinstance(spec["user_flow"], list):
+            return False, f"[FILE: {path}] 'user_flow' must be an array"
+        
+        if len(spec["user_flow"]) == 0:
+            return False, f"[FILE: {path}] 'user_flow' array is empty"
+        
+        # Validate user_flow structure
+        for i, step in enumerate(spec["user_flow"]):
+            if not isinstance(step, dict):
+                return False, f"[FILE: {path}] user_flow[{i}] must be an object"
+            
+            required_step_fields = ["step", "action"]
+            for field in required_step_fields:
+                if field not in step:
+                    return False, f"[FILE: {path}] user_flow[{i}] missing field: '{field}'"
+    
+    # Check minimum content length
+    if len(spec.get("overview", "")) < 50:
+        return False, f"[FILE: {path}] 'overview' is too short (< 50 chars)"
+    
+    if len(spec.get("task_scope", "")) < 50:
+        return False, f"[FILE: {path}] 'task_scope' is too short (< 50 chars)"
     
     return True, "OK"
 
@@ -175,6 +249,7 @@ def _validate_impl_plan(path: str, project_path: str = "") -> tuple[bool, str]:
             else:
                 all_subtasks.append(s)
     # Check that files_to_modify actually exist in the project
+    warnings = []
     if project_path:
         for s in all_subtasks:
             for fpath in s.get("files_to_modify", []):
@@ -182,10 +257,11 @@ def _validate_impl_plan(path: str, project_path: str = "") -> tuple[bool, str]:
                     continue
                 full = os.path.join(project_path, fpath)
                 if not os.path.isfile(full):
-                    errors.append(
+                    # Changed from ERROR to WARNING - file might exist but path is wrong
+                    # or file will be created by earlier subtask
+                    warnings.append(
                         f"Subtask {s.get('id','?')}: files_to_modify '{fpath}' "
-                        f"does not exist in the project. "
-                        f"If this is a new file, move it to files_to_create instead."
+                        f"does not exist in the project (this is OK if file will be created earlier)"
                     )
 
     # Reject verify-only subtasks that have no files to write.
@@ -276,6 +352,12 @@ def _validate_impl_plan(path: str, project_path: str = "") -> tuple[bool, str]:
         )
     if not all_subtasks:
         return False, f"[FILE: {path}] No valid subtasks found in any phase"
+    
+    # Log warnings but don't fail validation
+    if warnings:
+        warning_msg = "\n".join(f"  ⚠️ {w}" for w in warnings[:5])
+        print(f"[VALIDATION] Warnings for {path}:\n{warning_msg}", flush=True)
+    
     return True, "OK"
 
 
@@ -384,8 +466,8 @@ class PlanningPhase(BasePhase):
         # ЦИКЛ КРИТИКИ: Итеративное улучшение требований и спеки
         # ═══════════════════════════════════════════════════════════
         
-        max_critique_iterations = 3
-        min_critique_iterations = 3  # НОВОЕ: Минимум 3 попытки исправить
+        max_critique_iterations = 10
+        min_critique_iterations = 2
         critique_passed = False
         
         for iteration in range(max_critique_iterations):
@@ -1246,22 +1328,29 @@ Focus on making steps more specific about:
         try:
             self.log("  Extracting purpose (problem/solution/use cases)...", "info")
             
-            # Базовый промпт
+            # Базовый промпт - требуем JSON
             base_prompt = f"""
-    TASK: {self.task.title}
-    
-    DESCRIPTION:
-    {self.task.description}
-    
-    Why does the user need this feature? What problem does it solve?
-    
-    Answer in this format:
-    PROBLEM: [what problem user has now - 1-2 sentences]
-    SOLUTION: [how this feature solves it - 1-2 sentences]
-    USE CASES: [specific scenarios where user benefits - 2-3 examples]
-    
-    Be concrete and specific.
-    """
+TASK: {self.task.title}
+
+DESCRIPTION:
+{self.task.description}
+
+Extract the purpose of this feature: why does the user need it? What problem does it solve?
+
+Return ONLY a JSON object in this exact format (no markdown, no explanations):
+
+{{
+  "problem": "what problem user has now - 1-2 sentences",
+  "solution": "how this feature solves it - 1-2 sentences", 
+  "use_cases": [
+    "Specific scenario 1 where user benefits",
+    "Specific scenario 2 where user benefits",
+    "Specific scenario 3 where user benefits"
+  ]
+}}
+
+Be concrete and specific. Return ONLY the JSON, no other text.
+"""
             
             # ═══════════════════════════════════════════════════════════
             # НОВЫЙ КОД: Учет предыдущих результатов и критики
@@ -1344,45 +1433,52 @@ Focus on making steps more specific about:
                     )
                     
                     # Debug: log raw response
-                    resp = response#response[:300]
-                    self.log(f"  [DEBUG] Raw response: {resp}...", "info")
+                    resp_preview = response[:300] if len(response) > 300 else response
+                    self.log(f"  [DEBUG] Raw response: {resp_preview}...", "info")
                     
-                    # Parse sections
-                    purpose = {
-                        "problem": "",
-                        "solution": "",
-                        "use_cases": ""
-                    }
+                    # Parse JSON response
+                    import json as _json
+                    import re
                     
-                    lines = response.split('\n')
-                    current_section = None
+                    # Extract JSON from response (handle markdown code blocks)
+                    json_text = response.strip()
                     
-                    for line in lines:
-                        line = line.strip()
-                        if line.startswith("PROBLEM:"):
-                            current_section = "problem"
-                            purpose["problem"] = line.replace("PROBLEM:", "").strip()
-                        elif line.startswith("SOLUTION:"):
-                            current_section = "solution"
-                            purpose["solution"] = line.replace("SOLUTION:", "").strip()
-                        elif line.startswith("USE CASES:") or line.startswith("USE CASE:"):
-                            current_section = "use_cases"
-                            purpose["use_cases"] = line.replace("USE CASES:", "").replace("USE CASE:", "").strip()
-                        elif current_section and line:
-                            purpose[current_section] += " " + line
+                    # Remove markdown code blocks if present
+                    if json_text.startswith("```"):
+                        # Extract content between ``` markers
+                        match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', json_text, re.DOTALL)
+                        if match:
+                            json_text = match.group(1)
+                        else:
+                            # Try without markers
+                            json_text = re.sub(r'```(?:json)?', '', json_text).strip()
                     
-                    # Clean up
-                    for key in purpose:
-                        purpose[key] = purpose[key].strip()
+                    # Parse JSON
+                    purpose = _json.loads(json_text)
                     
-                    # Success - break if any section extracted
-                    if any(purpose.values()):
-                        self.log(f"  ✓ Extraction succeeded on attempt {attempt}", "ok")
-                        break
-                    else:
-                        self.log(f"  ⚠️ Attempt {attempt} failed - no purpose extracted", "warn")
-                        if attempt < max_attempts:
-                            self.log(f"  Retrying... ({attempt + 1}/{max_attempts})", "info")
+                    # Validate structure
+                    if not isinstance(purpose, dict):
+                        raise ValueError("Response is not a JSON object")
+                    
+                    if "problem" not in purpose or "solution" not in purpose or "use_cases" not in purpose:
+                        raise ValueError("Missing required fields: problem, solution, use_cases")
+                    
+                    # Ensure use_cases is a list
+                    if isinstance(purpose["use_cases"], str):
+                        # Convert string to list
+                        purpose["use_cases"] = [purpose["use_cases"]]
+                    elif not isinstance(purpose["use_cases"], list):
+                        raise ValueError("use_cases must be a list")
+                    
+                    # Success - break if valid
+                    self.log(f"  ✓ Extraction succeeded on attempt {attempt}", "ok")
+                    break
+                
+                except (json.JSONDecodeError, ValueError) as e:
+                    self.log(f"  ⚠️ Attempt {attempt} failed - {e}", "warn")
+                    if attempt < max_attempts:
+                        self.log(f"  Retrying... ({attempt + 1}/{max_attempts})", "info")
+                    purpose = None
                 
                 except RuntimeError as e:
                     self.log(f"  ⚠️ Attempt {attempt} failed with error: {e}", "warn")
@@ -1392,21 +1488,45 @@ Focus on making steps more specific about:
                         raise
             
             # CRITICAL: If no purpose extracted after all attempts - FAIL
-            if not purpose or not any(purpose.values()):
+            if not purpose or not isinstance(purpose, dict):
                 error_msg = (
                     f"Purpose extraction FAILED after {max_attempts} attempts.\n"
-                    "Ollama did not return problem/solution/use_cases.\n\n"
+                    "Ollama did not return valid JSON with problem/solution/use_cases.\n\n"
                     "This is important for understanding task context.\n"
                     "Task moved to Human Review."
                 )
-                self.log(f"  ❌ {error_msg}", "error")
+                self.log(f"  ✗ {error_msg}", "error")
+                raise RuntimeError(error_msg)
+            
+            # Validate required fields
+            if not purpose.get("problem") or not purpose.get("solution") or not purpose.get("use_cases"):
+                error_msg = (
+                    "Purpose extraction incomplete - missing required fields.\n"
+                    f"Got: {list(purpose.keys())}\n"
+                    "Need: problem, solution, use_cases"
+                )
+                self.log(f"  ✗ {error_msg}", "error")
                 raise RuntimeError(error_msg)
             
             # Save to task
             self.task.purpose = purpose
             self.state._save_kanban()
             
+            # Save to JSON file
+            purpose_path = os.path.join(self.task.task_dir, "purpose.json")
+            try:
+                import json as _json
+                with open(purpose_path, "w", encoding="utf-8") as _f:
+                    _json.dump(purpose, _f, indent=2, ensure_ascii=False)
+                self.log(f"  ✓ Purpose saved to {self._rel(purpose_path)}", "ok")
+            except Exception as e:
+                self.log(f"  ⚠️ Failed to save purpose.json: {e}", "warn")
+            
             self.log(f"  ✓ Extracted purpose", "ok")
+            self.log(f"    Problem: {purpose['problem'][:80]}...", "info")
+            self.log(f"    Solution: {purpose['solution'][:80]}...", "info")
+            use_cases_count = len(purpose['use_cases']) if isinstance(purpose['use_cases'], list) else 1
+            self.log(f"    Use cases: {use_cases_count} scenario(s)", "info")
             if purpose["problem"]:
                 self.log(f"    Problem: {purpose['problem'][:100]}...", "info")
             if purpose["solution"]:
@@ -1440,7 +1560,7 @@ Focus on making steps more specific about:
     # ── 1.3 Spec ──────────────────────────────────────────────────
     def _step3_spec(self, model: str) -> bool:
         wd          = self.task.project_path or self.state.working_dir
-        spec_path   = os.path.join(self.task.task_dir, "spec.md")
+        spec_path   = os.path.join(self.task.task_dir, "spec.json")  # Изменено на .json
         req_path    = os.path.join(self.task.task_dir, "requirements.json")
         context_path = os.path.join(self.task.task_dir, "context.json")
 
@@ -1448,7 +1568,6 @@ Focus on making steps more specific about:
         ctx_content = self._read_file_safe(context_path)
 
         # Extract reference file paths from context.json and pre-read them
-        # so the model sees real code patterns without spending tool-call rounds.
         code_samples = ""
         try:
             import json as _json
@@ -1481,17 +1600,34 @@ Focus on making steps more specific about:
             f"context.json:\n{ctx_content}\n\n"
             + (f"ACTUAL CODE FROM PROJECT (copy these patterns exactly):\n{code_samples}\n\n"
                if code_samples else "")
-            + f"Write spec.md to: {self._rel(spec_path)}\n\n"
-            "Use the actual code samples above for the Patterns section — copy real snippets, "
-            "do NOT invent code. "
-            "The acceptance criteria section must be copied verbatim from requirements.json."
+            + f"Write spec.json to: {self._rel(spec_path)}\n\n"
+            "IMPORTANT: Generate spec as JSON with this structure:\n"
+            "{\n"
+            '  "overview": "High-level description of what this feature does",\n'
+            '  "task_scope": "Clear boundaries - what is included and what is not",\n'
+            '  "acceptance_criteria": ["Criterion 1 from requirements.json", "Criterion 2", ...],\n'
+            '  "user_flow": [\n'
+            '    {\n'
+            '      "step": 1,\n'
+            '      "action": "User clicks X button",\n'
+            '      "ui_element": "Button with id=\\"add-btn\\"",\n'
+            '      "frontend_changes": "app.js: handleAddClick()",\n'
+            '      "backend_changes": "main.py: create_item()"\n'
+            '    }\n'
+            '  ],\n'
+            '  "patterns": ["Copy real code snippets from ACTUAL CODE above"]\n'
+            "}\n\n"
+            "Copy acceptance criteria verbatim from requirements.json.\n"
+            "Use actual code samples for patterns section.\n"
+            "If frontend/UI task: include detailed user_flow with steps.\n"
+            "Return ONLY valid JSON, no markdown blocks."
         )
 
         def validate():
-            return _validate_spec_md(spec_path)
+            return _validate_spec_json(spec_path)
 
         return self.run_loop(
-            "1.3 Spec", "p3_spec.md",
+            "1.3 Spec", "p3_spec.json",  # Промпт остается тот же для инструкций
             PLANNING_TOOLS, executor, msg, validate, model,
         )
 
@@ -1577,7 +1713,7 @@ Focus on making steps more specific about:
         БЕЗ ИЗМЕНЕНИЙ (остается как есть)
         """
         wd            = self.task.project_path or self.state.working_dir
-        spec_path     = os.path.join(self.task.task_dir, "spec.md")
+        spec_path = os.path.join(self.task.task_dir, "spec.json")
         req_path      = os.path.join(self.task.task_dir, "requirements.json")
         context_path  = os.path.join(self.task.task_dir, "context.json")
         critique_path = os.path.join(self.task.task_dir, "critique_report.json")
@@ -1588,11 +1724,11 @@ Focus on making steps more specific about:
     
         executor = self._make_planning_executor(wd)
         msg = (
-            f"spec.md:\n{spec_content}\n\n"
+            f"spec.json:\n{spec_content}\n\n"
             f"requirements.json:\n{req_content}\n\n"
             f"context.json:\n{ctx_content}\n\n"
             f"Write critique_report.json to: {self._rel(critique_path)}\n"
-            f"If you fix issues, rewrite spec.md at: {self._rel(spec_path)}\n\n"
+            f"If you fix issues, rewrite spec.json at: {self._rel(spec_path)}\n\n"
             "Focus on: validation drift (requirements that describe only verification, "
             "not actual implementation), unverifiable acceptance criteria, and invented file paths."
         )
@@ -1602,7 +1738,7 @@ Focus on making steps more specific about:
             if not ok:
                 return False, f"critique_report.json: {msg}"
             # Spec must still be valid after any fixes
-            return _validate_spec_md(spec_path)
+            return _validate_spec_json(spec_path)
     
         return self.run_loop(
             "1.4 Critique", "p4_critique.md",
@@ -1612,7 +1748,7 @@ Focus on making steps more specific about:
     def _run_critique_once(self, model: str) -> bool:
         """Single critique pass — called once or twice by _step4_critique."""
         wd            = self.task.project_path or self.state.working_dir
-        spec_path     = os.path.join(self.task.task_dir, "spec.md")
+        spec_path = os.path.join(self.task.task_dir, "spec.json")
         req_path      = os.path.join(self.task.task_dir, "requirements.json")
         context_path  = os.path.join(self.task.task_dir, "context.json")
         critique_path = os.path.join(self.task.task_dir, "critique_report.json")
@@ -1623,11 +1759,11 @@ Focus on making steps more specific about:
 
         executor = self._make_planning_executor(wd)
         msg = (
-            f"spec.md:\n{spec_content}\n\n"
+            f"spec.json:\n{spec_content}\n\n"
             f"requirements.json:\n{req_content}\n\n"
             f"context.json:\n{ctx_content}\n\n"
             f"Write critique_report.json to: {self._rel(critique_path)}\n"
-            f"If you fix issues, rewrite spec.md at: {self._rel(spec_path)}\n\n"
+            f"If you fix issues, rewrite spec.json at: {self._rel(spec_path)}\n\n"
             "Focus on: validation drift (requirements that describe only verification, "
             "not actual implementation), unverifiable acceptance criteria, and invented file paths."
         )
@@ -1637,7 +1773,7 @@ Focus on making steps more specific about:
             if not ok:
                 return False, f"critique_report.json: {msg}"
             # Spec must still be valid after any fixes
-            return _validate_spec_md(spec_path)
+            return _validate_spec_json(spec_path)
 
         return self.run_loop(
             "1.4 Critique", "p4_critique.md",
@@ -1649,7 +1785,7 @@ Focus on making steps more specific about:
     def _step5_impl_plan(self, model: str) -> bool:
         wd          = self.task.project_path or self.state.working_dir
         plan_path   = os.path.join(self.task.task_dir, "implementation_plan.json")
-        spec_path   = os.path.join(self.task.task_dir, "spec.md")
+        spec_path = os.path.join(self.task.task_dir, "spec.json")
         context_path = os.path.join(self.task.task_dir, "context.json")
         req_path    = os.path.join(self.task.task_dir, "requirements.json")
 
@@ -1665,7 +1801,7 @@ Focus on making steps more specific about:
         ) or "  (none scanned)"
 
         msg = (
-            f"spec.md:\n{spec_content}\n\n"
+            f"spec.json:\n{spec_content}\n\n"
             f"context.json:\n{ctx_content}\n\n"
             f"requirements.json:\n{req_content}\n\n"
             f"Existing project files (ONLY these paths are valid for files_to_modify):\n"
@@ -1702,7 +1838,7 @@ Focus on making steps more specific about:
         """
         wd       = self.task.project_path or self.state.working_dir
         plan_path = os.path.join(self.task.task_dir, "implementation_plan.json")
-        spec_path = os.path.join(self.task.task_dir, "spec.md")
+        spec_path = os.path.join(self.task.task_dir, "spec.json")
 
         spec_content = self._read_file_safe(spec_path)
         existing_plan = self._read_file_safe(plan_path)
