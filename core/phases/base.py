@@ -210,6 +210,54 @@ class BasePhase:
                     print(f"[WARN] Failed to load {path}: {e}", flush=True)
         return None
 
+    @staticmethod
+    def _normalize_project_index(project_index: dict) -> dict:
+        """
+        Ensure `project_index["services"]` is always a dict keyed by service name.
+
+        The LLM sometimes produces a list instead of a dict, e.g.:
+          {"services": [{"name": "backend", "type": "python", "files": {...}}]}
+        or even a bare list of strings.
+
+        This method normalises any such variant in-place and returns the
+        corrected index so all downstream code can safely call .items() on it.
+        """
+        raw = project_index.get("services")
+
+        if isinstance(raw, dict):
+            # Already correct format — nothing to do
+            return project_index
+
+        normalized: dict = {}
+
+        if isinstance(raw, list):
+            for i, item in enumerate(raw):
+                if isinstance(item, dict):
+                    # Use "name" key if present, else fall back to "service_N"
+                    key = item.get("name") or item.get("id") or f"service_{i}"
+                    # Remove the key from the data to avoid duplication
+                    entry = {k: v for k, v in item.items() if k not in ("name", "id")}
+                    # Ensure "files" is a dict
+                    if not isinstance(entry.get("files"), dict):
+                        entry["files"] = {}
+                    normalized[str(key)] = entry
+                elif isinstance(item, str):
+                    # Bare service name string with no data
+                    normalized[item] = {"type": "unknown", "files": {}}
+                else:
+                    normalized[f"service_{i}"] = {"type": "unknown", "files": {}}
+        elif raw is not None:
+            # Unexpected type — log and replace with empty dict
+            print(
+                f"[WARN] project_index 'services' has unexpected type "
+                f"{type(raw).__name__} — ignoring",
+                flush=True,
+            )
+
+        project_index = dict(project_index)  # shallow copy to avoid mutating caller's data
+        project_index["services"] = normalized
+        return project_index
+
     def _extract_keywords_from_task(self, task_description: str) -> set[str]:
         """Extract keywords from task description for file filtering."""
         import re
@@ -512,7 +560,12 @@ Maximum {max_files} files."""
         project_index = self._load_project_index_file()
         if not project_index:
             return ""
-        
+
+        # ── Normalise services to dict format ─────────────────────────
+        # The LLM occasionally writes services as a list; fix it before
+        # any downstream code calls .items() on it.
+        project_index = self._normalize_project_index(project_index)
+
         # Логируем структуру для отладки
         services = project_index.get("services", {})
         print(f"[PROJECT_CONTEXT] Loaded project_index with {len(services)} service(s)", flush=True)
@@ -667,18 +720,13 @@ Token count: {token_count} / {config['max_total_tokens']}
             return f"(Could not read {file_path}: {e})"
 
     # ── Executor factory ─────────────────────────────────────────
-    def _make_executor(self, wd: str, new_files_allowed: bool = True, **kwargs) -> "ToolExecutor":
+    def _make_executor(self, wd: str, **kwargs) -> "ToolExecutor":
         """
         Create a ToolExecutor pre-wired with:
         - the global FileCache (path index)
         - on_content_cached → updates task.file_contents (per-task cache)
         - log_fn → self.log (so auto-reads appear as log entries)
         - sandbox for the current task
-
-        new_files_allowed=False is used by the Coding phase to prevent the
-        model from writing files that were not pre-created in workdir by
-        Planning (step 1.7).  Pass False only for subtask execution loops.
-
         Extra kwargs are forwarded as-is (e.g. on_task_confirmed).
         """
         from core.tools import ToolExecutor
@@ -698,7 +746,6 @@ Token count: {token_count} / {config['max_total_tokens']}
             sandbox=create_sandbox(
                 task.task_dir,
                 task.project_path or self.state.working_dir,
-                new_files_allowed=new_files_allowed,
             ),
             **kwargs,
         )
@@ -725,6 +772,10 @@ Token count: {token_count} / {config['max_total_tokens']}
         # retry, causing Ollama to re-write the same files repeatedly.
         system = self.build_system(prompt_file)
 
+        # messages is RESET on every outer retry to avoid context bloat.
+        # Each outer iteration starts fresh: only the initial user message
+        # (optionally extended with a retry note) is sent, NOT the full
+        # accumulated history of every previous failed attempt.
         messages = [{"role": "user", "content": initial_user_message}]
 
         for outer in range(max_outer_iterations):
@@ -888,11 +939,28 @@ Token count: {token_count} / {config['max_total_tokens']}
                         "REMEMBER: Describing the fix in text does NOTHING.\n"
                         "You MUST call the write_file tool in your response."
                     )
+
+                self.log(f"[DEBUG] {retry_msg}", "info")
                 
-                messages.append({"role": "user", "content": retry_msg})
+                # ── RESET messages for the next outer iteration ────────────
+                # Do NOT append retry_msg to the existing (potentially huge)
+                # messages list.  Instead, start a fresh conversation that
+                # combines the original task with the current error context.
+                # This prevents unbounded context growth across retries while
+                # still giving the model everything it needs to fix the issue.
+                messages = [{
+                    "role": "user",
+                    "content": (
+                        initial_user_message
+                        + f"\n\n{'─' * 60}\n"
+                        + f"RETRY {outer + 1}/{max_outer_iterations - 1}\n"
+                        + f"{'─' * 60}\n\n"
+                        + retry_msg
+                    ),
+                }]
 
         self.log(
             f"  [WARN] Step '{step_name}' exhausted {max_outer_iterations} iterations",
-            "warn",
+            "info",
         )
         return False
