@@ -202,10 +202,15 @@ class CodingPhase(BasePhase):
 
         executor = self._make_executor(
             workdir,
-            new_files_allowed=False,   # Coding phase: only workdir stubs created by Planning
             on_task_confirmed=on_confirmed,
             on_file_written=on_write_made,
         )
+        # Coding phase: prevent the model from creating files that were not
+        # pre-created as stubs in workdir by Planning step 1.7.
+        # We set the flag directly on the sandbox so this works regardless of
+        # which version of _make_executor is present in base.py.
+        if executor.sandbox is not None:
+            executor.sandbox.new_files_allowed = False
         # Prevent write_file on modify-only files (would destroy existing code)
         executor.modify_only_files = {
             self._to_rel_workdir(workdir, f) for f in files_to_modify

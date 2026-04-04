@@ -961,6 +961,6 @@ Token count: {token_count} / {config['max_total_tokens']}
 
         self.log(
             f"  [WARN] Step '{step_name}' exhausted {max_outer_iterations} iterations",
-            "info",
+            "warn",
         )
         return False
