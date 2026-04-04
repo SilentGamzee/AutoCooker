@@ -137,6 +137,114 @@ class BasePhase:
             parts.append(f"{header}\n{snippet}")
         return "\n\n".join(parts)
 
+    # ── Token counting helper ────────────────────────────────
+    def _count_tokens(self, text: str) -> int:
+        """
+        Count tokens in text using tiktoken.
+        Falls back to character-based estimation if tiktoken is not available.
+        """
+        try:
+            import tiktoken
+            encoding = tiktoken.get_encoding("cl100k_base")
+            return len(encoding.encode(text))
+        except ImportError:
+            # Fallback: rough estimate (1 token ≈ 4 characters)
+            return len(text) // 4
+
+    # ── Extract file path from error message ─────────────────
+    def _extract_file_path_from_error(self, error_msg: str) -> str | None:
+        """
+        Extract file path from validation error message.
+        Looks for patterns like [FILE: path] or "Not found: path".
+        """
+        # Pattern 1: [FILE: path]
+        if "[FILE:" in error_msg:
+            try:
+                start = error_msg.index("[FILE:") + 6
+                end = error_msg.index("]", start)
+                return error_msg[start:end].strip()
+            except (ValueError, IndexError):
+                pass
+        
+        # Pattern 2: Not found: path
+        if "Not found:" in error_msg:
+            try:
+                start = error_msg.index("Not found:") + 10
+                # Find the end of the path (usually a newline or end of string)
+                path = error_msg[start:].split()[0].strip()
+                return path
+            except (ValueError, IndexError):
+                pass
+        
+        return None
+
+    # ── Read failed file content with batching ───────────────
+    def _read_failed_file_content_batched(self, file_path: str, max_tokens: int = 5000) -> str:
+        """
+        Read the content of a file that failed validation.
+        If file is too large (>max_tokens), returns batched content with guidance.
+        Returns a formatted string showing the file content, or empty string if file doesn't exist.
+        """
+        if not os.path.isfile(file_path):
+            return ""
+        
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            
+            tokens = self._count_tokens(content)
+            
+            # For JSON files, show structure even if large
+            if file_path.endswith(".json"):
+                try:
+                    import json as _json
+                    parsed = _json.loads(content)
+                    if isinstance(parsed, dict):
+                        top_keys = list(parsed.keys())
+                        
+                        # If small enough, show full content
+                        if tokens <= max_tokens:
+                            return (
+                                f"CURRENT FILE CONTENT ({file_path}):\n"
+                                f"Top-level keys: {top_keys}\n"
+                                f"File size: ~{tokens} tokens\n\n"
+                                f"Full content:\n{content}"
+                            )
+                        else:
+                            # Too large - show structure and first part
+                            max_chars = max_tokens * 4  # rough estimate
+                            preview = content[:max_chars]
+                            return (
+                                f"CURRENT FILE CONTENT ({file_path}):\n"
+                                f"⚠️ Large file (~{tokens} tokens) - showing first {max_tokens} tokens\n"
+                                f"Top-level keys: {top_keys}\n\n"
+                                f"Content preview:\n{preview}\n\n"
+                                f"…(file truncated - {tokens - max_tokens} more tokens)\n\n"
+                                f"💡 TIP: If you need to see specific parts, call read_file tool to examine the file."
+                            )
+                except Exception:
+                    pass
+            
+            # For non-JSON files or if JSON parsing failed
+            if tokens <= max_tokens:
+                return f"CURRENT FILE CONTENT ({file_path}):\n{content}"
+            else:
+                # Large file - show first and last parts
+                max_chars = max_tokens * 4
+                half_chars = max_chars // 2
+                preview_start = content[:half_chars]
+                preview_end = content[-half_chars:]
+                return (
+                    f"CURRENT FILE CONTENT ({file_path}):\n"
+                    f"⚠️ Large file (~{tokens} tokens) - showing first and last {max_tokens//2} tokens each\n\n"
+                    f"Beginning:\n{preview_start}\n\n"
+                    f"…(middle section truncated - {tokens - max_tokens} tokens omitted)…\n\n"
+                    f"End:\n{preview_end}\n\n"
+                    f"💡 TIP: If you need to see specific parts, call read_file tool."
+                )
+        except Exception as e:
+            return f"(Could not read {file_path}: {e})"
+
     # ── Executor factory ─────────────────────────────────────────
     def _make_executor(self, wd: str, **kwargs) -> "ToolExecutor":
         """
@@ -271,9 +379,27 @@ class BasePhase:
                         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
                     )
 
-                if file_snapshot:
+                # ═══════════════════════════════════════════════════════════
+                # НОВАЯ ЛОГИКА: Извлечение пути к файлу и чтение его содержимого
+                # ═══════════════════════════════════════════════════════════
+                failed_file_path = self._extract_file_path_from_error(reason)
+                failed_file_content = ""
+                if failed_file_path:
+                    failed_file_content = self._read_failed_file_content_batched(failed_file_path)
+
+                # Show file content - prioritize direct file read over snapshot
+                if failed_file_content:
+                    retry_msg += f"{failed_file_content}\n\n"
                     retry_msg += (
-                        "CURRENT FILE ON DISK (top-level keys show what fields exist):\n"
+                        "ACTION REQUIRED:\n"
+                        "1. Review the CURRENT FILE CONTENT above\n"
+                        "2. Identify what fields are missing or incorrect based on the validation error\n"
+                        "3. Call write_file with the COMPLETE corrected content\n"
+                        "4. Include ALL required fields that are mentioned in the validation error\n\n"
+                    )
+                elif file_snapshot:
+                    retry_msg += (
+                        "CURRENT FILE ON DISK (from cache - top-level keys show what fields exist):\n"
                         f"{file_snapshot}\n\n"
                     )
                 else:
@@ -294,8 +420,23 @@ class BasePhase:
                         "ACTION REQUIRED NOW:\n"
                         "Call write_file with the COMPLETE corrected content.\n"
                         "Include ALL required fields in one single write.\n\n"
-                        "PATH TO USE: The exact path from the validation error above.\n"
-                        "If the error said 'Not found: /path/to/file.json' - use that exact path.\n\n"
+                    )
+                    
+                    # ═══════════════════════════════════════════════════════════
+                    # НОВАЯ ЛОГИКА: Более конкретные инструкции о пути к файлу
+                    # ═══════════════════════════════════════════════════════════
+                    if failed_file_path:
+                        retry_msg += (
+                            f"PATH TO USE: {failed_file_path}\n"
+                            "This is the exact path from the validation error.\n\n"
+                        )
+                    else:
+                        retry_msg += (
+                            "PATH TO USE: The exact path from the validation error above.\n"
+                            "If the error said 'Not found: /path/to/file.json' - use that exact path.\n\n"
+                        )
+                    
+                    retry_msg += (
                         "FOR JSON FILES: Write PURE JSON with NO COMMENTS (//, /* */).\n\n"
                         "REMEMBER: Describing the fix in text does NOTHING.\n"
                         "You MUST call the write_file tool in your response."

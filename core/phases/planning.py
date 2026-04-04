@@ -34,58 +34,100 @@ def _read_json(path: str) -> tuple[bool, dict | list | None, str]:
 
 
 def _validate_project_index(path: str) -> tuple[bool, str]:
+    """Validate project_index.json - includes file path in error messages."""
     ok, data, err = _read_json(path)
     if not ok:
-        return False, err
+        return False, f"[FILE: {path}] {err}"
     if "services" not in data:
-        return False, "Missing 'services' key"
+        return False, f"[FILE: {path}] Missing 'services' key"
     return True, "OK"
 
 
 def _validate_requirements(path: str) -> tuple[bool, str]:
+    """Validate requirements.json - includes file path in error messages."""
     ok, data, err = _read_json(path)
     if not ok:
-        return False, err
+        return False, f"[FILE: {path}] {err}"
     required = ("task_description", "workflow_type", "acceptance_criteria")
     missing = [k for k in required if k not in data]
     if missing:
         present = [k for k in required if k in data]
         return False, (
+            f"[FILE: {path}] "
             f"Missing fields: {missing}. "
             f"Present fields: {present}. "
             f"Top-level keys in file: {list(data.keys())[:15]}"
         )
     if not data.get("task_description", "").strip():
-        return False, "task_description is empty"
+        return False, f"[FILE: {path}] task_description is empty"
     return True, "OK"
 
 
 def _validate_spec_md(path: str) -> tuple[bool, str]:
+    """Validate spec.md - includes file path in error messages and checks for User Flow."""
     if not os.path.isfile(path):
-        return False, "spec.md not found"
+        return False, f"[FILE: {path}] spec.md not found"
     with open(path, "r", encoding="utf-8") as f:
         content = f.read()
     if len(content.strip()) < 200:
-        return False, "spec.md is too short (< 200 chars)"
-    # Accept both H1 (# Heading) and H2 (## Heading) — model often writes H1
-    for heading in ("Overview", "Task Scope", "Acceptance Criteria"):
+        return False, f"[FILE: {path}] spec.md is too short (< 200 chars)"
+    
+    # Check for required headings (accept both H1 and H2)
+    required_headings = ["Overview", "Task Scope", "Acceptance Criteria"]
+    for heading in required_headings:
         if f"## {heading}" not in content and f"# {heading}" not in content:
             return False, (
+                f"[FILE: {path}] "
                 f"Missing section '{heading}'. "
                 f"Add '## {heading}' or '# {heading}' to the file."
             )
+    
+    # Check for User Flow section if this is a user-facing feature
+    # User Flow is required if spec mentions frontend files (web/, html, js, css)
+    has_frontend = any(marker in content.lower() for marker in 
+                      ['web/', '.html', '.js', '.css', 'frontend', 'ui ', 'user interface', 'button', 'form'])
+    
+    if has_frontend:
+        if "## User Flow" not in content and "# User Flow" not in content:
+            return False, (
+                f"[FILE: {path}] "
+                f"Missing '## User Flow' section. "
+                f"This task involves frontend/UI changes and MUST include a User Flow section "
+                f"describing step-by-step how users interact with the feature. "
+                f"Use the User Flow template from the prompt."
+            )
+        
+        # Verify User Flow has actual steps (not just the heading)
+        user_flow_pattern = r"(?:##|#)\s*User Flow.*?(?=(?:##|#)|$)"
+        import re
+        user_flow_match = re.search(user_flow_pattern, content, re.DOTALL | re.IGNORECASE)
+        if user_flow_match:
+            user_flow_section = user_flow_match.group(0)
+            # Check for step markers
+            has_steps = ("**Step" in user_flow_section or 
+                        "Step 1" in user_flow_section or
+                        "User Action" in user_flow_section)
+            if not has_steps:
+                return False, (
+                    f"[FILE: {path}] "
+                    f"User Flow section exists but has no steps. "
+                    f"Add step-by-step breakdown using the template: "
+                    f"'**Step 1: [Action]**' with User Action, UI Element, Frontend/Backend Changes."
+                )
+    
     return True, "OK"
 
 
 def _validate_impl_plan(path: str, project_path: str = "") -> tuple[bool, str]:
+    """Validate implementation_plan.json - includes file path in error messages."""
     ok, data, err = _read_json(path)
     if not ok:
-        return False, err
+        return False, f"[FILE: {path}] {err}"
     if "phases" not in data or not isinstance(data["phases"], list):
         top_keys = list(data.keys()) if isinstance(data, dict) else "not a dict"
-        return False, f"Missing 'phases' array. Top-level keys: {top_keys}"
+        return False, f"[FILE: {path}] Missing 'phases' array. Top-level keys: {top_keys}"
     if not data["phases"]:
-        return False, "'phases' is empty"
+        return False, f"[FILE: {path}] 'phases' is empty"
 
     # Show a structural dump of what the phases actually contain
     def _phase_summary(phases_data: list) -> str:
@@ -164,14 +206,76 @@ def _validate_impl_plan(path: str, project_path: str = "") -> tuple[bool, str]:
                     f"or remove it entirely."
                 )
 
+    # Check for full-stack planning - if there are frontend files, must have frontend subtasks
+    has_frontend_files = False
+    has_backend_files = False
+    frontend_subtasks = []
+    backend_subtasks = []
+    
+    for s in all_subtasks:
+        files = s.get("files_to_create", []) + s.get("files_to_modify", [])
+        is_frontend = any(
+            f.startswith("web/") or f.endswith((".html", ".js", ".css"))
+            for f in files
+        )
+        is_backend = any(
+            f.startswith("core/") or f.startswith("src/") or f.endswith(".py")
+            for f in files
+        )
+        
+        if is_frontend:
+            has_frontend_files = True
+            frontend_subtasks.append(s)
+        if is_backend:
+            has_backend_files = True
+            backend_subtasks.append(s)
+    
+    # If task has both frontend and backend files, check for proper organization
+    if has_frontend_files and has_backend_files:
+        # Check that frontend subtasks have user_visible_impact
+        frontend_without_impact = [
+            s.get("id", "?") for s in frontend_subtasks 
+            if not s.get("user_visible_impact")
+        ]
+        if frontend_without_impact:
+            errors.append(
+                f"Frontend subtasks missing 'user_visible_impact' field: {', '.join(frontend_without_impact)}. "
+                f"All frontend subtasks must explain what user sees/does as a result of the change."
+            )
+        
+        # Warn if all subtasks are mixed together without phases
+        if len(data["phases"]) == 1:
+            errors.append(
+                f"Task has both frontend and backend files but only 1 phase. "
+                f"Consider organizing into phases: "
+                f"Phase 1 (Backend/Data) with {len(backend_subtasks)} subtasks, "
+                f"Phase 2 (Frontend/UI) with {len(frontend_subtasks)} subtasks. "
+                f"This helps maintain proper dependency order (backend before frontend)."
+            )
+    
+    # If only frontend files but no backend, warn about missing data layer
+    if has_frontend_files and not has_backend_files:
+        # Check if any frontend subtask mentions data/state/storage
+        data_keywords = ["data", "state", "storage", "save", "load", "persist"]
+        frontend_needs_backend = any(
+            any(keyword in s.get("description", "").lower() for keyword in data_keywords)
+            for s in frontend_subtasks
+        )
+        if frontend_needs_backend:
+            errors.append(
+                f"Frontend subtasks mention data/state but no backend subtasks found. "
+                f"Add backend subtasks for data models and storage before frontend implementation."
+            )
+
     if errors:
         summary = _phase_summary(data["phases"])
         return False, (
+            f"[FILE: {path}] "
             f"{len(errors)} issue(s): " + "; ".join(errors[:5]) +
             f"\n\nActual phases structure:\n{summary}"
         )
     if not all_subtasks:
-        return False, "No valid subtasks found in any phase"
+        return False, f"[FILE: {path}] No valid subtasks found in any phase"
     return True, "OK"
 
 
