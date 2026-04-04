@@ -11,6 +11,26 @@ from core.tools import ToolExecutor
 
 PROMPTS_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "prompts")
 
+# ══════════════════════════════════════════════════════════════════
+# Project Context Configuration
+# ══════════════════════════════════════════════════════════════════
+
+PROJECT_CONTEXT_CONFIG = {
+    "use_keyword_filter": True,
+    "use_ollama_filter": True,
+    "ollama_filter_model": "llama3.1",
+    "max_ollama_files": 20,
+    "max_total_tokens": 6000,
+    "min_keyword_length": 3,
+    "stop_words": {
+        "the", "a", "an", "is", "are", "was", "were", "be", "been",
+        "have", "has", "had", "do", "does", "did", "will", "would",
+        "should", "could", "can", "may", "might", "must", "to", "from",
+        "in", "on", "at", "by", "for", "with", "about", "as", "into",
+        "of", "and", "or", "but", "not", "this", "that", "these", "those"
+    }
+}
+
 
 def load_prompt(filename: str) -> str:
     path = os.path.join(PROMPTS_DIR, filename)
@@ -92,6 +112,12 @@ class BasePhase:
         base = load_prompt(prompt_file)
         cache = self.state.cache
         parts = [base]
+        
+        # NEW: Add relevant project structure
+        project_context = self._load_relevant_project_index()
+        if project_context:
+            parts.append(project_context)
+        
         if cache.file_paths:
             parts.append(
                 "\n\n---\n## Cached project file paths\n```\n"
@@ -99,8 +125,6 @@ class BasePhase:
             )
         if cache.file_contents:
             summary = cache.contents_summary()
-            # Hard cap: Qwen 9B degrades badly past ~6-8k tokens in context.
-            # Cached file contents can easily exceed that if many files were read.
             CONTENT_SUMMARY_LIMIT = 4000
             if len(summary) > CONTENT_SUMMARY_LIMIT:
                 summary = (
@@ -108,7 +132,6 @@ class BasePhase:
                     + "\n…(truncated — use read_file to see remaining files)"
                 )
             parts.append("\n\n---\n## Cached file contents\n" + summary)
-        # Include only last 10 task logs so the context doesn't grow unboundedly
         recent_logs = self.task.logs[-10:]
         if recent_logs:
             log_lines = "\n".join(
@@ -163,6 +186,391 @@ class BasePhase:
         except ImportError:
             # Fallback: rough estimate (1 token ≈ 4 characters)
             return len(text) // 4
+
+
+    # ══════════════════════════════════════════════════════════════════
+    # Project Context Methods (Relevance Filtering)
+    # ══════════════════════════════════════════════════════════════════
+
+    def _load_project_index_file(self) -> dict | None:
+        """Load project_index.json from task_dir or project root."""
+        import json
+        
+        paths_to_try = [
+            os.path.join(self.task.task_dir, "project_index.json"),
+            os.path.join(self.task.project_path or self.state.working_dir, "project_index.json"),
+        ]
+        
+        for path in paths_to_try:
+            if os.path.isfile(path):
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        return json.load(f)
+                except Exception as e:
+                    print(f"[WARN] Failed to load {path}: {e}", flush=True)
+        return None
+
+    def _extract_keywords_from_task(self, task_description: str) -> set[str]:
+        """Extract keywords from task description for file filtering."""
+        import re
+        
+        config = PROJECT_CONTEXT_CONFIG
+        stop_words = config["stop_words"]
+        min_length = config["min_keyword_length"]
+        
+        words = re.findall(r'\b[\w-]+\b', task_description.lower())
+        
+        keywords = {
+            word for word in words
+            if len(word) >= min_length
+            and word not in stop_words
+            and not word.isdigit()
+        }
+        
+        return keywords
+
+    def _filter_files_by_keywords(self, project_index: dict, keywords: set[str]) -> list[str]:
+        """Filter files by keyword matching in path/description/symbols."""
+        matches = []
+        
+        services = project_index.get("services", {})
+        
+        for service_name, service_data in services.items():
+            # Защита: проверяем что service_data это dict
+            if not isinstance(service_data, dict):
+                print(f"[WARN] service_data for '{service_name}' is not a dict: {type(service_data)}", flush=True)
+                continue
+            
+            files = service_data.get("files", {})
+            
+            # Защита: проверяем что files это dict
+            if not isinstance(files, dict):
+                print(f"[WARN] files for '{service_name}' is not a dict: {type(files)}", flush=True)
+                continue
+            
+            for file_path, file_info in files.items():
+                # Защита: проверяем что file_info это dict
+                if not isinstance(file_info, dict):
+                    print(f"[WARN] file_info for '{file_path}' is not a dict: {type(file_info)}", flush=True)
+                    continue
+                
+                path_lower = file_path.lower()
+                if any(kw in path_lower for kw in keywords):
+                    matches.append(file_path)
+                    continue
+                
+                desc = file_info.get("description", "").lower()
+                if any(kw in desc for kw in keywords):
+                    matches.append(file_path)
+                    continue
+                
+                symbols = file_info.get("symbols", [])
+                symbols_lower = [s.lower() for s in symbols]
+                if any(any(kw in sym for kw in keywords) for sym in symbols_lower):
+                    matches.append(file_path)
+        
+        return matches
+
+    def _get_relevant_files_via_ollama(self, task_description: str, project_index: dict, max_files: int = 20) -> list[str]:
+        """Ask ollama which files are relevant to the task."""
+        import json
+        import re
+        
+        config = PROJECT_CONTEXT_CONFIG
+        model = config["ollama_filter_model"]
+        
+        compact_index = []
+        services = project_index.get("services", {})
+        
+        for service_name, service_data in services.items():
+            # Защита: проверяем что service_data это dict
+            if not isinstance(service_data, dict):
+                continue
+            
+            files = service_data.get("files", {})
+            
+            # Защита: проверяем что files это dict
+            if not isinstance(files, dict):
+                continue
+            
+            for file_path, file_info in files.items():
+                # Защита: проверяем что file_info это dict
+                if not isinstance(file_info, dict):
+                    continue
+                
+                desc = file_info.get("description", "No description")
+                compact_index.append(f"{file_path}: {desc}")
+        
+        if not compact_index:
+            print("[WARN] No files found in project_index for ollama filter", flush=True)
+            return []
+        
+        compact_str = "\n".join(compact_index)
+        
+        prompt = f"""You are analyzing a software project to determine which files are relevant to a task.
+
+TASK:
+{task_description}
+
+PROJECT FILES:
+{compact_str}
+
+INSTRUCTIONS:
+Return a JSON array of file paths that are MOST relevant to this task.
+Consider files that will be MODIFIED, READ for context, or are DEPENDENCIES.
+
+Return ONLY the JSON array, no explanation:
+["path/to/file1.py", "path/to/file2.js", ...]
+
+Maximum {max_files} files."""
+
+        try:
+            response = self.ollama.complete(model=model, prompt=prompt, max_tokens=500, temperature=0.0)
+            
+            json_match = re.search(r'\[.*\]', response, re.DOTALL)
+            if json_match:
+                file_list = json.loads(json_match.group(0))
+                if isinstance(file_list, list):
+                    all_paths = set()
+                    for service in services.values():
+                        if isinstance(service, dict):
+                            files = service.get("files", {})
+                            if isinstance(files, dict):
+                                all_paths.update(files.keys())
+                    
+                    valid_paths = [p for p in file_list if p in all_paths]
+                    return valid_paths[:max_files]
+            
+            print(f"[WARN] Ollama filter returned invalid JSON", flush=True)
+            return []
+        except Exception as e:
+            print(f"[WARN] Ollama filter failed: {e}", flush=True)
+            return []
+
+    def _combine_file_lists(self, keyword_matches: list[str], ollama_matches: list[str]) -> list[str]:
+        """Combine keyword and ollama file matches, prioritizing ollama."""
+        combined = list(ollama_matches)
+        seen = set(ollama_matches)
+        
+        for file_path in keyword_matches:
+            if file_path not in seen:
+                combined.append(file_path)
+                seen.add(file_path)
+        
+        return combined
+
+    def _format_single_file(self, file_path: str, file_info: dict) -> str:
+        """Format single file entry for token counting."""
+        desc = file_info.get("description", "")
+        symbols = file_info.get("symbols", [])
+        
+        formatted = f"**{file_path}**: {desc}"
+        if symbols:
+            formatted += f"\n  Symbols: [{', '.join(symbols[:5])}]"
+        
+        return formatted
+
+    def _prioritize_files(self, file_paths: list[str]) -> list[str]:
+        """
+        Sort files by importance for batching.
+        
+        Priority order:
+        1. main.py, app.py, __init__.py
+        2. core/* files
+        3. web/index.html, web/js/app.js
+        4. Everything else
+        """
+        priority_1 = []  # Entry points
+        priority_2 = []  # Core logic
+        priority_3 = []  # Main UI files
+        priority_4 = []  # Everything else
+        
+        for path in file_paths:
+            # Priority 1: Entry points
+            if any(p in path for p in ["main.py", "app.py", "__main__.py"]):
+                priority_1.append(path)
+            # Priority 2: Core logic
+            elif path.startswith("core/") or path.startswith("src/"):
+                priority_2.append(path)
+            # Priority 3: Main UI
+            elif any(p in path for p in ["web/index.html", "web/js/app.js", "index.html", "app.js"]):
+                priority_3.append(path)
+            # Priority 4: Everything else
+            else:
+                priority_4.append(path)
+        
+        return priority_1 + priority_2 + priority_3 + priority_4
+
+    def _batch_project_index_to_limit(self, project_index: dict, relevant_files: list[str], max_tokens: int) -> dict:
+        """Batch project index to fit within token limit."""
+        batched = {"services": {}}
+        current_tokens = 0
+        
+        services = project_index.get("services", {})
+        
+        for file_path in relevant_files:
+            found = False
+            for service_name, service_data in services.items():
+                # Защита: проверяем что service_data это dict
+                if not isinstance(service_data, dict):
+                    continue
+                
+                files = service_data.get("files", {})
+                
+                # Защита: проверяем что files это dict
+                if not isinstance(files, dict):
+                    continue
+                
+                if file_path in files:
+                    file_info = files[file_path]
+                    
+                    # Защита: проверяем что file_info это dict
+                    if not isinstance(file_info, dict):
+                        continue
+                    
+                    file_entry_str = self._format_single_file(file_path, file_info)
+                    entry_tokens = self._count_tokens(file_entry_str)
+                    
+                    if current_tokens + entry_tokens > max_tokens:
+                        return batched
+                    
+                    if service_name not in batched["services"]:
+                        batched["services"][service_name] = {
+                            "type": service_data.get("type", "unknown"),
+                            "files": {}
+                        }
+                    
+                    batched["services"][service_name]["files"][file_path] = file_info
+                    current_tokens += entry_tokens
+                    found = True
+                    break
+            
+            if not found:
+                print(f"[WARN] Relevant file not found in index: {file_path}", flush=True)
+        
+        return batched
+
+    def _format_project_index_section(self, batched_index: dict) -> str:
+        """Format batched project index into readable text."""
+        lines = []
+        
+        services = batched_index.get("services", {})
+        
+        # Считаем файлы с защитой
+        total_files = 0
+        for s in services.values():
+            if isinstance(s, dict):
+                files = s.get("files", {})
+                if isinstance(files, dict):
+                    total_files += len(files)
+        
+        lines.append(f"Showing {total_files} most relevant files:")
+        lines.append("")
+        
+        for service_name, service_data in services.items():
+            # Защита: проверяем что service_data это dict
+            if not isinstance(service_data, dict):
+                continue
+            
+            service_type = service_data.get("type", "unknown")
+            files = service_data.get("files", {})
+            
+            # Защита: проверяем что files это dict
+            if not isinstance(files, dict):
+                continue
+            
+            if not files:
+                continue
+            
+            lines.append(f"### {service_name.upper()} ({service_type})")
+            lines.append("")
+            
+            for file_path, file_info in files.items():
+                # Защита: проверяем что file_info это dict
+                if not isinstance(file_info, dict):
+                    continue
+                
+                desc = file_info.get("description", "No description")
+                symbols = file_info.get("symbols", [])
+                
+                lines.append(f"**{file_path}**: {desc}")
+                
+                if symbols and isinstance(symbols, list):
+                    symbols_str = ", ".join(str(s) for s in symbols[:5])
+                    if len(symbols) > 5:
+                        symbols_str += f" (+{len(symbols) - 5} more)"
+                    lines.append(f"  Symbols: [{symbols_str}]")
+                
+                lines.append("")
+        
+        return "\n".join(lines)
+
+    def _load_relevant_project_index(self) -> str:
+        """Load project_index.json with relevance filtering and batching."""
+        config = PROJECT_CONTEXT_CONFIG
+        
+        project_index = self._load_project_index_file()
+        if not project_index:
+            return ""
+        
+        # Логируем структуру для отладки
+        services = project_index.get("services", {})
+        print(f"[PROJECT_CONTEXT] Loaded project_index with {len(services)} service(s)", flush=True)
+        
+        # Проверяем структуру
+        for service_name, service_data in services.items():
+            if not isinstance(service_data, dict):
+                print(f"[PROJECT_CONTEXT] WARNING: service '{service_name}' is {type(service_data).__name__}, expected dict", flush=True)
+                print(f"[PROJECT_CONTEXT] Value: {service_data}", flush=True)
+                continue
+            
+            files = service_data.get("files", {})
+            if isinstance(files, dict):
+                print(f"[PROJECT_CONTEXT] Service '{service_name}' has {len(files)} file(s)", flush=True)
+            else:
+                print(f"[PROJECT_CONTEXT] WARNING: files in '{service_name}' is {type(files).__name__}, expected dict", flush=True)
+        
+        keywords = self._extract_keywords_from_task(self.task.description)
+        print(f"[PROJECT_CONTEXT] Extracted keywords: {keywords}", flush=True)
+        
+        keyword_matches = []
+        if config["use_keyword_filter"]:
+            keyword_matches = self._filter_files_by_keywords(project_index, keywords)
+            print(f"[PROJECT_CONTEXT] Keyword filter: {len(keyword_matches)} files", flush=True)
+        
+        ollama_matches = []
+        if config["use_ollama_filter"]:
+            try:
+                ollama_matches = self._get_relevant_files_via_ollama(
+                    self.task.description, project_index, max_files=config["max_ollama_files"]
+                )
+                print(f"[PROJECT_CONTEXT] Ollama filter: {len(ollama_matches)} files", flush=True)
+            except Exception as e:
+                print(f"[PROJECT_CONTEXT] Ollama filter failed: {e}, using keyword only", flush=True)
+        
+        relevant_files = self._combine_file_lists(keyword_matches, ollama_matches)
+        relevant_files = self._prioritize_files(relevant_files)
+        
+        print(f"[PROJECT_CONTEXT] Total relevant files: {len(relevant_files)}", flush=True)
+        
+        if not relevant_files:
+            print("[PROJECT_CONTEXT] No relevant files found, returning empty context", flush=True)
+            return ""
+        
+        batched_index = self._batch_project_index_to_limit(project_index, relevant_files, max_tokens=config["max_total_tokens"])
+        formatted = self._format_project_index_section(batched_index)
+        token_count = self._count_tokens(formatted)
+        
+        header = f"""
+
+{'=' * 60}
+PROJECT STRUCTURE (relevant to task)
+Token count: {token_count} / {config['max_total_tokens']}
+{'=' * 60}
+
+"""
+        
+        return header + formatted
 
     # ── Extract file path from error message ─────────────────
     def _extract_file_path_from_error(self, error_msg: str) -> str | None:
@@ -361,10 +769,9 @@ class BasePhase:
                 self.log(f"  ✓ Validation passed: {step_name}", "ok")
                 return True
             else:
-                # ИЗМЕНЕНО: Валидация failed
-                # Показываем ошибку только на последней итерации или если outer == 0
+                # Валидация failed
                 if outer == max_outer_iterations - 1:
-                    # Последняя итерация - показываем ошибку и выходим
+                    # Последняя итерация - показываем полную ошибку и выходим
                     self.log(f"  ✗ Validation failed: {reason}", "error")
                     self.log(
                         f"  [WARN] Step '{step_name}' exhausted {max_outer_iterations} iterations",
@@ -372,15 +779,91 @@ class BasePhase:
                     )
                     return False
                 
-                # НЕ последняя итерация - логируем как debug и продолжаем
-                print(f"[RUN_LOOP] Validation failed on iteration {outer + 1}/{max_outer_iterations}, continuing...", flush=True)
-                self.log(f"  ⚙️ Iteration {outer + 1}/{max_outer_iterations} - continuing...", "info")
+                # НЕ последняя итерация - логируем коротко, но СОЗДАЕМ retry_msg
+                print(f"[RUN_LOOP] Validation failed on iteration {outer + 1}/{max_outer_iterations}, creating retry message...", flush=True)
+                self.log(f"  ⚙️ Iteration {outer + 1}/{max_outer_iterations} - validation failed, retrying...", "info")
                 
-                # НЕ добавляем retry_msg - просто продолжаем следующую итерацию
-                # Модель продолжит работать без явного указания на ошибку
-                continue
+                # ВАЖНО: Создаем retry_msg чтобы модель знала что исправить
+                file_snapshot = self._snapshot_written_files(executor)
+                retry_msg = f"VALIDATION FAILED: {reason}\n\n"
+                
+                # Detect JSON comment errors
+                if "Expecting property name" in reason or "Expecting" in reason:
+                    if file_snapshot and ("|" in file_snapshot[:200] or "path" in file_snapshot[:50].lower()):
+                        retry_msg += (
+                            "🚫 FATAL ERROR: You wrote a TABLE instead of JSON!\n\n"
+                            "❌ WRONG (what you wrote):\n"
+                            "  path | description | symbols\n"
+                            "  core/main.py | Main entry | ...\n\n"
+                            "✅ CORRECT (what you MUST write):\n"
+                            '  {"services": {"backend": {"type": "python"}}}\n\n'
+                            "JSON MUST start with { and end with }.\n"
+                            "NO pipes (|), NO markdown, ONLY pure JSON.\n\n"
+                        )
+                    else:
+                        retry_msg += (
+                            "🚫 JSON SYNTAX ERROR DETECTED\n"
+                            "This error usually means you used COMMENTS in JSON.\n\n"
+                            "❌ FORBIDDEN in JSON:\n"
+                            '  {"key": "value",  // comment}\n'
+                            '  {"key": /* comment */ "value"}\n\n'
+                            "✅ CORRECT - Pure JSON only:\n"
+                            '  {"key": "value"}\n\n'
+                            "JSON does NOT support // or /* */ comments.\n"
+                            "Remove ALL comments and write pure JSON.\n\n"
+                        )
 
-        # Если дошли сюда - все итерации прошли без успешной валидации
+                if tool_calls_made == 0:
+                    retry_msg += (
+                        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        "❌ CRITICAL ERROR: YOU DID NOT CALL ANY TOOLS\n"
+                        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                        "You responded with TEXT ONLY. The file was NOT created.\n"
+                        "Describing what you would do does NOTHING.\n\n"
+                        "YOU MUST CALL write_file IN YOUR VERY NEXT RESPONSE.\n\n"
+                        "NO TEXT DESCRIPTIONS. ONLY TOOL CALLS.\n"
+                        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                    )
+
+                # Extract file path and show content
+                failed_file_path = self._extract_file_path_from_error(reason)
+                failed_file_content = ""
+                if failed_file_path:
+                    failed_file_content = self._read_failed_file_content_batched(failed_file_path)
+
+                if failed_file_content:
+                    retry_msg += f"{failed_file_content}\n\n"
+                    retry_msg += (
+                        "ACTION REQUIRED:\n"
+                        "1. Review the CURRENT FILE CONTENT above\n"
+                        "2. Identify what fields are missing or incorrect\n"
+                        "3. Call write_file with the COMPLETE corrected content\n"
+                        "4. Include ALL required fields\n\n"
+                    )
+                elif file_snapshot:
+                    retry_msg += f"CURRENT FILE ON DISK:\n{file_snapshot}\n\n"
+
+                has_modify_only = bool(getattr(executor, "modify_only_files", set()))
+                if has_modify_only:
+                    retry_msg += (
+                        "ACTION REQUIRED: Some files are modify-only.\n"
+                        "1. Call read_file to see current content\n"
+                        "2. Call modify_file with exact old_text → new_text\n\n"
+                    )
+                else:
+                    retry_msg += "ACTION REQUIRED: Call write_file with COMPLETE corrected content.\n\n"
+                    
+                    if failed_file_path:
+                        retry_msg += f"PATH TO USE: {failed_file_path}\n\n"
+                    
+                    retry_msg += (
+                        "FOR JSON FILES: Write PURE JSON with NO COMMENTS (//, /* */).\n\n"
+                        "REMEMBER: Describing the fix in text does NOTHING.\n"
+                        "You MUST call the write_file tool in your response."
+                    )
+                
+                messages.append({"role": "user", "content": retry_msg})
+
         self.log(
             f"  [WARN] Step '{step_name}' exhausted {max_outer_iterations} iterations",
             "warn",
