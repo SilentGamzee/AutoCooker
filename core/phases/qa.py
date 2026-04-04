@@ -392,7 +392,7 @@ EXPLANATION: [your explanation]
                     model=model,
                     system="You are a QA engineer verifying requirements against implementation.",
                     prompt=prompt,
-                    max_tokens=6000
+                    max_tokens=12000
                 )
                 
                 # Parse response
@@ -585,7 +585,7 @@ REASON: [brief explanation]
                     model=model,
                     system="You verify user flow steps against implementation.",
                     prompt=prompt,
-                    max_tokens=6000
+                    max_tokens=12000
                 )
                 
                 verdict = "NO"
@@ -654,7 +654,7 @@ EVIDENCE: [what code you found or what's missing]
                     model=model,
                     system="You verify system data processing against implementation.",
                     prompt=prompt,
-                    max_tokens=6000
+                    max_tokens=12000
                 )
                 
                 verdict = "NO"

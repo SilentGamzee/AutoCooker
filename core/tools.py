@@ -6,6 +6,7 @@ from typing import Callable, Optional
 
 import core
 from core.sandbox import create_sandbox
+from core.json_repair import repair_json
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Tool schema definitions (OpenAI / Ollama format)
@@ -484,6 +485,27 @@ class ToolExecutor:
                 f"Using write_file would destroy all existing code in this file."
             )
 
+        # ── JSON auto-repair ─────────────────────────────────────────
+        # LLMs sometimes hit max_tokens mid-output, leaving JSON truncated.
+        # Before writing a .json file, attempt to close any unclosed
+        # brackets/strings so the file is always parseable.
+        repair_note = ""
+        if abs_path.endswith(".json") and content.strip():
+            try:
+                repaired_content, was_repaired = repair_json(content)
+                if was_repaired:
+                    repair_note = (
+                        f"  ⚠️  JSON was truncated — auto-repaired "
+                        f"({len(content)} → {len(repaired_content)} chars)"
+                    )
+                    if self.log_fn:
+                        self.log_fn(repair_note, "warn")
+                    content = repaired_content
+            except Exception as exc:
+                # Repair failed — write original and let validation report the error
+                if self.log_fn:
+                    self.log_fn(f"  [WARN] JSON repair failed: {exc}", "warn")
+
         os.makedirs(os.path.dirname(abs_path), exist_ok=True)
         try:
             with open(abs_path, "w", encoding="utf-8") as f:
@@ -495,7 +517,10 @@ class ToolExecutor:
             if self.on_file_written:
                 self.on_file_written(path_rel, content)
             self._log_auto_read(path_rel, content)
-            return f"OK: written {len(content)} chars to {path_rel}"
+            result = f"OK: written {len(content)} chars to {path_rel}"
+            if repair_note:
+                result += f"\nWARNING: {repair_note.strip()}"
+            return result
         except Exception as e:
             return f"ERROR writing file: {e}"
 

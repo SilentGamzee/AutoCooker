@@ -20,7 +20,7 @@ PROJECT_CONTEXT_CONFIG = {
     "use_ollama_filter": True,
     "ollama_filter_model": "llama3.1",
     "max_ollama_files": 20,
-    "max_total_tokens": 6000,
+    "max_total_tokens": 12000,
     "min_keyword_length": 3,
     "stop_words": {
         "the", "a", "an", "is", "are", "was", "were", "be", "been",

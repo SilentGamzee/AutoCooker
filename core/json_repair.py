@@ -1,0 +1,165 @@
+"""
+json_repair — lightweight repair of truncated JSON produced by LLMs.
+
+LLMs sometimes hit max_tokens mid-output, leaving JSON with unclosed
+strings, arrays, or objects.  This module tries to close them so the
+file is at least parseable, even if the last few values are incomplete.
+
+Entry point:  repair_json(text: str) -> str
+  Returns the original text unchanged if it already parses correctly.
+  Returns a repaired version (closed brackets + optional dummy values)
+  if it was truncated.
+  Raises ValueError only for completely non-JSON input.
+"""
+from __future__ import annotations
+import json
+import re
+
+
+# ─────────────────────────────────────────────────────────────────
+# Internal tokeniser state
+# ─────────────────────────────────────────────────────────────────
+
+def _parse_structure(text: str) -> tuple[list[str], bool, bool]:
+    """
+    Walk the text character-by-character and return:
+      stack      — list of expected closing chars still needed ('}' or ']')
+      in_string  — whether we ended inside a string literal
+      after_colon — whether the last non-whitespace non-string token was ':'
+                    (meaning we're about to supply an object value)
+    """
+    stack: list[str] = []
+    in_string = False
+    escape_next = False
+    after_colon = False
+
+    i = 0
+    while i < len(text):
+        ch = text[i]
+
+        if escape_next:
+            escape_next = False
+            i += 1
+            continue
+
+        if ch == "\\" and in_string:
+            escape_next = True
+            i += 1
+            continue
+
+        if ch == '"':
+            in_string = not in_string
+            if not in_string:
+                after_colon = False   # just closed a string, reset
+            i += 1
+            continue
+
+        if in_string:
+            i += 1
+            continue
+
+        # Outside a string
+        if ch in " \t\n\r":
+            i += 1
+            continue
+
+        if ch == "{":
+            stack.append("}")
+            after_colon = False
+        elif ch == "[":
+            stack.append("]")
+            after_colon = False
+        elif ch in "}]":
+            if stack and stack[-1] == ch:
+                stack.pop()
+            after_colon = False
+        elif ch == ":":
+            after_colon = True
+        elif ch in ",":
+            after_colon = False
+
+        i += 1
+
+    return stack, in_string, after_colon
+
+
+# ─────────────────────────────────────────────────────────────────
+# Public API
+# ─────────────────────────────────────────────────────────────────
+
+def repair_json(text: str) -> tuple[str, bool]:
+    """
+    Attempt to repair truncated JSON.
+
+    Returns:
+      (result_text, was_repaired)
+        was_repaired=False  →  text was already valid, returned unchanged
+        was_repaired=True   →  text was repaired (brackets closed etc.)
+
+    The repair is best-effort:
+      - Closes an open string with '"'
+      - If we were in the middle of an object value (after ':'), inserts null
+      - Closes all unclosed arrays ']' and objects '}'
+    """
+    # Fast path: already valid
+    try:
+        json.loads(text)
+        return text, False
+    except json.JSONDecodeError:
+        pass
+
+    # Strip trailing garbage after the last meaningful char
+    # (e.g. a half-written key like  ,"incomple  )
+    stripped = text.rstrip()
+
+    stack, in_string, after_colon = _parse_structure(stripped)
+
+    tail = ""
+
+    # Close an open string
+    if in_string:
+        tail += '"'
+        after_colon = False   # the string is now "closed"
+
+    # If we're right after a colon (value expected), supply null
+    if after_colon:
+        tail += "null"
+
+    # Handle trailing comma before closing — remove it
+    # e.g.  {"a": 1,  → remove the comma so closing } is valid
+    candidate = stripped + tail
+    # Remove a lone trailing comma before a closing bracket
+    candidate = re.sub(r",\s*$", "", candidate)
+
+    # Close all unclosed containers in reverse order
+    tail2 = "".join(reversed(stack))
+    candidate = candidate + tail2
+
+    # Verify
+    try:
+        json.loads(candidate)
+        return candidate, True
+    except json.JSONDecodeError:
+        pass
+
+    # Second attempt: be more aggressive — strip back to the last complete value
+    # Find the last position that gives valid JSON when we close remaining brackets
+    for cutoff in range(len(stripped) - 1, max(len(stripped) - 200, 0), -1):
+        partial = stripped[:cutoff]
+        stack2, in_str2, ac2 = _parse_structure(partial)
+        t = ""
+        if in_str2:
+            t += '"'
+            ac2 = False
+        if ac2:
+            t += "null"
+        partial = re.sub(r",\s*$", "", partial + t)
+        partial += "".join(reversed(stack2))
+        try:
+            json.loads(partial)
+            return partial, True
+        except json.JSONDecodeError:
+            continue
+
+    # Give up — return original so the caller can handle it
+    return text, False

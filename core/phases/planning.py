@@ -850,7 +850,7 @@ class PlanningPhase(BasePhase):
                     response = self.ollama.complete(
                         model=model,
                         prompt=full_prompt,
-                        max_tokens=6000 
+                        max_tokens=12000 
                     )
                     
                     # Debug: log raw response
@@ -1036,7 +1036,7 @@ class PlanningPhase(BasePhase):
                     response = self.ollama.complete(
                         model=model,
                         prompt=full_prompt,
-                        max_tokens=6000 
+                        max_tokens=12000
                     )
                     
                     # Debug: log raw response
@@ -1250,7 +1250,7 @@ Focus on making steps more specific about:
                     response = self.ollama.complete(
                         model=model,
                         prompt=full_prompt,
-                        max_tokens=6000
+                        max_tokens=12000
                     )
                     
                     # Debug: log raw response
@@ -1430,7 +1430,7 @@ Be concrete and specific. Return ONLY the JSON, no other text.
                     response = self.ollama.complete(
                         model=model,
                         prompt=full_prompt,
-                        max_tokens=6000 
+                        max_tokens=12000 
                     )
                     
                     # Debug: log raw response
