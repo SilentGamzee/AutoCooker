@@ -18,6 +18,7 @@ from core.validator import (
 )
 from core.project_index import ProjectIndex
 from core.phases.base import BasePhase
+from core.git_utils import get_branch_diff, get_workdir_diff, get_changed_files_on_branch
 
 
 # ── Validators ────────────────────────────────────────────────────
@@ -1835,17 +1836,23 @@ Be concrete and specific. Return ONLY the JSON, no other text.
         """
         Re-plan only for the corrections the human provided.
         Keeps done subtasks intact, adds/modifies only what corrections require.
-        """
-        wd       = self.task.project_path or self.state.working_dir
-        plan_path = os.path.join(self.task.task_dir, "implementation_plan.json")
-        spec_path = os.path.join(self.task.task_dir, "spec.json")
 
-        spec_content = self._read_file_safe(spec_path)
+        Now includes:
+          - git diff <base_branch>..HEAD  — what has already been applied
+          - workdir diff vs base branch   — what the last coding cycle produced
+        Both help the model understand the current state and avoid re-doing
+        completed work or missing what genuinely needs to be fixed.
+        """
+        wd        = self.task.project_path or self.state.working_dir
+        plan_path  = os.path.join(self.task.task_dir, "implementation_plan.json")
+        spec_path  = os.path.join(self.task.task_dir, "spec.json")
+        workdir    = os.path.join(self.task.task_dir, WORKDIR_NAME)
+        git_branch = self.task.git_branch or "main"
+
+        spec_content  = self._read_file_safe(spec_path)
         existing_plan = self._read_file_safe(plan_path)
 
         # Show which subtasks are already done
-        done_ids = [s["id"] for s in self.task.subtasks if s.get("status") == "done"]
-        pending_ids = [s["id"] for s in self.task.subtasks if s.get("status") != "done"]
         subtask_summary = "\n".join(
             f"  [{s.get('status','?').upper()}] {s['id']}: {s.get('title','')}"
             for s in self.task.subtasks
@@ -1856,20 +1863,75 @@ Be concrete and specific. Return ONLY the JSON, no other text.
             if not p.startswith(".tasks") and not p.startswith(".git")
         )
 
+        # ── Branch diff: changes already committed / applied ──────────
+        # Shows the model what has been done in previous patch cycles so
+        # it only creates tasks for genuinely missing / broken work.
+        applied_diff_section = ""
+        try:
+            applied_diff = get_branch_diff(wd, git_branch, max_chars=6_000)
+            if applied_diff and "(no changes" not in applied_diff and \
+               "(project is not" not in applied_diff:
+                applied_diff_section = (
+                    f"\n## Already-applied changes (git diff `{git_branch}`..HEAD)\n"
+                    "These changes are already in the repo.  "
+                    "Do NOT create tasks that re-implement what you see here.\n\n"
+                    f"```diff\n{applied_diff}\n```\n"
+                )
+                self.log(f"  ✓ Branch diff included ({len(applied_diff)} chars)", "info")
+        except Exception as exc:
+            self.log(f"  [WARN] Branch diff failed: {exc}", "warn")
+
+        # ── Workdir diff: what the last coding cycle produced ─────────
+        # If workdir exists, show the diff vs the branch to give the model
+        # the full picture of in-progress (not yet merged) changes.
+        workdir_diff_section = ""
+        if os.path.isdir(workdir):
+            try:
+                in_scope: list[str] = []
+                seen: set[str] = set()
+                for s in self.task.subtasks:
+                    for p in (s.get("files_to_create") or []) + \
+                              (s.get("files_to_modify") or []):
+                        if p and p not in seen:
+                            seen.add(p)
+                            in_scope.append(p)
+
+                if in_scope:
+                    wdiff = get_workdir_diff(
+                        project_path=wd,
+                        git_branch=git_branch,
+                        workdir=workdir,
+                        files=in_scope,
+                        max_total_chars=5_000,
+                    )
+                    if wdiff and "(no " not in wdiff and "(project is not" not in wdiff:
+                        workdir_diff_section = (
+                            f"\n## Workdir diff (in-progress changes, not yet merged)\n"
+                            "These are the changes produced by the last coding cycle "
+                            f"but not yet applied to `{git_branch}`.\n\n"
+                            f"{wdiff}\n"
+                        )
+                        self.log(f"  ✓ Workdir diff included ({len(wdiff)} chars)", "info")
+            except Exception as exc:
+                self.log(f"  [WARN] Workdir diff failed: {exc}", "warn")
+
         executor = self._make_planning_executor(wd)
         msg = (
             f"CORRECTIONS TO APPLY:\n{self.task.corrections}\n\n"
             f"Original spec:\n{spec_content[:1000]}\n\n"
             f"Existing subtask statuses:\n{subtask_summary}\n\n"
             f"Existing implementation_plan.json:\n{existing_plan[:2000]}\n\n"
-            f"Project files (valid for files_to_modify):\n{existing_files}\n\n"
-            f"Write updated implementation_plan.json to: {self._rel(plan_path)}\n\n"
+            f"Project files (valid for files_to_modify):\n{existing_files}\n"
+            + applied_diff_section
+            + workdir_diff_section
+            + f"\nWrite updated implementation_plan.json to: {self._rel(plan_path)}\n\n"
             "RULES:\n"
             "1. Keep all subtasks with status='done' EXACTLY as they are.\n"
             "2. For pending subtasks: update them if the corrections affect them.\n"
             "3. Add NEW subtasks only for corrections that are not covered by existing subtasks.\n"
             "4. Do NOT re-do work already marked done — only add/fix what the corrections require.\n"
             "5. files_to_modify must only contain paths from the project files list above.\n"
+            "6. Study the diffs above carefully — do not create tasks for changes already present.\n"
         )
 
         def validate():
@@ -1981,6 +2043,34 @@ Be concrete and specific. Return ONLY the JSON, no other text.
             f"{len(missing)} not found",
             "ok" if not missing else "warn",
         )
+
+        # ═══════════════════════════════════════════════════════════
+        # НОВОЕ: Создаём пустые заглушки для каждого файла из
+        # files_to_create, которого ещё нет в workdir.
+        # Это необходимо, чтобы фаза Кодинга (с new_files_allowed=False)
+        # могла записывать в эти файлы через write_file — sandbox
+        # проверяет, что файл уже существует перед разрешением записи.
+        # ═══════════════════════════════════════════════════════════
+        stubs_created: list[str] = []
+        for subtask in self.task.subtasks:
+            for new_file in subtask.get("files_to_create", []):
+                if not new_file:
+                    continue
+                dest_file = os.path.join(workdir, new_file)
+                if not os.path.exists(dest_file):
+                    os.makedirs(os.path.dirname(dest_file), exist_ok=True)
+                    # Пустая заглушка — Coding фаза перезапишет полным содержимым
+                    open(dest_file, "w", encoding="utf-8").close()
+                    stubs_created.append(new_file)
+                    self.log(f"  ✦ stub created → workdir/{new_file}", "info")
+
+        if stubs_created:
+            self.log(
+                f"  Created {len(stubs_created)} stub file(s) for files_to_create "
+                f"(Coding phase will overwrite them with real content)",
+                "ok",
+            )
+
         return True   # missing files are warned but don't block coding
 
     # ── Helpers ───────────────────────────────────────────────────

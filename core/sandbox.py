@@ -30,11 +30,15 @@ PLANNING_ALLOWED_FILES = {
 }
 
 class Sandbox:
-    def __init__(self, task_dir: str, project_path: str):
-        self.task_dir     = os.path.abspath(task_dir)
-        self.project_path = os.path.abspath(project_path)
-        self.workdir      = os.path.join(self.task_dir, WORKDIR_NAME)
-        self._task_number = self._extract_task_number(task_dir)
+    def __init__(self, task_dir: str, project_path: str, new_files_allowed: bool = True):
+        self.task_dir         = os.path.abspath(task_dir)
+        self.project_path     = os.path.abspath(project_path)
+        self.workdir          = os.path.join(self.task_dir, WORKDIR_NAME)
+        self._task_number     = self._extract_task_number(task_dir)
+        # When False (Coding phase): write_file is blocked for paths that do
+        # not already exist in workdir.  Planning pre-creates stub files for
+        # every files_to_create entry, so the model can still overwrite them.
+        self.new_files_allowed = new_files_allowed
 
     def _extract_task_number(self, task_dir: str) -> int:
         m = re.match(r'task_(\d+)', os.path.basename(task_dir))
@@ -79,8 +83,22 @@ class Sandbox:
         # значит это Planning фаза - разрешаем только файлы планирования
         # ═══════════════════════════════════════════════════════════
         
-        # Если путь внутри workdir - всегда разрешаем (Coding/QA фаза)
+        # Если путь внутри workdir — проверяем разрешение на создание новых файлов
         if target_abs.startswith(self.workdir + os.sep) or target_abs == self.workdir:
+            # ═══════════════════════════════════════════════════════════
+            # НОВАЯ ПРОВЕРКА: В фазе Кодинга запрещено создавать новые
+            # файлы — только изменять уже существующие в workdir.
+            # Planning-фаза обязана заранее создать заглушки для всех
+            # files_to_create (шаг 1.7 _step7_prepare_workdir).
+            # ═══════════════════════════════════════════════════════════
+            if not self.new_files_allowed and not os.path.exists(target_abs):
+                rel = os.path.relpath(target_abs, self.workdir).replace(os.sep, "/")
+                return False, (
+                    f"Write blocked: cannot create new file '{rel}' during Coding phase. "
+                    f"Only files pre-created in workdir by the Planning phase may be written. "
+                    f"If this file should exist, it must be listed in 'files_to_create' in the "
+                    f"implementation plan — Planning will then create an empty stub for it in workdir."
+                )
             return True, "OK"
         
         # Путь внутри task_dir, но ВНЕ workdir - это Planning файлы
@@ -142,5 +160,5 @@ class Sandbox:
         return True, "OK"
 
 
-def create_sandbox(task_dir: str, project_path: str) -> Sandbox:
-    return Sandbox(task_dir, project_path)
+def create_sandbox(task_dir: str, project_path: str, new_files_allowed: bool = True) -> Sandbox:
+    return Sandbox(task_dir, project_path, new_files_allowed=new_files_allowed)

@@ -7,6 +7,7 @@ from core.state import AppState, KanbanTask
 from core.tools import ToolExecutor, QA_REVIEWER_TOOLS  # Only reviewer tools, no fixer!
 from core.sandbox import WORKDIR_NAME
 from core.phases.base import BasePhase
+from core.git_utils import get_workdir_diff
 
 # Hard caps — prevent runaway loops
 MAX_REVIEWER_ITERATIONS = 4  # outer loops inside run_loop for the reviewer
@@ -36,9 +37,18 @@ class QAPhase(BasePhase):
         scope_summary = self._build_scope_summary()
         self.log(f"  Scope: {len(self.task.subtasks)} subtasks", "info")
 
+        # ── Compute diff against target branch ───────────────────────────
+        # This gives reviewers an at-a-glance view of exactly what the patch
+        # will apply to the target branch, making issues much easier to spot.
+        branch_diff = self._get_workdir_diff()
+        if branch_diff and "(no " not in branch_diff and "(project is not" not in branch_diff:
+            self.log("  ✓ Branch diff computed for review context", "info")
+        else:
+            self.log("  ℹ Branch diff not available (non-git project or no changes)", "info")
+
         # ── Single read-only review (NO fix cycles) ───────────────────────
         self.log("─── QA Review ───")
-        verdict, all_issues, summary = self._review(model, scope_summary, [])
+        verdict, all_issues, summary = self._review(model, scope_summary, [], branch_diff)
         
         subtask_passed = (verdict == "PASS")
         
@@ -96,7 +106,7 @@ class QAPhase(BasePhase):
 
         # ── Task-goal verification (did we actually solve what was asked?) ─
         self.log("─── QA Goal Verification ───")
-        goal_passed, goal_issues = self._verify_task_goal(model)
+        goal_passed, goal_issues = self._verify_task_goal(model, branch_diff)
 
         # ── Final verdict combines all checks ──────────────────────────
         final_passed = tests_ok and subtask_passed and checklist_passed and user_flow_passed and system_flow_passed and goal_passed
@@ -125,7 +135,8 @@ class QAPhase(BasePhase):
 
     # ── Review ────────────────────────────────────────────────────────
     def _review(
-        self, model: str, scope_summary: str, prior_issues: list[str]
+        self, model: str, scope_summary: str, prior_issues: list[str],
+        branch_diff: str = "",
     ) -> tuple[str, list[str], str]:
         workdir = os.path.join(self.task.task_dir, WORKDIR_NAME)
         executor = self._make_executor(workdir)
@@ -157,19 +168,32 @@ class QAPhase(BasePhase):
                     except Exception:
                         pass
 
+        # Include diff section when available — gives reviewer a precise view
+        # of what will land on the target branch.
+        diff_section = ""
+        if branch_diff and "(no " not in branch_diff and "(project is not" not in branch_diff:
+            diff_section = (
+                f"\n\n## DIFF vs target branch `{self.task.git_branch}`\n"
+                f"This is the exact patch that will be applied.  "
+                f"Use it to verify correctness and completeness.\n\n"
+                f"{branch_diff}\n"
+            )
+
         msg = (
             f"Task: {self.task.title}\n"
             f"Description: {self.task.description}\n\n"
             f"Files in scope:\n{scope_summary}\n"
             + (f"\nFile contents for review:\n{file_previews}" if file_previews else "")
+            + diff_section
             + f"\nSubtasks to verify:\n{subtask_detail}"
             + prior_note
             + "\n\nInstructions:\n"
-            "1. Review the file contents shown above (or use read_file if needed).\n"
+            "1. Review the file contents and diff shown above (or use read_file if needed).\n"
             "2. Check EVERY subtask's completion condition against the actual content.\n"
             "3. Look specifically for: undefined variables, wrong function signatures, "
             "references to classes/functions that don't exist in the codebase.\n"
-            "4. You MUST call submit_qa_verdict — this is REQUIRED to complete the review.\n"
+            "4. If a diff is provided: verify the changes are minimal, correct, and complete.\n"
+            "5. You MUST call submit_qa_verdict — this is REQUIRED to complete the review.\n"
             "   PASS: all conditions met and no code errors found.\n"
             "   FAIL: list each issue as: file:line — what is wrong — what is expected."
         )
@@ -210,7 +234,7 @@ class QAPhase(BasePhase):
             "(no file scope defined — review task directory only)"
 
     # ── Task-goal verification ────────────────────────────────────────
-    def _verify_task_goal(self, model: str) -> tuple[bool, list[str]]:
+    def _verify_task_goal(self, model: str, branch_diff: str = "") -> tuple[bool, list[str]]:
         """
         Ask Ollama: 'Does the sum of changes actually solve the original task?'
         Reads requirements.json / spec.json from the task planning dir and the
@@ -259,6 +283,15 @@ class QAPhase(BasePhase):
                     content = _read(full, maxlen=1200)
                     file_previews += f"\n=== {fpath} ===\n{content}\n"
 
+        # Include diff for goal verification — makes it much easier to judge completeness
+        diff_section = ""
+        if branch_diff and "(no " not in branch_diff and "(project is not" not in branch_diff:
+            diff_section = (
+                f"\n\nDiff vs target branch `{self.task.git_branch}` "
+                f"(exact changes that will land on the branch):\n\n"
+                f"{branch_diff}\n"
+            )
+
         msg = (
             f"TASK GOAL VERIFICATION\n"
             f"======================\n"
@@ -267,10 +300,11 @@ class QAPhase(BasePhase):
             f"Acceptance criteria (from requirements.json):\n"
             f"{acceptance_criteria or '(none defined)'}\n\n"
             f"Spec summary:\n{spec_content}\n\n"
-            f"Implemented files:\n{file_previews or '(none)'}\n\n"
-            "Instructions:\n"
+            f"Implemented files:\n{file_previews or '(none)'}\n"
+            + diff_section
+            + "\nInstructions:\n"
             "1. Read the task description and acceptance criteria carefully.\n"
-            "2. Review what was actually implemented in the files above.\n"
+            "2. Review what was actually implemented in the files (and diff) above.\n"
             "3. Determine if EVERY acceptance criterion is met by the implementation.\n"
             "4. Do NOT check code style — only check functional completeness.\n"
             "5. You MUST call submit_qa_verdict:\n"
@@ -639,6 +673,38 @@ EVIDENCE: [what code you found or what's missing]
                 all_passed = False
         
         return all_passed, failed_steps
+
+    # ── Branch diff helper ────────────────────────────────────────────
+    def _get_workdir_diff(self) -> str:
+        """
+        Compute unified diff between workdir files and the target git branch.
+
+        Returns a formatted diff string ready to inject into review prompts,
+        or an informational message when git / diff is unavailable.
+        """
+        workdir      = os.path.join(self.task.task_dir, WORKDIR_NAME)
+        project_path = self.task.project_path or self.state.working_dir
+        git_branch   = self.task.git_branch or "main"
+
+        # Collect all in-scope files (created + modified by all subtasks)
+        files_in_scope: list[str] = []
+        seen: set[str] = set()
+        for subtask in self.task.subtasks:
+            for path in (subtask.get("files_to_create") or []) + \
+                        (subtask.get("files_to_modify") or []):
+                if path and path not in seen:
+                    seen.add(path)
+                    files_in_scope.append(path)
+
+        if not files_in_scope:
+            return "(no in-scope files to diff)"
+
+        return get_workdir_diff(
+            project_path=project_path,
+            git_branch=git_branch,
+            workdir=workdir,
+            files=files_in_scope,
+        )
 
     # ── Tests ─────────────────────────────────────────────────────────
     def _run_tests(self) -> bool:

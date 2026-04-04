@@ -202,6 +202,7 @@ class CodingPhase(BasePhase):
 
         executor = self._make_executor(
             workdir,
+            new_files_allowed=False,   # Coding phase: only workdir stubs created by Planning
             on_task_confirmed=on_confirmed,
             on_file_written=on_write_made,
         )

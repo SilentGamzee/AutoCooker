@@ -667,13 +667,18 @@ Token count: {token_count} / {config['max_total_tokens']}
             return f"(Could not read {file_path}: {e})"
 
     # ── Executor factory ─────────────────────────────────────────
-    def _make_executor(self, wd: str, **kwargs) -> "ToolExecutor":
+    def _make_executor(self, wd: str, new_files_allowed: bool = True, **kwargs) -> "ToolExecutor":
         """
         Create a ToolExecutor pre-wired with:
         - the global FileCache (path index)
         - on_content_cached → updates task.file_contents (per-task cache)
         - log_fn → self.log (so auto-reads appear as log entries)
         - sandbox for the current task
+
+        new_files_allowed=False is used by the Coding phase to prevent the
+        model from writing files that were not pre-created in workdir by
+        Planning (step 1.7).  Pass False only for subtask execution loops.
+
         Extra kwargs are forwarded as-is (e.g. on_task_confirmed).
         """
         from core.tools import ToolExecutor
@@ -693,6 +698,7 @@ Token count: {token_count} / {config['max_total_tokens']}
             sandbox=create_sandbox(
                 task.task_dir,
                 task.project_path or self.state.working_dir,
+                new_files_allowed=new_files_allowed,
             ),
             **kwargs,
         )
