@@ -49,26 +49,19 @@ class BasePhase:
 
     # ── Gevent-safe eel dispatcher ────────────────────────────────
     @staticmethod
+    @staticmethod
     def _gevent_safe(fn):
-        """Schedule fn() inside gevent's event loop (thread-safe)."""
-        try:
-            import gevent as _gevent
-            # Try to spawn in gevent greenlet
-            _gevent.spawn(fn)
-        except ImportError:
-            # gevent not available - call directly
-            try:
-                fn()
-            except Exception as e:
-                # Log to console if eel call fails
-                print(f"[GEVENT] Direct call failed: {type(e).__name__}: {e}", flush=True)
-        except Exception as e:
-            # gevent.spawn failed - try direct call as fallback
-            print(f"[GEVENT] spawn failed: {type(e).__name__}: {e}, trying direct call", flush=True)
-            try:
-                fn()
-            except Exception as e2:
-                print(f"[GEVENT] Direct call also failed: {type(e2).__name__}: {e2}", flush=True)
+        """
+        Schedule fn() to run inside the main gevent event loop (thread-safe).
+
+        Uses eel_bridge which attaches an async_ watcher to the main hub.
+        watcher.send() is the only gevent mechanism that is truly safe to call
+        from any OS thread, including a plain threading.Thread.
+
+        Falls back to gevent.spawn() if the bridge was not initialised.
+        """
+        from core.eel_bridge import call as _bridge_call
+        _bridge_call(fn)
 
     # ── Logging ──────────────────────────────────────────────────
     def log(self, msg: str, log_type: Optional[str] = None):
@@ -940,8 +933,6 @@ Token count: {token_count} / {config['max_total_tokens']}
                         "You MUST call the write_file tool in your response."
                     )
 
-                self.log(f"[DEBUG] {retry_msg}", "info")
-                
                 # ── RESET messages for the next outer iteration ────────────
                 # Do NOT append retry_msg to the existing (potentially huge)
                 # messages list.  Instead, start a fresh conversation that
