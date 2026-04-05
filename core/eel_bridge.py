@@ -51,18 +51,29 @@ def setup() -> None:
         hub = gevent.get_hub()
         w = hub.loop.async_()
 
-        def _drain(watcher, revents):
-            """Called by the main hub when watcher.send() wakes it up."""
+        def _drain(*_args):
+            """
+            Called IN the hub's own greenlet when watcher.send() fires.
+
+            IMPORTANT: do NOT call fn() directly here.
+            The hub's greenlet cannot yield to itself — any blocking gevent
+            operation inside fn() (e.g. eel's WebSocket send via gevent socket)
+            would deadlock or crash the event loop.
+
+            Instead, spawn each fn as a NEW greenlet so it runs in a proper
+            context where yielding is allowed.
+            """
+            import gevent as _g
             while _queue:
                 try:
                     fn = _queue.popleft()
-                    fn()
                 except IndexError:
                     break
+                try:
+                    _g.spawn(fn)
                 except Exception as exc:
                     print(
-                        f"[EEL_BRIDGE] callback raised "
-                        f"{type(exc).__name__}: {exc}",
+                        f"[EEL_BRIDGE] spawn failed: {type(exc).__name__}: {exc}",
                         flush=True,
                     )
 

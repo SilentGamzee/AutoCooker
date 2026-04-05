@@ -21,6 +21,7 @@ import eel
 
 from core.state import AppState, KanbanTask, COLUMNS, TaskAbortedError
 from core.ollama_client import OllamaClient, shutdown_all_clients
+from core.eel_bridge import call as _eel_bridge_call, setup as _eel_bridge_setup
 from core.phases.planning import PlanningPhase
 from core.phases.coding import CodingPhase
 from core.phases.qa import QAPhase
@@ -120,21 +121,10 @@ def _slug(title: str) -> str:
 
 def _gevent_safe(fn):
     """
-    Schedule fn() to run inside gevent's event loop.
-
-    eel's WebSocket is NOT thread-safe for writes from real OS threads.
-    On Windows with Python 3.12, gevent does not monkeypatch threading.Thread
-    into greenlets — the pipeline runs as a real OS thread. Calling eel.*()
-    directly from that thread corrupts the WebSocket and triggers _detect_shutdown.
-
-    gevent.spawn() queues fn as a new greenlet in the hub. This is thread-safe:
-    the hub picks it up and executes it inside the event loop on the next iteration.
+    Schedule fn() to run inside the main gevent event loop (thread-safe).
+    Uses eel_bridge.call() — the only safe mechanism for OS threads on Windows.
     """
-    try:
-        import gevent as _gevent
-        _gevent.spawn(fn)
-    except Exception:
-        fn()   # fallback if gevent not available (tests, etc.)
+    _eel_bridge_call(fn)
 
 
 def _push_board():
@@ -977,11 +967,26 @@ def get_workdir_diff(task_id: str) -> dict:
     }
 
 def on_eel_close(route, websockets):
-    """Вызывается eel когда браузер закрывается."""
-    if not websockets:          # последняя вкладка закрыта
-        shutdown_all_clients()  # no-op, но eel не выйдет сам!
-        # ← СЮДА нужно добавить:
-        sys.exit(0)
+    """
+    Called by eel when the browser window closes (or refreshes).
+
+    Behaviour:
+      - Pipeline NOT running → exit immediately via os._exit(0)
+      - Pipeline IS running  → just return; eel will call sys.exit() next,
+        which our except SystemExit block catches and waits for completion
+    """
+    if not websockets:
+        if not _PIPELINE_RUNNING:
+            import os as _os
+            print("[EEL] Browser closed, no pipeline running — exiting.", flush=True)
+            _os._exit(0)
+        # Pipeline is running — let eel's sys.exit() propagate to the
+        # except SystemExit handler below, which waits for the task to finish.
+        print(
+            "[EEL] Browser closed while pipeline is running — "
+            "task will complete in the background. Reopen the browser to reconnect.",
+            flush=True,
+        )
 
 @eel.expose
 def merge_workdir(task_id: str) -> dict:
@@ -1059,15 +1064,38 @@ if __name__ == "__main__":
     except (AttributeError, OSError):
         pass   # SIGUSR1 not available on Windows — that's fine
 
+    # Initialise the thread-safe eel bridge BEFORE starting the server.
+    # This attaches an async_ watcher to the main hub so OS threads (the
+    # pipeline's threading.Thread) can safely call eel.* functions.
+    _eel_bridge_setup()
+
     try:
         eel.start("index.html", size=(1400, 900), port=8765, block=True, close_callback=on_eel_close)
     except SystemExit:
-        # eel calls sys.exit() on browser disconnect — print all thread stacks
-        print("\n[EEL] Server stopped (browser disconnected or window closed).", flush=True)
-        print("[EEL] Active thread stacks at shutdown:", flush=True)
-        faulthandler.dump_traceback()
+        # eel calls sys.exit() after the close_callback returns.
+        # If a pipeline is running, wait for it to complete before exiting
+        # so the task is not killed mid-execution.
+        if _PIPELINE_RUNNING:
+            print(
+                "\n[EEL] Browser disconnected — pipeline is still running in background.\n"
+                "       Waiting for task to complete before exiting…\n"
+                "       (Press Ctrl+C to force-quit and lose task progress)",
+                flush=True,
+            )
+            try:
+                while _PIPELINE_RUNNING:
+                    time.sleep(2)
+                print("[EEL] Pipeline finished — exiting cleanly.", flush=True)
+            except KeyboardInterrupt:
+                print("\n[EEL] Force-quit requested.", flush=True)
+        else:
+            print("\n[EEL] Browser disconnected — exiting.", flush=True)
+        import os as _os
+        _os._exit(0)
     except KeyboardInterrupt:
         print("\n[EEL] Keyboard interrupt — shutting down.", flush=True)
+        import os as _os
+        _os._exit(0)
     except BaseException as e:
         print(f"\n[EEL CRASH] {type(e).__name__}: {e}", flush=True)
         traceback.print_exc()
