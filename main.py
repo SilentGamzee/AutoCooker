@@ -979,7 +979,9 @@ def get_workdir_diff(task_id: str) -> dict:
 def on_eel_close(route, websockets):
     """Вызывается eel когда браузер закрывается."""
     if not websockets:          # последняя вкладка закрыта
-        shutdown_all_clients()  # прерывает все HTTP-запросы к Ollama
+        shutdown_all_clients()  # no-op, но eel не выйдет сам!
+        # ← СЮДА нужно добавить:
+        sys.exit(0)
 
 @eel.expose
 def merge_workdir(task_id: str) -> dict:

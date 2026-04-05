@@ -153,7 +153,7 @@ class KanbanTask:
     # Human corrections for re-run (set from UI when task is done/human_review)
     corrections: str = ""
     # Iteration limit: pipeline re-runs up to this many times if QA fails
-    max_iterations: int = 3
+    max_iterations: int = 6
     # Which iteration we are currently on (1-based, updated at runtime)
     current_iteration: int = 0
     
@@ -172,8 +172,8 @@ class KanbanTask:
     # ══════════════════════════════════════════════════════
     # Iterative subtask execution
     # ══════════════════════════════════════════════════════
-    subtask_max_loops: int = 3
-    max_patches: int = 2
+    subtask_max_loops: int = 6
+    max_patches: int = 10
     patch_count: int = 0
     last_executed_subtask_id: str = ""
     
