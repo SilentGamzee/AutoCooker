@@ -908,7 +908,7 @@ def get_cached_file_content(task_id: str, rel_path: str) -> str | None:
 # ─── Git / Workdir API ────────────────────────────────────────────
 
 @eel.expose
-def get_workdir_diff(task_id: str) -> dict:
+def get_task_workdir_diff(task_id: str) -> dict:
     """Return unified diff between workdir files and project files."""
     import subprocess
     task = STATE.get_task(task_id)

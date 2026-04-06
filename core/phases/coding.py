@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import subprocess
 
+from core.dumb_util import get_dumb_task_workdir_diff
 from core.state import AppState, KanbanTask
 from core.sandbox import WORKDIR_NAME
 from core.tools import ToolExecutor, CODING_TOOLS
@@ -22,7 +23,6 @@ class CodingPhase(BasePhase):
         self.log("═══ CODING PHASE START ═══")
         model = self.task.models.get("coding") or "llama3.1"
 
-        self._step1_scripts_dir()
         overall_ok = self._step2_execute_tasks(model)
         self._step3_readme(model)
         self._step4_tests()
@@ -30,17 +30,6 @@ class CodingPhase(BasePhase):
 
         self.log("═══ CODING PHASE COMPLETE ═══")
         return overall_ok
-
-    # ── 2.1 Scripts dir ───────────────────────────────────────────
-    def _step1_scripts_dir(self):
-        self.log("─── Step 2.1: Scripts directory ───")
-        scripts_dir = os.path.join(self.task.task_dir, "scripts")
-        os.makedirs(scripts_dir, exist_ok=True)
-        self.state.cache.update_file_paths(
-            self.task.project_path or self.state.working_dir
-        )
-        self.log(f"  Created: {scripts_dir}", "ok")
-        self.set_step("2.1 Scripts dir")
 
     # ── 2.2 Execute subtasks ───────────────────────────────────────
     def _step2_execute_tasks(self, model: str) -> bool:
@@ -278,25 +267,18 @@ class CodingPhase(BasePhase):
         #   - making unnecessary changes outside the task scope
         branch_diff_section = ""
         try:
-            diff_files = list(dict.fromkeys(files_to_modify + files_to_create))
+            diff = get_dumb_task_workdir_diff(self.state, self.task.id)
+            diff_files = diff.get("files", [])
             if diff_files:
-                diff_text = get_workdir_diff(
-                    project_path=wd,
-                    git_branch=self.task.git_branch or "main",
-                    workdir=workdir,
-                    files=diff_files,
-                    max_total_chars=4_000,
+                branch_diff_section = (
+                    f"\n## Current diff vs branch `{self.task.git_branch or 'main'}`\n"
+                    "This shows what has already changed in workdir relative to the target branch."
+                    "Only make changes BEYOND what is already here.\n\n"
+                    f"{diff_files}\n"
                 )
-                if diff_text and "(no " not in diff_text and "(project is not" not in diff_text:
-                    branch_diff_section = (
-                        f"\n## Current diff vs branch `{self.task.git_branch or 'main'}`\n"
-                        "This shows what has already changed in workdir relative to the "
-                        "target branch.  Only make changes BEYOND what is already here.\n\n"
-                        f"{diff_text}\n"
-                    )
         except Exception as _diff_exc:
             pass  # diff is informational — never block execution
-
+        
         msg = (
             (
                 f"=== ALREADY COMPLETED IN THIS SESSION ===\n"

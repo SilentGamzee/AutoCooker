@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import time
+from core.dumb_util import get_dumb_task_workdir_diff
 
 import eel  # For UI updates via websocket
 
@@ -1868,16 +1869,16 @@ Be concrete and specific. Return ONLY the JSON, no other text.
         # it only creates tasks for genuinely missing / broken work.
         applied_diff_section = ""
         try:
-            applied_diff = get_branch_diff(wd, git_branch, max_chars=6_000)
-            if applied_diff and "(no changes" not in applied_diff and \
-               "(project is not" not in applied_diff:
+            diff = get_dumb_task_workdir_diff(self.state, self.task.id)
+            diff_files = diff.get("files", [])
+            if diff_files:
                 applied_diff_section = (
                     f"\n## Already-applied changes (git diff `{git_branch}`..HEAD)\n"
                     "These changes are already in the repo.  "
                     "Do NOT create tasks that re-implement what you see here.\n\n"
-                    f"```diff\n{applied_diff}\n```\n"
+                    f"```diff\n{diff_files}\n```\n"
                 )
-                self.log(f"  ✓ Branch diff included ({len(applied_diff)} chars)", "info")
+                self.log(f"  ✓ Branch diff included ({len(diff_files)} chars)", "info")
         except Exception as exc:
             self.log(f"  [WARN] Branch diff failed: {exc}", "warn")
 

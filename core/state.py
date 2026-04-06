@@ -112,6 +112,9 @@ class FileCache:
 
     def get_content(self, rel_path: str) -> Optional[str]:
         return self.file_contents.get(rel_path)
+    
+    def get_all_contents(self) -> dict[str, str]:
+        return self.file_contents.copy()
 
     def paths_summary(self) -> str:
         return "\n".join(self.file_paths) if self.file_paths else "(no files cached yet)"

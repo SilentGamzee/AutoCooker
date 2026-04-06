@@ -411,7 +411,6 @@ EXPLANATION: [your explanation]
             try:
                 response = self.ollama.complete(
                     model=model,
-                    system="You are a QA engineer verifying requirements against implementation.",
                     prompt=prompt,
                     max_tokens=6000
                 )
@@ -442,6 +441,8 @@ EXPLANATION: [your explanation]
                     
             except Exception as e:
                 self.log(f"    ⚠️ Verification error: {e}", "warn")
+                import traceback
+                traceback.print_exc()
                 req_dict["status"] = "error"
                 req_dict["explanation"] = f"Verification failed: {e}"
                 all_passed = False
@@ -604,7 +605,6 @@ REASON: [brief explanation]
             try:
                 response = self.ollama.complete(
                     model=model,
-                    system="You verify user flow steps against implementation.",
                     prompt=prompt,
                     max_tokens=6000
                 )
@@ -622,6 +622,8 @@ REASON: [brief explanation]
                     
             except Exception as e:
                 self.log(f"    ⚠️ Verification error: {e}", "warn")
+                import traceback
+                traceback.print_exc()
                 all_passed = False
         
         return all_passed, failed_steps
@@ -673,7 +675,6 @@ EVIDENCE: [what code you found or what's missing]
             try:
                 response = self.ollama.complete(
                     model=model,
-                    system="You verify system data processing against implementation.",
                     prompt=prompt,
                     max_tokens=6000
                 )
@@ -691,6 +692,8 @@ EVIDENCE: [what code you found or what's missing]
                     
             except Exception as e:
                 self.log(f"    ⚠️ Verification error: {e}", "warn")
+                import traceback
+                traceback.print_exc()
                 all_passed = False
         
         return all_passed, failed_steps
@@ -797,11 +800,6 @@ OUT_OF_SCOPE:
             try:
                 response = self.ollama.complete(
                     model=model,
-                    system=(
-                        "You are a senior code reviewer. "
-                        "Your job is to detect changes that go beyond the stated task scope. "
-                        "Be strict but fair — only flag genuinely out-of-scope changes."
-                    ),
                     prompt=prompt,
                     max_tokens=2000,
                 )

@@ -1086,7 +1086,7 @@ let _diffData = [];
 
 async function showDiff() {
   if (!activeTaskId) return;
-  const res = await eel.get_workdir_diff(activeTaskId)();
+  const res = await eel.get_task_workdir_diff(activeTaskId)();
   if (!res.ok) { alert('Error: ' + res.error); return; }
 
   _diffData = res.files || [];

@@ -31,22 +31,54 @@ The file MUST start with `{` and end with `}`. No tables, no markdown, ONLY JSON
 1. `project_index.json` — tech stack, services, entry points, commands
 2. `context.json` — relevant files, patterns, existing implementations
 
-**You MUST call write_file for BOTH files. If either is missing, this phase fails.**
+**You MUST eventually call write_file for BOTH files, but each response must still include exactly one write_file call and update the current snapshot progressively.**
 
-## ⚠️ CRITICAL REQUIREMENT: EVERY RESPONSE MUST CALL A TOOL
+## ⚠️ CRITICAL REQUIREMENT: TOOL CALLS AND WRITE-THROUGH CHECKPOINTS
 
-**YOU MUST CALL AT LEAST ONE TOOL IN EVERY SINGLE RESPONSE.**
+You MUST call at least one tool in every response.
 
 Valid tool calls during Discovery phase:
 - `list_directory` - to explore project structure
 - `read_file` - to inspect files and understand the codebase
-- `write_file` - to create project_index.json and context.json
+- `write_file` - to persist the current incremental snapshot of project_index.json or context.json
 
-❌ **FORBIDDEN**: Responding with ONLY text (explanations, descriptions, analysis)
-✅ **REQUIRED**: Every response must include at least one tool call
+Rules:
+- Every response MUST include exactly one `write_file` call.
+- The `write_file` call must persist the latest merged snapshot of the file that is currently being built.
+- Update the JSON progressively as new files are read or new structure is discovered.
+- Do NOT wait until the end to write everything at once.
+- If both JSON files need changes, write the one that is most complete or most affected by the new evidence in this response.
+- Never mix multiple `write_file` calls in the same response.
+- You MAY batch multiple `read_file` and `list_directory` calls before the single `write_file` call in the same response.
+- If no new information was discovered, still write the latest valid snapshot again.
+
+## ⚠️ CRITICAL REQUIREMENT: TOOL CALL BATCHING
+- You MUST include at least one tool call in every response.
+- You SHOULD batch as many `read_file` and `list_directory` calls as needed into a single response.
+- Never mix multiple `write_file` calls in the same response.
+
+## ⚠️ CRITICAL REQUIREMENT: DEDUPLICATE READS USING TOOL HISTORY
+Before calling any `read_file` or `list_directory`, always inspect the provided `History of tool calls:`.
+
+- If the same file or directory was already read/listed, DO NOT call it again.
+- Re-reading the same path is allowed only if:
+  - the previous call failed,
+  - the previous result was incomplete/truncated,
+  - or a different path is being read.
+- Treat exact path matches as already processed.
+- Prefer expanding coverage to new files/directories instead of repeating the same reads.
+- This rule applies within the current conversation turn and across prior turns when the history shows the path was already accessed.
+
+## ⚠️ CRITICAL REQUIREMENT: INCREMENTAL MERGE FROM READ RESULTS
+Any new information from `read_file` or `list_directory` must be merged into the current JSON snapshot before writing.
+
+Rules:
+- Do not overwrite earlier discoveries with partial data.
+- Preserve existing valid fields when adding new ones.
+- If a file was already read in `Read files from last call:`, use that content directly instead of reading again.
+- The write step must reflect everything known so far, not only the latest file.
 
 ## ⚠️ CRITICAL: JSON FILES - NO COMMENTS ALLOWED
-
 When writing JSON files (project_index.json, context.json):
 
 ❌ **ABSOLUTELY FORBIDDEN**:
@@ -74,8 +106,8 @@ If you need to explain something - do it in a separate text response BEFORE call
 Then call write_file with PURE JSON only.
 
 If a write fails or validation fails:
-1. **DO NOT** just explain what went wrong in text
-2. **DO** immediately call write_file again with corrected path/content
+1. DO NOT just explain what went wrong in text
+2. DO immediately call ONE `write_file` again with corrected path/content
 3. Use the exact paths provided in the error message
 
 **Example of correct behavior when blocked:**
@@ -98,7 +130,7 @@ Call `list_directory` on:
 - Configuration directories
 
 ### Step 2: Read entry points and config files
-Call `read_file` on EVERY file that matches:
+Call `read_file` on every file that matches the list below, but only if it has not already appeared in `History of tool calls:` or has not yet been fully read:
 - `main.py`, `app.py`, `index.ts`, `index.js`, `server.py`, `manage.py`
 - `pyproject.toml`, `package.json`, `Cargo.toml`, `go.mod`
 - `.env.example`, `settings.py`, `config.py`, `config.json`

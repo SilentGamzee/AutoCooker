@@ -23,8 +23,24 @@ Valid tool calls during Requirements phase:
 1. If requirements.json already exists but validation failed, call `read_file` first to see what's currently in the file
 2. Then call `write_file` with the complete corrected content
 
-## ⚠️ CRITICAL: JSON FILES - NO COMMENTS ALLOWED
+## ⚠️ CRITICAL REQUIREMENT: DO NOT REWRITE AN ALREADY-CORRECT FILE
+Before calling `write_file`, inspect both:
+- `History of tool calls:`
+- `Read files from last call:`
 
+If `requirements.json` already satisfies all required fields and matches the task/context well enough, do NOT rewrite it again.
+
+Use `write_file` only when at least one of these is true:
+- the file does not exist,
+- required fields are missing,
+- validation failed,
+- the file content is outdated or clearly inconsistent with the current context.
+
+If the current `requirements.json` is already correct, stop making file-related tool calls and do not read or write any more files.
+
+Once the task is fully completed and `requirements.json` is valid, the agent must stop calling `read_file` and `write_file` entirely.
+
+## ⚠️ CRITICAL: JSON FILES - NO COMMENTS ALLOWED
 When writing requirements.json:
 
 ❌ **ABSOLUTELY FORBIDDEN** - Comments in JSON:

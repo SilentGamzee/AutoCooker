@@ -118,7 +118,7 @@ class BasePhase:
             )
         if cache.file_contents:
             summary = cache.contents_summary()
-            CONTENT_SUMMARY_LIMIT = 4000
+            CONTENT_SUMMARY_LIMIT = 8000
             if len(summary) > CONTENT_SUMMARY_LIMIT:
                 summary = (
                     summary[:CONTENT_SUMMARY_LIMIT]
@@ -276,7 +276,21 @@ class BasePhase:
         
         services = project_index.get("services", {})
         
-        for service_name, service_data in services.items():
+        if isinstance(services, dict):
+            service_iter = services.items()
+        elif isinstance(services, list):
+            service_iter = (
+                (
+                    item.get("service_name", f"service_{i}"),
+                    item
+                )
+                for i, item in enumerate(services)
+                if isinstance(item, dict)
+            )
+        else:
+            service_iter = []
+
+        for service_name, service_data in service_iter:
             # Защита: проверяем что service_data это dict
             if not isinstance(service_data, dict):
                 print(f"[WARN] service_data for '{service_name}' is not a dict: {type(service_data)}", flush=True)
@@ -323,7 +337,21 @@ class BasePhase:
         compact_index = []
         services = project_index.get("services", {})
         
-        for service_name, service_data in services.items():
+        if isinstance(services, dict):
+            service_iter = services.items()
+        elif isinstance(services, list):
+            service_iter = (
+                (
+                    item.get("service_name", f"service_{i}"),
+                    item
+                )
+                for i, item in enumerate(services)
+                if isinstance(item, dict)
+            )
+        else:
+            service_iter = []
+
+        for service_name, service_data in service_iter:
             # Защита: проверяем что service_data это dict
             if not isinstance(service_data, dict):
                 continue
@@ -366,7 +394,7 @@ Return ONLY the JSON array, no explanation:
 Maximum {max_files} files."""
 
         try:
-            response = self.ollama.complete(model=model, prompt=prompt, max_tokens=6000, temperature=0.0)
+            response = self.ollama.complete(model=model, prompt=prompt, max_tokens=6000)
             
             json_match = re.search(r'\[.*\]', response, re.DOTALL)
             if json_match:
@@ -449,9 +477,23 @@ Maximum {max_files} files."""
         
         services = project_index.get("services", {})
         
+        if isinstance(services, dict):
+            service_iter = services.items()
+        elif isinstance(services, list):
+            service_iter = (
+                (
+                    item.get("service_name", f"service_{i}"),
+                    item
+                )
+                for i, item in enumerate(services)
+                if isinstance(item, dict)
+            )
+        else:
+            service_iter = []
+        
         for file_path in relevant_files:
             found = False
-            for service_name, service_data in services.items():
+            for service_name, service_data in service_iter:
                 # Защита: проверяем что service_data это dict
                 if not isinstance(service_data, dict):
                     continue
@@ -563,8 +605,22 @@ Maximum {max_files} files."""
         services = project_index.get("services", {})
         print(f"[PROJECT_CONTEXT] Loaded project_index with {len(services)} service(s)", flush=True)
         
+        if isinstance(services, dict):
+            service_iter = services.items()
+        elif isinstance(services, list):
+            service_iter = (
+                (
+                    item.get("service_name", f"service_{i}"),
+                    item
+                )
+                for i, item in enumerate(services)
+                if isinstance(item, dict)
+            )
+        else:
+            service_iter = []
+        
         # Проверяем структуру
-        for service_name, service_data in services.items():
+        for service_name, service_data in service_iter:
             if not isinstance(service_data, dict):
                 print(f"[PROJECT_CONTEXT] WARNING: service '{service_name}' is {type(service_data).__name__}, expected dict", flush=True)
                 print(f"[PROJECT_CONTEXT] Value: {service_data}", flush=True)
@@ -764,13 +820,14 @@ Token count: {token_count} / {config['max_total_tokens']}
         # iteration would re-inject all cached file contents on every
         # retry, causing Ollama to re-write the same files repeatedly.
         system = self.build_system(prompt_file)
-
         # messages is RESET on every outer retry to avoid context bloat.
         # Each outer iteration starts fresh: only the initial user message
         # (optionally extended with a retry note) is sent, NOT the full
         # accumulated history of every previous failed attempt.
         messages = [{"role": "user", "content": initial_user_message}]
 
+        tool_calls = []
+        last_read_files: dict[str, dict[str, object]] = {}
         for outer in range(max_outer_iterations):
             # ── Abort checkpoint ──────────────────────────────────
             self.state.check_abort(self.task.id)
@@ -783,11 +840,14 @@ Token count: {token_count} / {config['max_total_tokens']}
                 system_len = len(system) if system else 0
                 print(f"[RUN_LOOP] Starting chat_with_tools: messages={msg_count}, system_len={system_len}, tools={len(tools)}", flush=True)
                 
-                messages, final_text, tool_calls_made = self.ollama.chat_with_tools(
+                final_text, tool_calls_made = self.ollama.chat_with_tools(
                     model=model,
                     system=system,
                     messages=messages,
                     tools=tools,
+                    tool_calls=tool_calls,
+                    last_read_files=last_read_files,
+                    validate_fn=validate_fn,
                     tool_executor=executor,
                     log_fn=self.log,
                     is_aborted=lambda: self.task.id in self.state.abort_requested,
@@ -932,6 +992,8 @@ Token count: {token_count} / {config['max_total_tokens']}
                         "REMEMBER: Describing the fix in text does NOTHING.\n"
                         "You MUST call the write_file tool in your response."
                     )
+                    
+                self.log(f"  [RETRY] Validation failed: {reason}", "warn")
 
                 # ── RESET messages for the next outer iteration ────────────
                 # Do NOT append retry_msg to the existing (potentially huge)

@@ -7,6 +7,7 @@ from typing import Callable, Optional
 import core
 from core.sandbox import create_sandbox
 from core.json_repair import repair_json
+from core.state import FileCache
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Tool schema definitions (OpenAI / Ollama format)
@@ -307,7 +308,7 @@ class ToolExecutor:
     def __init__(
         self,
         working_dir: str,
-        cache,                     # FileCache
+        cache: FileCache,
         on_task_confirmed: Optional[Callable[[str, str], None]] = None,
         on_task_created: Optional[Callable[[dict], None]] = None,
         on_file_written: Optional[Callable[[str, str], None]] = None,
@@ -516,7 +517,6 @@ class ToolExecutor:
                 self.on_content_cached(path_rel, content)
             if self.on_file_written:
                 self.on_file_written(path_rel, content)
-            self._log_auto_read(path_rel, content)
             result = f"OK: written {len(content)} chars to {path_rel}"
             if repair_note:
                 result += f"\nWARNING: {repair_note.strip()}"
@@ -552,18 +552,9 @@ class ToolExecutor:
                 self.on_content_cached(path_rel, updated)
             if self.on_file_written:
                 self.on_file_written(path_rel, updated)
-            self._log_auto_read(path_rel, updated)
             return f"OK: replaced text in {path_rel}"
         except Exception as e:
             return f"ERROR modifying file: {e}"
-
-    def _log_auto_read(self, path_rel: str, content: str):
-        """Emit a read_file log entry after a write so the cache refresh is visible."""
-        if not self.log_fn:
-            return
-        preview = content#content[:300] + ("…" if len(content) > 300 else "")
-        self.log_fn('[Tool ►] read_file({"path": "' + path_rel + '"})', "tool_read")
-        self.log_fn(f"[Tool ◄] {preview}", "tool_result")
 
     def _lint_file(self, args: dict) -> str:
         from core.linter import lint_file
