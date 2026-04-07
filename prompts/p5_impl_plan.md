@@ -221,14 +221,22 @@ Find:
 - HTML structure before JS handlers (handlers need DOM elements)
 - Core logic before integration
 
-### Step 6: For each subtask, write precise description
+### Step 6: For each subtask, write precise description AND implementation_steps
 
-The description must answer ALL of these:
+The `description` must answer ALL of these:
 1. **What file?** (exact path)
 2. **What to create/add/change?** (class name, function name, HTML element, specific logic)
 3. **What pattern to follow?** (reference file path + what to copy)
 4. **What NOT to do?** (common mistakes for this type of task)
 5. **User-visible impact?** (for frontend tasks - what user sees/does)
+
+The `implementation_steps` array is **MANDATORY** for every subtask.
+Each step must include:
+- `action` — one specific action to take (imperative sentence)
+- `code` — exact code snippet showing what to write (required for at least one step)
+- `verify_methods` — (optional) list of method/class names from other files that MUST be verified to exist before use
+
+**Before referencing any method or class from another file in `implementation_steps.code`, you MUST read that file to confirm the method/class actually exists. If it does not exist, do NOT reference it — update the description to create it first.**
 
 ---
 
@@ -255,6 +263,12 @@ The description must answer ALL of these:
           "patterns_from": ["core/state.py"],
           "completion_without_ollama": "File core/attachment.py exists AND contains '@dataclass' AND contains 'class Attachment' AND contains 'filename' AND contains 'filepath'",
           "completion_with_ollama": "The Attachment dataclass has all required fields with correct types",
+          "implementation_steps": [
+            {
+              "action": "Create file core/attachment.py with the Attachment dataclass",
+              "code": "from dataclasses import dataclass, field\nimport uuid\nfrom datetime import datetime\n\n@dataclass\nclass Attachment:\n    id: str\n    task_id: str\n    filename: str\n    filepath: str\n    uploaded_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())\n\n    def to_dict(self) -> dict:\n        return {\"id\": self.id, \"task_id\": self.task_id, \"filename\": self.filename,\n                \"filepath\": self.filepath, \"uploaded_at\": self.uploaded_at}"
+            }
+          ],
           "status": "pending"
         },
         {
@@ -267,6 +281,21 @@ The description must answer ALL of these:
           "patterns_from": ["core/state.py"],
           "completion_without_ollama": "File core/state.py contains 'save_attachment' AND contains 'get_attachments' AND contains 'delete_attachment' AND contains 'attachments: dict'",
           "completion_with_ollama": "Methods properly update the attachments dict and persist to disk",
+          "implementation_steps": [
+            {
+              "action": "Add 'from core.attachment import Attachment' import at top of core/state.py",
+              "code": "from core.attachment import Attachment",
+              "verify_methods": ["Attachment"]
+            },
+            {
+              "action": "Add attachments field to AppState dataclass body",
+              "code": "attachments: dict[str, list[Attachment]] = field(default_factory=dict)"
+            },
+            {
+              "action": "Add save_attachment, get_attachments, delete_attachment methods to AppState",
+              "code": "def save_attachment(self, task_id: str, attachment: Attachment) -> None:\n    if task_id not in self.attachments:\n        self.attachments[task_id] = []\n    self.attachments[task_id].append(attachment)\n\ndef get_attachments(self, task_id: str) -> list[Attachment]:\n    return self.attachments.get(task_id, [])\n\ndef delete_attachment(self, task_id: str, attachment_id: str) -> None:\n    self.attachments[task_id] = [\n        a for a in self.attachments.get(task_id, []) if a.id != attachment_id\n    ]"
+            }
+          ],
           "status": "pending"
         }
       ]
@@ -288,6 +317,16 @@ The description must answer ALL of these:
           "completion_without_ollama": "File web/index.html contains 'add-attachment-btn' AND contains 'attachment-input' AND contains 'attachment-list'",
           "completion_with_ollama": "Elements are in correct location within task detail section",
           "user_visible_impact": "User sees 'Add Attachment' button when viewing a task",
+          "implementation_steps": [
+            {
+              "action": "Find the task-detail-content div in web/index.html and locate where the task description ends",
+              "code": "<!-- search for: id=\"task-detail-content\" -->"
+            },
+            {
+              "action": "Insert attachment UI block AFTER the description div, BEFORE subtasks section",
+              "code": "<div class=\"attachment-section\">\n  <button id=\"add-attachment-btn\" class=\"btn-secondary\">\n    <i class=\"icon-paperclip\"></i> Add Attachment\n  </button>\n  <input type=\"file\" id=\"attachment-input\" style=\"display:none\">\n  <div id=\"attachment-list\" class=\"attachment-list\"></div>\n</div>"
+            }
+          ],
           "status": "pending"
         },
         {
@@ -301,6 +340,26 @@ The description must answer ALL of these:
           "completion_without_ollama": "File web/js/app.js contains 'handleAddAttachment' AND contains 'handleFileSelect' AND contains 'renderAttachments' AND contains 'handleDeleteAttachment'",
           "completion_with_ollama": "Functions properly interact with backend and update DOM correctly",
           "user_visible_impact": "User can click button, select file, see file appear in list, and delete files",
+          "implementation_steps": [
+            {
+              "action": "Add handleAddAttachment function that triggers the file input click",
+              "code": "function handleAddAttachment() {\n  document.getElementById('attachment-input').click();\n}"
+            },
+            {
+              "action": "Add handleFileSelect function that reads the selected file and calls eel.save_attachment",
+              "code": "async function handleFileSelect(event) {\n  const file = event.target.files[0];\n  if (!file) return;\n  const reader = new FileReader();\n  reader.onload = async (e) => {\n    await eel.save_attachment(currentTaskId, file.name, e.target.result)();\n    renderAttachments(currentTaskId);\n  };\n  reader.readAsDataURL(file);\n}",
+              "verify_methods": ["eel.save_attachment"]
+            },
+            {
+              "action": "Add renderAttachments and handleDeleteAttachment functions",
+              "code": "async function renderAttachments(taskId) {\n  const attachments = await eel.get_attachments(taskId)();\n  const list = document.getElementById('attachment-list');\n  list.innerHTML = attachments.map(a =>\n    `<div class=\"attachment-item\" data-id=\"${a.id}\">\n      <span>${a.filename}</span>\n      <button onclick=\"handleDeleteAttachment('${taskId}', '${a.id}')\">Delete</button>\n    </div>`\n  ).join('');\n}\n\nasync function handleDeleteAttachment(taskId, attachmentId) {\n  await eel.delete_attachment(taskId, attachmentId)();\n  renderAttachments(taskId);\n}",
+              "verify_methods": ["eel.get_attachments", "eel.delete_attachment"]
+            },
+            {
+              "action": "Wire event listeners: add-attachment-btn click and attachment-input change",
+              "code": "document.getElementById('add-attachment-btn').addEventListener('click', handleAddAttachment);\ndocument.getElementById('attachment-input').addEventListener('change', handleFileSelect);"
+            }
+          ],
           "status": "pending"
         },
         {
@@ -314,6 +373,12 @@ The description must answer ALL of these:
           "completion_without_ollama": "File web/css/styles.css contains '.attachment-list' AND contains '.attachment-item'",
           "completion_with_ollama": "Styles match existing UI patterns and look professional",
           "user_visible_impact": "Attachment list looks polished and matches app design",
+          "implementation_steps": [
+            {
+              "action": "Add .attachment-list and .attachment-item styles to web/css/styles.css following .task-item pattern",
+              "code": ".attachment-list {\n  margin-top: 8px;\n  padding: 4px 0;\n  border-top: 1px solid var(--border-color);\n}\n\n.attachment-item {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  padding: 4px 8px;\n  border-radius: 4px;\n}\n\n.attachment-item:hover {\n  background: var(--hover-bg);\n}"
+            }
+          ],
           "status": "pending"
         }
       ]
@@ -334,6 +399,8 @@ The description must answer ALL of these:
 6. **`patterns_from` must reference files that actually exist** (from context.json)
 7. **NEVER create a subtask that is only about validation or testing** unless tests are explicitly in the task requirements
 8. **Number of subtasks must match the complexity**: Simple → 1-3, Standard → 4-10, Complex → 8-15
+9. **`implementation_steps` is MANDATORY** — every subtask must have at least 2 steps with concrete `action` and at least one step with a `code` snippet
+10. **Verify methods before referencing** — if a step's `code` calls a method from another file, add that method name to `verify_methods` AND use `read_file` to confirm it exists before finalizing the plan
 
 ---
 
@@ -388,6 +455,20 @@ Before adding a file to `files_to_modify`:
    → If exists: Add to files_to_modify
    → If not exists: Add to files_to_create instead
 ```
+
+### Rule 6: Verify every method/class referenced in implementation_steps.code
+Before finalizing a subtask's `implementation_steps`, for every external method or class referenced in `code`:
+
+```
+implementation_steps[n].code calls: "eel.save_attachment()"
+→ "save_attachment" is referenced from another module
+✅ read_file("core/state.py") → verify "def save_attachment" exists
+   → Found: add "save_attachment" to verify_methods, keep the code
+   → Not found: Remove the call from code, create a preceding subtask to add it first
+```
+
+❌ FORBIDDEN: Writing `implementation_steps.code` that calls a method not yet confirmed to exist
+✅ REQUIRED: Every method in `verify_methods` must have been confirmed via `read_file` before plan is written
 
 ---
 

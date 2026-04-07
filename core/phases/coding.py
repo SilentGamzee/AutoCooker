@@ -12,6 +12,27 @@ from core.phases.base import BasePhase
 from core.git_utils import get_workdir_diff
 
 
+def _format_implementation_steps(steps: list) -> str:
+    """Format implementation_steps list into a readable section for the coding agent."""
+    if not steps or not isinstance(steps, list):
+        return ""
+    lines = ["Implementation Steps (follow in order):\n"]
+    for i, step in enumerate(steps, 1):
+        if not isinstance(step, dict):
+            continue
+        action = step.get("action", "").strip()
+        code = step.get("code", "").strip()
+        verify = step.get("verify_methods", [])
+        if action:
+            lines.append(f"  Step {i}: {action}")
+        if verify:
+            lines.append(f"    Verify exist before use: {', '.join(verify)}")
+        if code:
+            lines.append(f"    ```\n    {code}\n    ```")
+    lines.append("")
+    return "\n".join(lines) + "\n"
+
+
 class CodingPhase(BasePhase):
     def __init__(self, state: AppState, task: KanbanTask):
         super().__init__(state, task, "coding")
@@ -290,7 +311,8 @@ class CodingPhase(BasePhase):
             f"Subtask ID: {sid}\n"
             f"Title: {title}\n\n"
             f"Description:\n{subtask_dict.get('description', '')}\n\n"
-            f"Files to CREATE from scratch:\n"
+            + _format_implementation_steps(subtask_dict.get('implementation_steps', []))
+            + f"Files to CREATE from scratch:\n"
             + ("\n".join(f"  - {f}" for f in files_to_create) if files_to_create else "  (none)")
             + f"\n\nFiles to MODIFY (add/change specific parts only):\n"
             + ("\n".join(f"  - {f}" for f in files_to_modify) if files_to_modify else "  (none)")

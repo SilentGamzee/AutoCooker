@@ -246,6 +246,20 @@ def _validate_impl_plan(path: str, project_path: str = "") -> tuple[bool, str]:
                 sub_errors.append("missing 'completion_without_ollama'")
             if not (s.get("files_to_create") or s.get("files_to_modify")):
                 sub_errors.append("no files_to_create or files_to_modify")
+            # Validate implementation_steps
+            steps = s.get("implementation_steps", [])
+            if not steps or not isinstance(steps, list):
+                sub_errors.append(
+                    "missing 'implementation_steps' array — subtask must include step-by-step "
+                    "implementation guide with code snippets"
+                )
+            else:
+                steps_with_code = [st for st in steps if isinstance(st, dict) and st.get("code", "").strip()]
+                if len(steps_with_code) == 0:
+                    sub_errors.append(
+                        "implementation_steps must contain at least one step with 'code' snippet — "
+                        "include actual code fragments showing what to write"
+                    )
             if sub_errors:
                 errors.append(f"Subtask {s.get('id','?')}: {', '.join(sub_errors)}")
             else:
@@ -1964,6 +1978,7 @@ Be concrete and specific. Return ONLY the JSON, no other text.
                     "files_to_create": s.get("files_to_create", []),
                     "files_to_modify": s.get("files_to_modify", []),
                     "patterns_from":   s.get("patterns_from", []),
+                    "implementation_steps": s.get("implementation_steps", []),
                     # Preserve status from JSON (patch mode keeps "done" subtasks intact)
                     "status": s.get("status", "pending"),
                 })
