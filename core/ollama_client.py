@@ -338,6 +338,7 @@ class OllamaClient:
 
         _tool_calls_made = 0
         _rounds_without_write = 0
+        _dedup_count = 0          # consecutive write_file DEDUP hits this session
         _last_call = ("", "")
         _repeat_count = 0
         _files_read: set[str] = set()
@@ -372,6 +373,27 @@ class OllamaClient:
 
             for path in expired_files:
                 del last_read_files[path]
+
+            if not disable_write_nudge and _dedup_count >= 2:
+                if _dedup_count >= 3:
+                    # Model ignored the nudge — force-exit on its behalf.
+                    written_paths = list(_written_files.keys())
+                    if log_fn:
+                        log_fn(
+                            f"  [AUTO-CONFIRM] Dedup loop {_dedup_count}x — "
+                            f"forcing phase done (files already written: {written_paths})",
+                            "warn",
+                        )
+                    print(
+                        f"[AUTO-CONFIRM] Dedup loop {_dedup_count}x — exiting inner loop",
+                        flush=True,
+                    )
+                    return "", _tool_calls_made
+                nudge = (
+                    f"🚨 DEDUP LOOP: {_dedup_count} write_file calls rejected — file already written. "
+                    "Call confirm_phase_done (or confirm_task_done) NOW."
+                )
+                messages.append({"role": "user", "content": nudge})
 
             if not disable_write_nudge and _rounds_without_write >= 5:
                 already_read = ", ".join(sorted(_files_read)[:5])
@@ -564,9 +586,7 @@ class OllamaClient:
                     except Exception as e:
                         print(f"Error in log_data serialization: {e}", flush=True)
 
-                if tool_name in ("write_file", "modify_file"):
-                    _rounds_without_write = -1
-                elif tool_name == "read_file":
+                if tool_name == "read_file":
                     _path_arg = raw_args.get("path", "")
                     if _path_arg in _files_read and _rounds_without_write > 2 and log_fn:
                         log_fn(
@@ -653,9 +673,10 @@ class OllamaClient:
                         )
                         call_status = "SUCCESS"
                         _skip_execution = True
-                        print(f"[DEDUP] write_file('{_wpath}') skipped — identical content", flush=True)
+                        _dedup_count += 1
+                        print(f"[DEDUP] write_file('{_wpath}') skipped — identical content (dedup #{_dedup_count})", flush=True)
                         if log_fn:
-                            log_fn(f"  [DEDUP] write_file skipped: {_wpath} (same content)", "warn")
+                            log_fn(f"  [DEDUP] write_file skipped: {_wpath} (same content, #{_dedup_count})", "warn")
 
                 if not _skip_execution:
                     try:
@@ -700,6 +721,9 @@ class OllamaClient:
                             _wcontent = str(raw_args.get("content", ""))
                             if _wpath:
                                 _written_files[_wpath] = _wcontent
+                        if tool_name in ("write_file", "modify_file"):
+                            _rounds_without_write = -1
+                            _dedup_count = 0  # real write clears the dedup loop counter
 
                         print(f"[EXEC] Tool completed successfully: {tool_name}")
                     except Exception as e:
