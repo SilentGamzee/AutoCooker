@@ -320,6 +320,7 @@ class OllamaClient:
         """
         REPEAT_LIMIT = 4
         READ_FILE_TTL_ROUNDS = 3
+        READ_MAX_ROUNDS = 6
 
         def _truncate(value: object, limit: int = 1200) -> str:
             text = str(value)
@@ -623,7 +624,7 @@ class OllamaClient:
                     _last_call = call_key
                     _repeat_count = 1
 
-                if _rounds_without_write >= 3:
+                if _rounds_without_write >= READ_MAX_ROUNDS:
                     if log_fn:
                         log_fn(
                             f"[WARN] Called {_rounds_without_write} times without write ",
