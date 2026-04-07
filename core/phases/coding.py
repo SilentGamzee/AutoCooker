@@ -1,12 +1,13 @@
 """Coding phase — executes subtasks with strict file-write verification."""
 from __future__ import annotations
+import difflib
 import os
 import subprocess
 
 from core.dumb_util import get_dumb_task_workdir_diff
 from core.state import AppState, KanbanTask
 from core.sandbox import WORKDIR_NAME
-from core.tools import ToolExecutor, CODING_TOOLS
+from core.tools import ToolExecutor, CODING_TOOLS, CRITIC_TOOLS
 from core.validator import validate_readme
 from core.phases.base import BasePhase
 from core.git_utils import get_workdir_diff
@@ -77,7 +78,7 @@ class CodingPhase(BasePhase):
                     )
                     subtask_dict["status"] = "pending"
                     subtask_dict["current_loop"] = 0
-            
+
             # Skip if needs analysis (will be handled in Analysis phase)
             if prior_status == "needs_analysis":
                 self.log(
@@ -86,7 +87,7 @@ class CodingPhase(BasePhase):
                 )
                 all_ok = False
                 continue
-            
+
             # Skip if manually skipped or marked invalid
             if prior_status in ("skipped", "invalid"):
                 self.log(
@@ -94,87 +95,88 @@ class CodingPhase(BasePhase):
                     "info"
                 )
                 continue
-            
+
             # ══════════════════════════════════════════════════════
-            # NEW: Automatic validation before execution
+            # Automatic validation before execution
             # ══════════════════════════════════════════════════════
             valid, invalid_reason = self._validate_subtask_before_execution(subtask_dict)
             if not valid:
                 subtask_dict["status"] = "invalid"
                 subtask_dict["invalid_reason"] = invalid_reason
                 subtask_dict["invalidated_at"] = self._current_timestamp()
-                
+
                 self.log(
                     f"  ⊘ Task {sid} is invalid: {invalid_reason}. Skipping.",
                     "warn"
                 )
-                
-                # Save status and continue to next subtask
+
                 self.state.save_subtasks_for_task(self.task)
                 self.push_task()
                 continue
 
             # Task header
             self.log(f"\n  ▶ Task {sid}: {subtask_dict.get('title', '')}", "step_header")
-            
-            # Iterative execution with loop limit
-            max_loops = subtask_dict.get("max_loops", self.task.subtask_max_loops)
-            current_loop = subtask_dict.get("current_loop", 0)
+
+            # ── Critic-aware iteration loop ────────────────────────
+            max_iterations = subtask_dict.get("max_loops", self.task.subtask_max_loops)
+            critic_feedback: list[str] = []  # issues from previous critic run
             success = False
-            
-            while current_loop < max_loops and not success:
-                current_loop += 1
-                subtask_dict["current_loop"] = current_loop
+
+            for iteration in range(1, max_iterations + 1):
+                subtask_dict["current_loop"] = iteration
                 subtask_dict["status"] = "in_progress"
-                
-                # Update UI with current subtask and loop indicator
                 self.task.last_executed_subtask_id = sid
-                
-                self.log(
-                    f"  [Loop {current_loop}/{max_loops}] Attempting task {sid}...",
-                    "info"
-                )
-                
+                self.log(f"  [Iter {iteration}/{max_iterations}] Coding {sid}...", "info")
                 self.task.progress = self.task.subtask_progress()
                 self.push_task()
 
-                # Execute one attempt
-                success = self._execute_one_task(subtask_dict, model)
-                
-                if success:
-                    # Success!
+                coding_ok = self._execute_one_task(subtask_dict, model, critic_feedback)
+
+                if not coding_ok:
+                    self.log(f"  ↻ Coding failed on iter {iteration}, retrying...", "warn")
+                    critic_feedback = []
+                    continue
+
+                # Coding succeeded → run critic
+                self.log(f"  ◉ Running critic on iter {iteration}...", "info")
+                rule_issues, llm_issues = self._run_critic(subtask_dict, model)
+                all_issues = rule_issues + llm_issues
+                critical_issues = [i for i in all_issues if i.get("severity") == "critical"]
+
+                if not critical_issues:
+                    success = True
                     subtask_dict["status"] = "done"
-                    subtask_dict["current_loop"] = 0  # Reset
+                    subtask_dict["current_loop"] = 0
+                    self.log(f"  ✓ Task {sid} passed critic on iter {iteration}", "ok")
+                    if all_issues:
+                        for mi in all_issues:
+                            self.log(f"    [minor] {mi.get('description', '')}", "info")
+                    break
+
+                # Critic found critical issues → retry with feedback
+                critic_feedback = [
+                    f"{i.get('category', '')}: {i.get('description', '')} (file: {i.get('file', '')})"
+                    for i in critical_issues
+                ]
+                self.log(
+                    f"  ✗ Critic found {len(critical_issues)} critical issue(s) on iter {iteration}:",
+                    "warn",
+                )
+                for issue in critical_issues:
                     self.log(
-                        f"  ✓ Task {sid} completed on loop {current_loop}/{max_loops}",
-                        "ok"
+                        f"    [{issue.get('category')}] {issue.get('file')}: {issue.get('description')}",
+                        "warn",
                     )
-                else:
-                    # Failed this attempt
-                    retry_msg = "retrying..." if current_loop < max_loops else "analysis needed"
-                    self.log(
-                        f"  ↻ Loop {current_loop}/{max_loops} failed, {retry_msg}",
-                        "warn"
-                    )
-            
-            # After all attempts
+
             if not success:
-                # Reached limit - needs analysis
-                subtask_dict["status"] = "needs_analysis"
-                subtask_dict["analysis_needed"] = True
+                self._handle_subtask_failure(subtask_dict, critic_feedback)
                 all_ok = False
                 self.task.has_errors = True
-                
-                self.log(
-                    f"  ⚠️ Task {sid} did not complete after {max_loops} loops. "
-                    f"Marking for analysis and patch.",
-                    "error"
-                )
-            
+
             self.task.progress = self.task.subtask_progress()
             self.state.save_subtasks_for_task(self.task)
             self.push_task()
-            
+
             # Refresh cache
             self.state.cache.update_file_paths(
                 self.task.project_path or self.state.working_dir
@@ -183,7 +185,12 @@ class CodingPhase(BasePhase):
         return all_ok
 
     # ── Execute one subtask ────────────────────────────────────────
-    def _execute_one_task(self, subtask_dict: dict, model: str) -> bool:
+    def _execute_one_task(
+        self,
+        subtask_dict: dict,
+        model: str,
+        critic_feedback: list[str] | None = None,
+    ) -> bool:
         sid     = subtask_dict.get("id", "?")
         wd      = self.task.project_path or self.state.working_dir
         workdir = os.path.join(self.task.task_dir, WORKDIR_NAME)
@@ -300,7 +307,16 @@ class CodingPhase(BasePhase):
         except Exception as _diff_exc:
             pass  # diff is informational — never block execution
         
-        msg = (
+        # Prepend critic feedback from previous iteration if present
+        critic_prefix = ""
+        if critic_feedback:
+            critic_prefix = (
+                "=== CRITIC FEEDBACK FROM PREVIOUS ATTEMPT ===\n"
+                + "\n".join(f"  \u274c {issue}" for issue in critic_feedback)
+                + "\n=== END CRITIC FEEDBACK \u2014 FIX THESE ISSUES FIRST ===\n\n"
+            )
+
+        msg = critic_prefix + (
             (
                 f"=== ALREADY COMPLETED IN THIS SESSION ===\n"
                 f"{completed_summary}\n"
@@ -394,6 +410,195 @@ class CodingPhase(BasePhase):
             CODING_TOOLS, executor, msg, validate_fn, model,
             max_outer_iterations=10,  # Reduced from 20 - each attempt gets 10 internal rounds
         )
+
+    # ── Critic ────────────────────────────────────────────────────
+    def _run_critic(
+        self, subtask_dict: dict, model: str
+    ) -> tuple[list[dict], list[dict]]:
+        """
+        Run rule-based critic, then LLM critic if issues found.
+        Returns (rule_issues, llm_issues) as plain dicts.
+        """
+        from core.critic import RuleCritic
+
+        workdir = os.path.join(self.task.task_dir, WORKDIR_NAME)
+        project_path = self.task.project_path or self.state.working_dir
+
+        critic = RuleCritic()
+        try:
+            rule_issues_obj = critic.run(subtask_dict, workdir, project_path)
+        except Exception as e:
+            self.log(f"  [WARN] RuleCritic crashed: {e}", "warn")
+            rule_issues_obj = []
+
+        rule_issues = [
+            {
+                "severity": i.severity,
+                "category": i.category,
+                "file": i.file,
+                "description": i.description,
+                "line": i.line,
+            }
+            for i in rule_issues_obj
+        ]
+
+        # Always run LLM critic — rule issues are passed as context.
+        # LLM covers semantic checks (description compliance, logic, style)
+        # that rule-based checks cannot catch.
+        llm_issues: list[dict] = []
+        try:
+            llm_issues = self._run_llm_critic(subtask_dict, rule_issues, model)
+        except Exception as e:
+            self.log(f"  [WARN] LLM critic crashed: {e}", "warn")
+
+        return rule_issues, llm_issues
+
+    def _run_llm_critic(
+        self,
+        subtask_dict: dict,
+        rule_issues: list[dict],
+        model: str,
+    ) -> list[dict]:
+        """
+        Run the LLM critic using p6_critic.md + submit_critic_verdict tool.
+        Returns list of issue dicts from the LLM verdict.
+        """
+        workdir = os.path.join(self.task.task_dir, WORKDIR_NAME)
+        project_path = self.task.project_path or self.state.working_dir
+
+        # Build diff text for context
+        files_to_check = (
+            (subtask_dict.get("files_to_create") or [])
+            + (subtask_dict.get("files_to_modify") or [])
+        )
+        diff_sections: list[str] = []
+        for rel_path in files_to_check:
+            abs_workdir = os.path.join(workdir, rel_path)
+            abs_original = os.path.join(project_path, rel_path)
+            if not os.path.isfile(abs_workdir):
+                continue
+            try:
+                with open(abs_workdir, "r", encoding="utf-8", errors="replace") as fh:
+                    new_lines = fh.readlines()
+                old_lines: list[str] = []
+                if os.path.isfile(abs_original):
+                    with open(abs_original, "r", encoding="utf-8", errors="replace") as fh:
+                        old_lines = fh.readlines()
+                diff = list(
+                    difflib.unified_diff(
+                        old_lines, new_lines,
+                        fromfile=f"a/{rel_path}", tofile=f"b/{rel_path}",
+                        lineterm="",
+                    )
+                )
+                if diff:
+                    diff_sections.append("\n".join(diff[:200]))  # cap per file
+            except Exception:
+                pass
+
+        diff_text = "\n\n".join(diff_sections) if diff_sections else "(no diff available)"
+
+        # Format rule issues
+        if rule_issues:
+            rule_issues_text = "\n".join(
+                f"  [{i.get('severity','?').upper()}] [{i.get('category','?')}] "
+                f"{i.get('file', '?')}: {i.get('description', '')}"
+                for i in rule_issues
+            )
+        else:
+            rule_issues_text = "  (none)"
+
+        # Build critic message
+        sid = subtask_dict.get("id", "?")
+        critic_msg = (
+            f"Subtask ID: {sid}\n"
+            f"Title: {subtask_dict.get('title', '')}\n\n"
+            f"Description:\n{subtask_dict.get('description', '')}\n\n"
+            f"Files to create: {subtask_dict.get('files_to_create', [])}\n"
+            f"Files to modify: {subtask_dict.get('files_to_modify', [])}\n\n"
+            f"## Diff (workdir vs project baseline)\n"
+            f"```diff\n{diff_text[:6000]}\n```\n\n"
+            f"## Rule-based pre-check results\n"
+            f"{rule_issues_text}\n\n"
+            "Review the above diff and rule-based results. "
+            "Call submit_critic_verdict with your verdict."
+        )
+
+        # Create a fresh executor for the critic (read-only workdir)
+        critic_executor = self._make_executor(workdir)
+
+        # Reset verdict state
+        critic_executor.critic_verdict = None
+        critic_executor.critic_verdict_issues = []
+        critic_executor.critic_verdict_summary = ""
+
+        def validate_fn() -> tuple[bool, str]:
+            if critic_executor.critic_verdict is None:
+                return False, "submit_critic_verdict not yet called"
+            if critic_executor.critic_verdict not in ("PASS", "FAIL"):
+                return False, f"Invalid verdict: {critic_executor.critic_verdict!r}"
+            return True, "OK"
+
+        # Run the LLM critic loop (fewer iterations — it just reads and judges)
+        ok = self.run_loop(
+            f"critic {sid}",
+            "p6_critic.md",
+            CRITIC_TOOLS,
+            critic_executor,
+            critic_msg,
+            validate_fn,
+            model,
+            max_outer_iterations=4,
+        )
+
+        if not ok or critic_executor.critic_verdict is None:
+            self.log("  [WARN] LLM critic did not submit a verdict", "warn")
+            return []
+
+        verdict = critic_executor.critic_verdict
+        issues = critic_executor.critic_verdict_issues or []
+        summary = critic_executor.critic_verdict_summary
+
+        self.log(f"  LLM critic verdict: {verdict} — {summary}", "info")
+
+        if verdict == "PASS":
+            return []
+
+        # Return issues as dicts (ensure required fields present)
+        result: list[dict] = []
+        for issue in issues:
+            if not isinstance(issue, dict):
+                continue
+            result.append(
+                {
+                    "severity": issue.get("severity", "critical"),
+                    "category": "llm_critic",
+                    "file": issue.get("file", ""),
+                    "description": issue.get("description", ""),
+                    "line": "",
+                }
+            )
+        return result
+
+    def _handle_subtask_failure(
+        self, subtask_dict: dict, critic_feedback: list[str]
+    ) -> None:
+        """Mark a subtask as failed after exhausting all iterations."""
+        sid = subtask_dict.get("id", "?")
+        failure_reason = (
+            "; ".join(critic_feedback[:5]) if critic_feedback else "Exhausted all iterations"
+        )
+        subtask_dict["status"] = "needs_analysis"
+        subtask_dict["analysis_needed"] = True
+        subtask_dict["failure_reason"] = failure_reason
+
+        self.log(
+            f"  Task {sid} failed after all iterations. Reason: {failure_reason}",
+            "error",
+        )
+        if critic_feedback:
+            for fb in critic_feedback:
+                self.log(f"    - {fb}", "error")
 
     # ── Subtask validation before execution ────────────────────────
     def _validate_subtask_before_execution(

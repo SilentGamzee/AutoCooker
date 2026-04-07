@@ -5,10 +5,10 @@ Supports:
   .py        — py_compile (syntax) + pyflakes (undefined names, unused imports)
   .json      — json.loads
   .xml       — xml.etree.ElementTree
-  .html/.htm — html.parser structural check
-  .css/.scss — brace balance + basic property check
+  .html/.htm — html.parser structural check + inline <script> check + duplicate id
+  .css/.scss — brace balance + basic property check + duplicate selectors
   .yaml/.yml — pyyaml (if installed)
-  .js/.ts    — node --check (if node available)
+  .js/.ts    — node --check (if node available) + eslint (if available)
 
 Returns (ok: bool, message: str).
 """
@@ -17,7 +17,9 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import subprocess
+import tempfile
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -193,6 +195,29 @@ def _lint_html(abs_path: str) -> tuple[bool, str]:
         if parser.stack:
             all_errors.append(f"Unclosed tags: {', '.join(f'<{t}>' for t in parser.stack[-5:])}")
 
+        # --- Check for duplicate id attributes ---
+        id_values: list[str] = re.findall(r'\bid\s*=\s*["\']([^"\']+)["\']', content, re.IGNORECASE)
+        seen_ids: set[str] = set()
+        for id_val in id_values:
+            if id_val in seen_ids:
+                all_errors.append(f"Duplicate id attribute: '{id_val}'")
+            seen_ids.add(id_val)
+
+        # --- Extract and lint inline <script> blocks ---
+        script_blocks = re.findall(
+            r'<script(?:[^>]*)>(.*?)</script>',
+            content,
+            re.DOTALL | re.IGNORECASE,
+        )
+        for i, block in enumerate(script_blocks):
+            block = block.strip()
+            if not block:
+                continue
+            # Skip src-only script tags (they have no inline content)
+            js_ok, js_msg = _lint_js_content(block, filename=f"{abs_path}:script[{i+1}]")
+            if not js_ok:
+                all_errors.append(f"Inline script[{i+1}] error: {js_msg}")
+
         if all_errors:
             return False, "\n".join(all_errors[:10])
         return True, "OK"
@@ -206,24 +231,85 @@ def _lint_html(abs_path: str) -> tuple[bool, str]:
 
 def _lint_css(abs_path: str) -> tuple[bool, str]:
     """
-    Check brace balance and basic property syntax.
+    Check brace balance, basic property syntax, and duplicate selectors.
     Full CSS parsing is complex; this catches the most common errors.
     """
+    # Common valid CSS property prefixes (first word of property name)
+    _VALID_CSS_PREFIXES: frozenset[str] = frozenset({
+        "align", "animation", "appearance", "aspect",
+        "backdrop", "background", "border", "bottom", "box",
+        "break",
+        "caption", "caret", "clear", "clip", "color", "column",
+        "columns", "content", "counter", "cursor",
+        "direction", "display",
+        "empty",
+        "filter", "flex", "float", "font",
+        "gap", "grid",
+        "height",
+        "image", "inline",
+        "isolation",
+        "justify",
+        "left", "letter", "line", "list",
+        "margin", "max", "min",
+        "object", "opacity", "order", "outline", "overflow",
+        "padding", "page", "place", "pointer", "position",
+        "resize", "right", "row",
+        "scroll",
+        "table", "text", "top", "transform", "transition",
+        "unicode", "user",
+        "vertical", "visibility",
+        "white", "width", "will", "word",
+        "z",
+        # vendor-prefix forms
+        "-webkit", "-moz", "-ms", "-o",
+        # SCSS/variables
+        "--",
+    })
+
     try:
         with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
             content = f.read()
 
         errors: list[str] = []
+        warnings: list[str] = []
 
-        # Remove comments (/* ... */) before counting braces
+        # Remove comments (/* ... */) before analysis
         stripped = _remove_css_comments(content)
 
         opens  = stripped.count("{")
         closes = stripped.count("}")
         if opens != closes:
             errors.append(f"Unbalanced braces: {opens} opening, {closes} closing")
-        # Check for properties missing colon or semicolon inside blocks
-        # Simple heuristic: inside a block, look for lines that look like broken properties
+
+        # --- Duplicate selector detection ---
+        # Walk character-by-character to correctly track nesting depth.
+        selectors: list[str] = []
+        in_block = 0
+        current_selector = []
+        for ch in stripped:
+            if ch == "{":
+                if in_block == 0:
+                    sel = "".join(current_selector).strip()
+                    if sel and not sel.startswith("@"):
+                        selectors.append(sel)
+                    current_selector = []
+                in_block += 1
+            elif ch == "}":
+                in_block = max(0, in_block - 1)
+                if in_block == 0:
+                    current_selector = []  # reset after block closed
+            elif in_block == 0:
+                current_selector.append(ch)
+
+        seen_selectors: dict[str, int] = {}
+        for sel in selectors:
+            key = " ".join(sel.split())  # normalise whitespace
+            seen_selectors[key] = seen_selectors.get(key, 0) + 1
+        for sel, count in seen_selectors.items():
+            if count > 1:
+                warnings.append(f"Duplicate CSS selector: '{sel}' appears {count} times")
+
+        # --- Property validation inside blocks ---
         in_block = 0
         for lineno, line in enumerate(stripped.splitlines(), 1):
             for ch in line:
@@ -245,10 +331,18 @@ def _lint_css(abs_path: str) -> tuple[bool, str]:
                 and "@" not in stripped_line
                 and len(stripped_line) > 3
             ):
-                errors.append(f"Line {lineno}: possible malformed property: {stripped_line[:60]}")
+                # Check if first token looks like a valid CSS property prefix
+                first_token = stripped_line.split("-")[0].lower()
+                if first_token not in _VALID_CSS_PREFIXES and not stripped_line.startswith("--"):
+                    errors.append(
+                        f"Line {lineno}: possible malformed property: {stripped_line[:60]}"
+                    )
 
+        all_issues = errors + warnings
         if errors:
-            return False, "\n".join(errors[:5])
+            return False, "\n".join(all_issues[:5])
+        if warnings:
+            return True, "OK (warnings: " + "; ".join(warnings[:3]) + ")"
         return True, "OK"
     except Exception as e:
         return False, f"CSS check error: {e}"
@@ -287,15 +381,79 @@ def _lint_yaml(abs_path: str) -> tuple[bool, str]:
 # JavaScript / TypeScript
 # ─────────────────────────────────────────────────────────────────
 
+def _lint_js_content(source: str, filename: str = "<inline>") -> tuple[bool, str]:
+    """
+    Lint a JS/TS source string using node's stdin mode.
+    Falls back to writing a temp file and running node --check.
+    Returns (ok, message).
+    """
+    if not source.strip():
+        return True, "OK (empty)"
+
+    # Try piping to node via --input-type=module (Node 12+)
+    try:
+        result = subprocess.run(
+            ["node", "--input-type=module"],
+            input=source,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if result.returncode == 0:
+            return True, "OK"
+        err = result.stderr.strip()
+        if err:
+            # Replace <stdin> with the provided filename for clarity
+            err = err.replace("<stdin>", filename)
+            return False, err[:500]
+    except FileNotFoundError:
+        pass  # node not available
+    except subprocess.TimeoutExpired:
+        return False, f"node --input-type=module timed out for {filename}"
+    except Exception:
+        pass
+
+    # Fallback: write to temp file and use node --check
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".js", delete=False, encoding="utf-8"
+        ) as tmp:
+            tmp.write(source)
+            tmp_path = tmp.name
+        try:
+            result = subprocess.run(
+                ["node", "--check", tmp_path],
+                capture_output=True, text=True, timeout=15,
+            )
+            if result.returncode != 0:
+                err = result.stderr.strip().replace(tmp_path, filename)
+                return False, err[:500] or "Node syntax error"
+            return True, "OK"
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+    except FileNotFoundError:
+        return True, "OK (node not available — inline JS check skipped)"
+    except subprocess.TimeoutExpired:
+        return False, f"node --check timed out for {filename}"
+    except Exception as e:
+        return True, f"OK (inline JS check skipped: {e})"
+
+
 def _lint_js(abs_path: str) -> tuple[bool, str]:
     """
     Use `node --check` for syntax validation if Node.js is available.
+    After passing, try eslint for undefined-variable detection.
     TypeScript: use `tsc --noEmit` if tsc is available, else skip.
     """
     ext = os.path.splitext(abs_path)[1].lower()
 
     # Try node --check for .js/.jsx
     if ext in (".js", ".jsx"):
+        node_ok = True
+        node_msg = "OK"
         try:
             result = subprocess.run(
                 ["node", "--check", abs_path],
@@ -303,11 +461,52 @@ def _lint_js(abs_path: str) -> tuple[bool, str]:
             )
             if result.returncode != 0:
                 return False, result.stderr.strip() or "Node syntax error"
-            return True, "OK"
         except FileNotFoundError:
             return True, "OK (node not available — JS syntax check skipped)"
         except subprocess.TimeoutExpired:
             return False, "node --check timed out"
+
+        # node --check passed — try eslint for deeper checks
+        eslint_msgs: list[str] = []
+        try:
+            eslint_result = subprocess.run(
+                [
+                    "eslint",
+                    "--no-eslintrc",
+                    "--rule", '{"no-undef": "error", "no-unused-vars": "warn"}',
+                    "--stdin-filename", abs_path,
+                    abs_path,
+                ],
+                capture_output=True, text=True, timeout=20,
+            )
+            if eslint_result.returncode != 0:
+                output = (eslint_result.stdout + eslint_result.stderr).strip()
+                if output:
+                    eslint_msgs = [output[:800]]
+        except FileNotFoundError:
+            # eslint not available — do a simple regex-based check instead
+            try:
+                with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
+                    js_source = f.read()
+                regex_issues = _regex_check_js(js_source, abs_path)
+                if regex_issues:
+                    eslint_msgs = regex_issues
+            except Exception:
+                pass
+        except subprocess.TimeoutExpired:
+            pass  # eslint timed out — ignore, don't fail the lint
+        except Exception:
+            pass
+
+        if eslint_msgs:
+            # eslint warnings/errors are informational unless they are "error" level
+            combined = "\n".join(eslint_msgs)
+            if "error" in combined.lower() and "no-undef" in combined.lower():
+                return False, combined
+            # warn-level only — pass with message
+            return True, f"OK (eslint warnings: {combined[:300]})"
+
+        return True, "OK"
 
     # TypeScript (.ts/.tsx)
     if ext in (".ts", ".tsx"):
@@ -326,3 +525,23 @@ def _lint_js(abs_path: str) -> tuple[bool, str]:
             return False, "tsc timed out"
 
     return True, "OK"
+
+
+def _regex_check_js(source: str, filename: str) -> list[str]:
+    """
+    Minimal regex-based JS check when eslint is not available.
+    Looks for common patterns that indicate undefined or incorrect usage.
+    """
+    issues: list[str] = []
+
+    # Check for use of 'undefined' as function call (common mistake)
+    for m in re.finditer(r"\bundefined\s*\(", source):
+        line_no = source[: m.start()].count("\n") + 1
+        issues.append(f"{filename}:{line_no}: calling 'undefined' as a function")
+
+    # Check for obvious typos: double semicolons, stray }); without matching
+    double_semi = re.findall(r";;", source)
+    if double_semi:
+        issues.append(f"{filename}: double semicolons found ({len(double_semi)} occurrences)")
+
+    return issues

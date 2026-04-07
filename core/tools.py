@@ -283,6 +283,45 @@ SUBMIT_QA_VERDICT = {
     },
 }
 
+CRITIC_VERDICT_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "submit_critic_verdict",
+        "description": "Submit the critic verdict for the current subtask implementation.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "verdict": {
+                    "type": "string",
+                    "enum": ["PASS", "FAIL"],
+                    "description": "Overall verdict: PASS if implementation is correct, FAIL if critical issues found.",
+                },
+                "issues": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "severity": {
+                                "type": "string",
+                                "enum": ["critical", "minor"],
+                            },
+                            "file": {"type": "string"},
+                            "description": {"type": "string"},
+                        },
+                        "required": ["severity", "file", "description"],
+                    },
+                    "description": "List of issues found. Empty array if PASS.",
+                },
+                "summary": {
+                    "type": "string",
+                    "description": "One-sentence explanation of the verdict.",
+                },
+            },
+            "required": ["verdict", "issues", "summary"],
+        },
+    },
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Tool sets per phase
 # ─────────────────────────────────────────────────────────────────────────────
@@ -296,6 +335,9 @@ CODING_TOOLS   = [READ_FILE, READ_FILE_RANGE, LIST_DIRECTORY, WRITE_FILE, MODIFY
 QA_REVIEWER_TOOLS = [READ_FILE, READ_FILE_RANGE, LIST_DIRECTORY, LINT_FILE, SUBMIT_QA_VERDICT]
 QA_FIXER_TOOLS    = [READ_FILE, READ_FILE_RANGE, LIST_DIRECTORY, WRITE_FILE, MODIFY_FILE, LINT_FILE]
 QA_TOOLS          = QA_REVIEWER_TOOLS
+
+# Critic: read-only + verdict submission
+CRITIC_TOOLS = [READ_FILE, READ_FILE_RANGE, LIST_DIRECTORY, LINT_FILE, CRITIC_VERDICT_TOOL]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -340,19 +382,24 @@ class ToolExecutor:
         self.qa_verdict: Optional[str] = None
         self.qa_verdict_issues: list[str] = []
         self.qa_verdict_summary: str = ""
+        # Critic verdict (set by submit_critic_verdict tool)
+        self.critic_verdict: Optional[str] = None
+        self.critic_verdict_issues: list[dict] = []
+        self.critic_verdict_summary: str = ""
 
     # ------------------------------------------------------------------
     def __call__(self, tool_name: str, args: dict) -> str:
         dispatch = {
-            "read_file":         self._read_file,
-            "read_file_range":   self._read_file_range,
-            "list_directory":    self._list_directory,
-            "write_file":        self._write_file,
-            "modify_file":       self._modify_file,
-            "lint_file":         self._lint_file,
-            "confirm_task_done": self._confirm_task_done,
-            "create_task":       self._create_task,
-            "submit_qa_verdict": self._submit_qa_verdict,
+            "read_file":              self._read_file,
+            "read_file_range":        self._read_file_range,
+            "list_directory":         self._list_directory,
+            "write_file":             self._write_file,
+            "modify_file":            self._modify_file,
+            "lint_file":              self._lint_file,
+            "confirm_task_done":      self._confirm_task_done,
+            "create_task":            self._create_task,
+            "submit_qa_verdict":      self._submit_qa_verdict,
+            "submit_critic_verdict":  self._submit_critic_verdict,
         }
         fn = dispatch.get(tool_name)
         if fn is None:
@@ -592,3 +639,13 @@ class ToolExecutor:
         self.qa_verdict_issues  = issues
         self.qa_verdict_summary = summary
         return f"QA verdict recorded: {verdict}. Issues: {len(issues)}."
+
+    def _submit_critic_verdict(self, args: dict) -> str:
+        verdict = args.get("verdict", "FAIL")
+        issues  = args.get("issues", [])
+        summary = args.get("summary", "")
+        # Store on executor for retrieval by _run_llm_critic
+        self.critic_verdict         = verdict
+        self.critic_verdict_issues  = issues
+        self.critic_verdict_summary = summary
+        return "Verdict submitted."
