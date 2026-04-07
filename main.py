@@ -922,9 +922,18 @@ def get_task_workdir_diff(task_id: str) -> dict:
     if not os.path.isdir(workdir):
         return {"ok": False, "error": "Workdir not found — coding phase not run yet"}
 
+    _SKIP = (
+        "__pycache__", ".pyc", ".pyo", ".pyd", ".git",
+        "node_modules", ".egg-info", ".dist-info",
+        ".mypy_cache", ".ruff_cache", ".pytest_cache",
+    )
+
     diffs = []
-    for dirpath, _, files in os.walk(workdir):
+    for dirpath, dirs, files in os.walk(workdir):
+        dirs[:] = [d for d in dirs if not any(pat in d for pat in _SKIP)]
         for fname in files:
+            if any(pat in fname for pat in _SKIP):
+                continue
             wfile = os.path.join(dirpath, fname)
             rel   = os.path.relpath(wfile, workdir).replace("\\", "/")
             pfile = os.path.join(project, rel)

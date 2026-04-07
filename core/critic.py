@@ -416,8 +416,17 @@ class RuleCritic:
         if not os.path.isdir(workdir):
             return issues
 
+        _SKIP = (
+            "__pycache__", ".pyc", ".pyo", ".pyd", ".git",
+            "node_modules", ".egg-info", ".dist-info",
+            ".mypy_cache", ".ruff_cache", ".pytest_cache",
+        )
+
         for dirpath, _dirs, files in os.walk(workdir):
+            _dirs[:] = [d for d in _dirs if not any(pat in d for pat in _SKIP)]
             for fname in files:
+                if any(pat in fname for pat in _SKIP):
+                    continue
                 abs_workdir_file = os.path.join(dirpath, fname)
                 try:
                     rel = os.path.relpath(abs_workdir_file, workdir).replace("\\", "/")

@@ -54,10 +54,20 @@ def _read_json(path: str) -> tuple[bool, dict | list | None, str]:
         return False, None, f"Not found: {path}"
     try:
         with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+            raw = f.read()
+        data = json.loads(raw)
         return True, data, ""
     except json.JSONDecodeError as e:
-        return False, None, f"JSON error: {e}"
+        pos = e.pos or 0
+        ctx_s = max(0, pos - 80)
+        ctx_e = min(len(raw), pos + 80)
+        snippet = raw[ctx_s:ctx_e].replace("\n", "↵")
+        arrow = "~" * (pos - ctx_s) + "^"
+        return False, None, (
+            f"JSON error at char {pos} (line {e.lineno}, col {e.colno}): {e.msg}\n"
+            f"  Context: ...{snippet}...\n"
+            f"            {'   ' + arrow}"
+        )
 
 
 def _validate_project_index(path: str) -> tuple[bool, str]:

@@ -636,6 +636,31 @@ class ToolExecutor:
                 if self.log_fn:
                     self.log_fn(f"  [WARN] JSON repair failed: {exc}", "warn")
 
+        # ── Final JSON validity gate ──────────────────────────────
+        # If the file is .json and content is still invalid after repair,
+        # refuse to write it and return a precise error so the model can fix it.
+        if abs_path.endswith(".json") and content.strip():
+            try:
+                json.loads(content)
+            except json.JSONDecodeError as _je:
+                _pos = _je.pos or 0
+                _ctx_s = max(0, _pos - 80)
+                _ctx_e = min(len(content), _pos + 80)
+                _snippet = content[_ctx_s:_ctx_e].replace("\n", "↵")
+                _arrow = "~" * (_pos - _ctx_s) + "^"
+                err_msg = (
+                    f"ERROR: Invalid JSON — file NOT written.\n"
+                    f"Parse error at char {_pos} "
+                    f"(line {_je.lineno}, col {_je.colno}): {_je.msg}\n"
+                    f"Context:\n"
+                    f"  ...{_snippet}...\n"
+                    f"  {'   ' + _arrow}\n"
+                    f"Fix the JSON at that position and retry write_file."
+                )
+                if self.log_fn:
+                    self.log_fn(f"  [JSON INVALID] {_je.msg} at char {_pos}", "error")
+                return err_msg
+
         os.makedirs(os.path.dirname(abs_path), exist_ok=True)
         try:
             with open(abs_path, "w", encoding="utf-8") as f:

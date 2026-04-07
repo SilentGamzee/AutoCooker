@@ -819,11 +819,21 @@ Token count: {token_count} / {config['max_total_tokens']}
             return "(file is empty)"
 
         # Try parsing as-is
+        parse_error_ctx = ""
         try:
             parsed = json.loads(raw)
             return json.dumps(parsed, ensure_ascii=False, indent=2)
-        except json.JSONDecodeError:
-            pass
+        except json.JSONDecodeError as e:
+            pos = e.pos or 0
+            ctx_s = max(0, pos - 80)
+            ctx_e = min(len(raw), pos + 80)
+            snippet = raw[ctx_s:ctx_e].replace("\n", "↵")
+            arrow = "~" * (pos - ctx_s) + "^"
+            parse_error_ctx = (
+                f"JSON error at char {pos} (line {e.lineno}, col {e.colno}): {e.msg}\n"
+                f"  Context: ...{snippet}...\n"
+                f"            {'   ' + arrow}"
+            )
 
         # Try repair_json
         try:
@@ -834,10 +844,11 @@ Token count: {token_count} / {config['max_total_tokens']}
         except Exception:
             pass
 
-        # Fallback: raw text, capped at 3000 chars
+        # Fallback: raw text, capped at 3000 chars, with error context
         truncated = raw[:3000]
         suffix = f"\n…(truncated, total {len(raw)} chars)" if len(raw) > 3000 else ""
-        return f"(raw, could not parse as JSON)\n{truncated}{suffix}"
+        error_hint = f"\n{parse_error_ctx}" if parse_error_ctx else ""
+        return f"(raw, could not parse as JSON){error_hint}\n{truncated}{suffix}"
 
     # ── Ollama outer loop ────────────────────────────────────────
     def run_loop(
