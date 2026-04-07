@@ -855,15 +855,17 @@ Token count: {token_count} / {config['max_total_tokens']}
         disable_write_nudge: bool = False,
         shared_last_read_files: Optional[dict] = None,
         reconstruct_after: Optional[int] = None,
+        min_rounds_before_confirm: int = 1,
     ) -> bool:
         """
-        max_tool_rounds:       inner tool-call rounds per outer iteration.
-        file_ttl:              TTL for read-file cache entries (default 3; use 12 for read phases).
-        disable_write_nudge:   suppress "you haven't written" nudges (for read-only phases).
-        shared_last_read_files: if provided, use this dict instead of creating a fresh one.
-                                Allows carrying file contents from a read phase into a write phase.
-        reconstruct_after:     if set, after this many failed outer iterations switch from
-                               "fix the file" mode to "rewrite from scratch" mode.
+        max_tool_rounds:          inner tool-call rounds per outer iteration.
+        file_ttl:                 TTL for read-file cache entries (default 3; use 12 for read phases).
+        disable_write_nudge:      suppress "you haven't written" nudges (for read-only phases).
+        shared_last_read_files:   if provided, use this dict instead of creating a fresh one.
+                                  Allows carrying file contents from a read phase into a write phase.
+        reconstruct_after:        if set, after this many failed outer iterations switch from
+                                  "fix the file" mode to "rewrite from scratch" mode.
+        min_rounds_before_confirm: confirm_phase_done rejected if fewer inner rounds completed.
         """
         self.set_step(step_name)
 
@@ -911,6 +913,7 @@ Token count: {token_count} / {config['max_total_tokens']}
                     max_tool_rounds=max_tool_rounds,
                     file_ttl=file_ttl,
                     disable_write_nudge=disable_write_nudge,
+                    min_rounds_before_confirm=min_rounds_before_confirm,
                 )
                 
                 # Логирование после успешного завершения

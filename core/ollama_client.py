@@ -312,6 +312,7 @@ class OllamaClient:
         max_tool_rounds: int = 40,
         file_ttl: int = 3,
         disable_write_nudge: bool = False,
+        min_rounds_before_confirm: int = 1,
     ) -> tuple[list[dict], str, int]:
         """
         Execute multi-turn tool-calling loop until the model stops calling
@@ -321,6 +322,8 @@ class OllamaClient:
                   use 12 for read-only discovery phase so files survive all rounds).
         disable_write_nudge: if True, suppress the "you haven't written anything"
                              messages — used during read-only phases.
+        min_rounds_before_confirm: confirm_phase_done is rejected if fewer inner
+                                   rounds have completed (guards against premature exit).
 
         Returns:
             (history, final_response, tool_calls_made)
@@ -338,6 +341,8 @@ class OllamaClient:
         _last_call = ("", "")
         _repeat_count = 0
         _files_read: set[str] = set()
+        # Per-session write deduplication: path → content written this chat_with_tools call.
+        _written_files: dict[str, str] = {}
 
         # Keep separate history of tool calls with status/result.
         tool_call_history: list[dict] = list(tool_calls)
@@ -528,6 +533,10 @@ class OllamaClient:
             if auto_read_tool_calls:
                 model_tool_calls.extend(auto_read_tool_calls)
 
+            # Per-round read counters: detect rounds where all reads were already cached.
+            _round_reads = 0
+            _round_new_reads = 0
+
             for tc in model_tool_calls:
                 if is_aborted and is_aborted():
                     raise RuntimeError("__ABORTED__")
@@ -559,42 +568,149 @@ class OllamaClient:
                     _rounds_without_write = -1
                 elif tool_name == "read_file":
                     _path_arg = raw_args.get("path", "")
-
                     if _path_arg in _files_read and _rounds_without_write > 2 and log_fn:
                         log_fn(
                             f"[WARN] Re-reading already-seen file without writes: {_path_arg} "
                             f"({_rounds_without_write} rounds since last write)",
                             "warn",
                         )
-
                     _files_read.add(_path_arg)
+                elif tool_name == "read_files_batch":
+                    for _p in raw_args.get("paths", []):
+                        _files_read.add(_p)
 
                 call_status = "SUCCESS"
                 error_text = None
 
-                try:
-                    print(f"[EXEC] Executing tool: {tool_name}")
-                    result = tool_executor(tool_name, raw_args)
-
-                    if tool_name == "read_file":
-                        path = raw_args.get("path", "")
-                        if path:
-                            last_read_files[path] = {
-                                "content": result,
-                                "ttl": READ_FILE_TTL_ROUNDS,
-                            }
-                        
-
-                    print(f"[EXEC] Tool completed successfully: {tool_name}")
-                except Exception as e:
-                    call_status = "FAILED"
-                    error_text = f"{type(e).__name__}: {e}"
-                    if log_fn:
-                        log_fn(
-                            f"[EXEC] Tool execution failed: {tool_name} - {error_text}",
-                            "error",
+                # ── confirm_phase_done: validate history before allowing exit ──
+                if tool_name == "confirm_phase_done":
+                    successful_writes = [
+                        h for h in tool_call_history
+                        if h.get("tool_name") == "write_file"
+                        and h.get("status") == "SUCCESS"
+                        and str(h.get("result", "")).startswith("OK:")
+                    ]
+                    if not successful_writes:
+                        result = (
+                            "[CONFIRM REJECTED] No successful write_file calls found in history. "
+                            "Write all required files first, then call confirm_phase_done."
                         )
-                    result = f"ERROR: {e}"
+                        print(f"[CONFIRM_PHASE_DONE] Rejected — no writes in history", flush=True)
+                    elif _round < min_rounds_before_confirm:
+                        result = (
+                            f"[CONFIRM REJECTED] Only {_round + 1} round(s) completed, "
+                            f"minimum is {min_rounds_before_confirm}. Continue working."
+                        )
+                        print(f"[CONFIRM_PHASE_DONE] Rejected — round {_round + 1} < min {min_rounds_before_confirm}", flush=True)
+                    else:
+                        result = f"OK: phase confirmed — {len(successful_writes)} file(s) written."
+                        if log_fn:
+                            log_fn(f"  → confirm_phase_done accepted ({len(successful_writes)} writes)", "info")
+                        print(f"[CONFIRM_PHASE_DONE] Accepted — exiting inner loop", flush=True)
+                        tool_call_history.append({
+                            "tool_name": tool_name,
+                            "arguments": raw_args,
+                            "status": "SUCCESS",
+                            "result": result,
+                        })
+                        tool_message = {"role": "tool", "content": result}
+                        if tc.get("id"):
+                            tool_message["tool_call_id"] = tc["id"]
+                        messages.append(tool_message)
+                        return "", _tool_calls_made
+
+                    # Rejected — fall through to history/message append below
+                    tool_call_history.append({
+                        "tool_name": tool_name,
+                        "arguments": raw_args,
+                        "status": "REJECTED",
+                        "result": _truncate(result, 400),
+                    })
+                    tool_message = {"role": "tool", "content": str(result)}
+                    if tc.get("id"):
+                        tool_message["tool_call_id"] = tc["id"]
+                    messages.append(tool_message)
+                    continue
+
+                # ── write_file deduplication ───────────────────────────────
+                _TRIVIALLY_EMPTY = frozenset({"{}", "[]", "", "{ }", "{  }", "null"})
+                _MIN_VALID_CONTENT_LEN = 20
+
+                _skip_execution = False
+                if tool_name == "write_file":
+                    _wpath = str(raw_args.get("path", "")).strip()
+                    _wcontent = str(raw_args.get("content", ""))
+                    _is_trivial = (
+                        _wcontent.strip() in _TRIVIALLY_EMPTY
+                        or len(_wcontent.strip()) < _MIN_VALID_CONTENT_LEN
+                    )
+                    if (not _is_trivial
+                            and _wpath in _written_files
+                            and _written_files[_wpath] == _wcontent):
+                        result = (
+                            f"[ALREADY WRITTEN] {_wpath} — identical content already written "
+                            "this session. If all required files are complete, call confirm_phase_done."
+                        )
+                        call_status = "SUCCESS"
+                        _skip_execution = True
+                        print(f"[DEDUP] write_file('{_wpath}') skipped — identical content", flush=True)
+                        if log_fn:
+                            log_fn(f"  [DEDUP] write_file skipped: {_wpath} (same content)", "warn")
+
+                if not _skip_execution:
+                    try:
+                        print(f"[EXEC] Executing tool: {tool_name}")
+                        result = tool_executor(tool_name, raw_args)
+
+                        if tool_name == "read_file":
+                            path = raw_args.get("path", "")
+                            _round_reads += 1
+                            # Do not refresh last_read_files for duplicate reads — the
+                            # original entry (with its remaining TTL) stays intact so
+                            # the model can still access the content via context.
+                            if path and not str(result).startswith("[ALREADY READ]"):
+                                _round_new_reads += 1
+                                last_read_files[path] = {
+                                    "content": result,
+                                    "ttl": READ_FILE_TTL_ROUNDS,
+                                }
+                        elif tool_name == "read_files_batch":
+                            # Store each individual path's content in last_read_files.
+                            # The batch result is "=== path ===\ncontent" blocks — parse them.
+                            _batch_paths = [p for p in raw_args.get("paths", []) if p.strip()]
+                            _round_reads += len(_batch_paths)
+                            for _bp in _batch_paths:
+                                _bp = _bp.strip()
+                                _marker = f"=== {_bp} ==="
+                                if _marker in result:
+                                    _after = result.split(_marker, 1)[1]
+                                    _file_content = _after.split("\n\n=== ", 1)[0].lstrip("\n")
+                                else:
+                                    _file_content = result
+                                if not _file_content.startswith("[ALREADY READ]"):
+                                    _round_new_reads += 1
+                                    last_read_files[_bp] = {
+                                        "content": _file_content,
+                                        "ttl": READ_FILE_TTL_ROUNDS,
+                                    }
+
+                        # Track successful writes for deduplication and confirm_phase_done checks.
+                        if tool_name == "write_file" and str(result).startswith("OK:"):
+                            _wpath = str(raw_args.get("path", "")).strip()
+                            _wcontent = str(raw_args.get("content", ""))
+                            if _wpath:
+                                _written_files[_wpath] = _wcontent
+
+                        print(f"[EXEC] Tool completed successfully: {tool_name}")
+                    except Exception as e:
+                        call_status = "FAILED"
+                        error_text = f"{type(e).__name__}: {e}"
+                        if log_fn:
+                            log_fn(
+                                f"[EXEC] Tool execution failed: {tool_name} - {error_text}",
+                                "error",
+                            )
+                        result = f"ERROR: {e}"
 
                 # Append tool-call history per call, with status/result.
                 history_record = {
@@ -647,6 +763,21 @@ class OllamaClient:
                             "warn",
                         )
                     return "", _tool_calls_made
+
+            # Early exit for read-only phases: if every read this round was cached,
+            # there is nothing new to learn — break immediately instead of wasting rounds.
+            if disable_write_nudge and _round_reads > 0 and _round_new_reads == 0:
+                print(
+                    f"[EARLY EXIT] Round {_round + 1}: all {_round_reads} read(s) returned "
+                    "[ALREADY READ] — read phase complete",
+                    flush=True,
+                )
+                if log_fn:
+                    log_fn(
+                        f"[READ PHASE] Round {_round + 1}: all {_round_reads} read(s) cached — exiting early",
+                        "warn",
+                    )
+                return "", _tool_calls_made
 
             if validate_fn:
                 ok, reason = validate_fn()

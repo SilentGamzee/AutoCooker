@@ -79,6 +79,9 @@ Write `spec.json` from `requirements.json` and `context.json`.
 }
 ```
 
+## FINISH
+After writing spec.json, call `confirm_phase_done`.
+
 ## VALIDATION CHECKLIST
 - `overview` ≥ 50 chars
 - `user_flow.steps` array exists and non-empty

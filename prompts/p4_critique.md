@@ -63,3 +63,5 @@ If no issues:
   "created_at": "ISO timestamp"
 }
 ```
+
+After writing critique_report.json (and spec.json if fixes applied), call `confirm_phase_done`.

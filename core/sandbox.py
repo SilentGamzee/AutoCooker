@@ -27,6 +27,7 @@ PLANNING_ALLOWED_FILES = {
     'spec.json',
     'critique_report.json',
     'implementation_plan.json',
+    'scored_files.json',
 }
 
 class Sandbox:

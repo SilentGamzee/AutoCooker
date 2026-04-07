@@ -31,6 +31,29 @@ READ_FILE = {
     },
 }
 
+READ_FILES_BATCH = {
+    "type": "function",
+    "function": {
+        "name": "read_files_batch",
+        "description": (
+            "Read multiple files at once in a single call. "
+            "Always prefer this over calling read_file one file at a time. "
+            "Returns each file's content separated by a header line."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "List of relative file paths to read simultaneously.",
+                },
+            },
+            "required": ["paths"],
+        },
+    },
+}
+
 LIST_DIRECTORY = {
     "type": "function",
     "function": {
@@ -103,6 +126,28 @@ MODIFY_FILE = {
                 },
             },
             "required": ["path", "old_text", "new_text"],
+        },
+    },
+}
+
+CONFIRM_PHASE_DONE = {
+    "type": "function",
+    "function": {
+        "name": "confirm_phase_done",
+        "description": (
+            "Call this tool ONLY after you have successfully written ALL required files "
+            "for this phase. Do not call it before writing the files."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "files_written": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "List of file paths you wrote in this phase.",
+                },
+            },
+            "required": [],
         },
     },
 }
@@ -328,9 +373,11 @@ CRITIC_VERDICT_TOOL = {
 
 # Planning: read-only access to project + write ONLY to task planning directory.
 # MODIFY_FILE is intentionally excluded — no reason to modify project files during planning.
-PLANNING_TOOLS = [READ_FILE, LIST_DIRECTORY, PLANNING_WRITE_FILE, CREATE_TASK]
+PLANNING_TOOLS = [READ_FILE, READ_FILES_BATCH, LIST_DIRECTORY, PLANNING_WRITE_FILE, CREATE_TASK, CONFIRM_PHASE_DONE]
 # Read-only tools for the Discovery read phase (no write allowed).
-DISCOVERY_READ_TOOLS = [READ_FILE, READ_FILE_RANGE, LIST_DIRECTORY]
+DISCOVERY_READ_TOOLS = [READ_FILE, READ_FILES_BATCH, READ_FILE_RANGE, LIST_DIRECTORY]
+# Analysis phase: write-only (model analyses index provided in context, no file reading needed)
+ANALYSIS_TOOLS = [PLANNING_WRITE_FILE, CONFIRM_PHASE_DONE]
 CODING_TOOLS   = [READ_FILE, READ_FILE_RANGE, LIST_DIRECTORY, WRITE_FILE, MODIFY_FILE, LINT_FILE, CONFIRM_TASK_DONE]
 
 # QA Reviewer: strictly read-only — it evaluates, never writes project files.
@@ -396,6 +443,7 @@ class ToolExecutor:
     def __call__(self, tool_name: str, args: dict) -> str:
         dispatch = {
             "read_file":              self._read_file,
+            "read_files_batch":       self._read_files_batch,
             "read_file_range":        self._read_file_range,
             "list_directory":         self._list_directory,
             "write_file":             self._write_file,
@@ -464,11 +512,9 @@ class ToolExecutor:
         # This prevents the model from re-reading the same file multiple times during
         # the read phase of Discovery.
         if self.session_read_files and rel in self.session_read_files:
-            cached = self.session_read_files[rel]
             return (
-                f"[ALREADY READ — content is current, do NOT read again]\n"
-                f"File: {rel}\n\n"
-                f"{cached}"
+                f"[ALREADY READ] {rel} — content is in 'Read files from last call:'. "
+                f"Do NOT call read_file on this path again."
             )
 
         if not os.path.isfile(abs_path):
@@ -484,6 +530,17 @@ class ToolExecutor:
             return content
         except Exception as e:
             return f"ERROR reading file: {e}"
+
+    def _read_files_batch(self, args: dict) -> str:
+        """Read multiple files at once. Applies same dedup as _read_file per path."""
+        paths = args.get("paths", [])
+        if not paths:
+            return "ERROR: 'paths' array is empty"
+        parts: list[str] = []
+        for path_raw in paths:
+            result = self._read_file({"path": path_raw})
+            parts.append(f"=== {path_raw} ===\n{result}")
+        return "\n\n".join(parts)
 
     def _read_file_range(self, args: dict) -> str:
         path_raw   = args.get("path", "")
@@ -544,6 +601,9 @@ class ToolExecutor:
         # Validate path with sandbox
         validation = self._validate_path(abs_path, "write")
         if validation != "OK":
+            if self.log_fn:
+                self.log_fn(f"  [SANDBOX BLOCK] write_file('{path_raw}'): {validation}", "warn")
+            print(f"[SANDBOX BLOCK] write_file('{path_raw}'): {validation}", flush=True)
             return validation
 
         # Enforce modify-only rule: block write_file for files that must use modify_file

@@ -105,6 +105,9 @@ Order: backend → HTML → JS → CSS (handlers need DOM elements)
 }
 ```
 
+## FINISH
+After writing implementation_plan.json, call `confirm_phase_done`.
+
 ## FORBIDDEN PATTERNS
 - Backend subtasks without frontend subtasks for user-facing features
 - `files_to_modify` containing a non-existent file

@@ -49,3 +49,4 @@ All files have been read. Write `project_index.json` then `context.json` using `
 - `to_reference` must have ≥ entries as `to_modify`
 - For every file in `to_modify`: include its imports and reverse imports in `to_reference`
 - Use EXACT field names above — wrong names cause validation failure
+- After writing BOTH files, call `confirm_phase_done` to finish

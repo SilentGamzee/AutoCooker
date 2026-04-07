@@ -48,3 +48,4 @@ Produce `requirements.json` from the task description and project context.
 - Use ONLY paths from context.json/project_index.json for `files_to_modify`
 - New files that don't exist yet → `files_to_create`, NOT `files_to_modify`
 - Greenfield project with no known files → write `[]` and note in `workflow_rationale`
+- After writing requirements.json, call `confirm_phase_done` to finish

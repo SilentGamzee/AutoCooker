@@ -9,7 +9,7 @@ from core.dumb_util import get_dumb_task_workdir_diff
 import eel  # For UI updates via websocket
 
 from core.state import AppState, KanbanTask
-from core.tools import ToolExecutor, PLANNING_TOOLS, DISCOVERY_READ_TOOLS
+from core.tools import ToolExecutor, PLANNING_TOOLS, DISCOVERY_READ_TOOLS, ANALYSIS_TOOLS
 from core.sandbox import create_sandbox, WORKDIR_NAME
 from core.project_index import analyze_cross_deps
 from core.validator import (
@@ -62,6 +62,28 @@ def _validate_requirements(path: str) -> tuple[bool, str]:
         )
     if not data.get("task_description", "").strip():
         return False, f"[FILE: {path}] task_description is empty"
+    return True, "OK"
+
+
+def _validate_scored_files(path: str) -> tuple[bool, str]:
+    """Validate scored_files.json produced by the index analysis step."""
+    ok, data, err = _read_json(path)
+    if not ok:
+        return False, f"[FILE: {path}] {err}"
+    if not isinstance(data, dict):
+        return False, f"[FILE: {path}] Must be a JSON object"
+    files = data.get("files")
+    if not isinstance(files, list) or len(files) == 0:
+        return False, f"[FILE: {path}] Missing or empty 'files' array"
+    for i, item in enumerate(files[:3]):
+        if not isinstance(item, dict):
+            return False, f"[FILE: {path}] files[{i}] must be an object"
+        for k in ("path", "score", "reason"):
+            if k not in item:
+                return False, f"[FILE: {path}] files[{i}] missing field '{k}'"
+        score = item.get("score")
+        if not isinstance(score, (int, float)) or not (0.0 <= float(score) <= 1.0):
+            return False, f"[FILE: {path}] files[{i}].score must be float 0–1, got {score!r}"
     return True, "OK"
 
 
@@ -466,6 +488,11 @@ class PlanningPhase(BasePhase):
         # НОВЫЙ КОД: Полный цикл планирования с итеративной критикой
         # ═══════════════════════════════════════════════════════════
         
+        # Шаг 0: Index Analysis (non-fatal — enriches subsequent steps)
+        self.log("─── Step 1.0a Index Analysis ───")
+        if not self._step0_index_analysis(model):
+            self.log("  [WARN] Index analysis failed — continuing without file scores", "warn")
+
         # Шаг 1: Discovery (выполняется один раз)
         self.log(f"─── Step 1.1 Discovery ───")
         if not self._step1_discovery(model):
@@ -702,11 +729,21 @@ class PlanningPhase(BasePhase):
         # dict — the write phase automatically sees every file read in phase A.
         shared_read_files: dict = {}
 
+        # ── Inject scored_files priority list ─────────────────────
+        priority_files = self._priority_files()
+        priority_msg = ""
+        if priority_files:
+            lines = ["PRIORITY FILES (score ≥ 0.7 from index analysis — read these first):"]
+            for p in priority_files:
+                lines.append(f"  - {p}")
+            priority_msg = "\n".join(lines) + "\n\n"
+
         # ── Phase A: Read (5 rounds, read-only, TTL=12, dedup) ────────────
         read_msg = (
             f"Project directory: {wd}\n"
             f"Task: {self.task.title}\n"
             f"Task description: {self.task.description}\n\n"
+            f"{priority_msg}"
             f"{cross_deps_msg}"
             f"{file_context_msg}\n\n"
             "READ PHASE: Read all files relevant to the task above. "
@@ -756,6 +793,12 @@ class PlanningPhase(BasePhase):
                 return False, f"context.json: {m2}"
             return True, "OK"
 
+        # ── Reset TTL for all Phase A files before entering Phase B ──
+        # Phase A decremented TTLs during its own rounds. Without a reset,
+        # files expire mid-Phase-B and the model loses its read context.
+        for _info in shared_read_files.values():
+            _info["ttl"] = 12
+
         self.log("─── Step 1.1b Discovery Write ───")
         return self.run_loop(
             "1.1b Discovery Write",
@@ -766,9 +809,10 @@ class PlanningPhase(BasePhase):
             validate,
             model,
             max_outer_iterations=5,
-            file_ttl=12,                             # keep same TTL so files stay visible
-            shared_last_read_files=shared_read_files,  # carry read context into write phase
+            file_ttl=12,
+            shared_last_read_files=shared_read_files,
             reconstruct_after=3,
+            min_rounds_before_confirm=2,
         )
     # ── 1.2 Requirements ──────────────────────────────────────────
     def _step2_requirements(self, model: str) -> bool:
@@ -780,11 +824,13 @@ class PlanningPhase(BasePhase):
         # Provide prior output as context
         proj_idx = self._read_file_safe(proj_idx_path)
         ctx      = self._read_file_safe(context_path)
-        
+        scored   = self._scored_files_ctx()
+
         executor = self._make_planning_executor(wd)
         msg = (
             f"Task name: {self.task.title}\n"
             f"Task description: {self.task.description}\n\n"
+            f"{scored}"
             f"project_index.json:\n{proj_idx}\n\n"
             f"context.json:\n{ctx}\n\n"
             f"Write requirements.json to this EXACT path (copy it verbatim): {self._rel(req_path)}\n\n"
@@ -1665,7 +1711,9 @@ Be concrete and specific. Return ONLY the JSON, no other text.
             pass
 
         executor = self._make_planning_executor(wd)
+        scored   = self._scored_files_ctx()
         msg = (
+            f"{scored}"
             f"requirements.json:\n{req_content}\n\n"
             f"context.json:\n{ctx_content}\n\n"
             + (f"ACTUAL CODE FROM PROJECT (copy these patterns exactly):\n{code_samples}\n\n"
@@ -1871,7 +1919,9 @@ Be concrete and specific. Return ONLY the JSON, no other text.
             if not p.startswith(".tasks") and not p.startswith(".git")
         ) or "  (none scanned)"
 
+        scored = self._scored_files_ctx()
         msg = (
+            f"{scored}"
             f"spec.json:\n{spec_content}\n\n"
             f"context.json:\n{ctx_content}\n\n"
             f"requirements.json:\n{req_content}\n\n"
@@ -1987,7 +2037,9 @@ Be concrete and specific. Return ONLY the JSON, no other text.
                 self.log(f"  [WARN] Workdir diff failed: {exc}", "warn")
 
         executor = self._make_planning_executor(wd)
+        scored = self._scored_files_ctx()
         msg = (
+            f"{scored}"
             f"CORRECTIONS TO APPLY:\n{self.task.corrections}\n\n"
             f"Original spec:\n{spec_content[:1000]}\n\n"
             f"Existing subtask statuses:\n{subtask_summary}\n\n"
@@ -2147,6 +2199,63 @@ Be concrete and specific. Return ONLY the JSON, no other text.
         return True   # missing files are warned but don't block coding
 
     # ── Helpers ───────────────────────────────────────────────────
+    # ── scored_files helpers ─────────────────────────────────────
+    def _scored_files_ctx(self) -> str:
+        """Return scored_files.json as a formatted context block for prompt injection."""
+        path = os.path.join(self.task.task_dir, "scored_files.json")
+        content = self._read_file_safe(path)
+        if content == "(file not found)":
+            return ""
+        return f"FILE RELEVANCE ANALYSIS (scored_files.json):\n{content}\n\n"
+
+    def _priority_files(self) -> list[str]:
+        """Return priority file paths: score >= 0.7, max 10, sorted by score desc."""
+        path = os.path.join(self.task.task_dir, "scored_files.json")
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            files = data.get("files", [])
+            files.sort(key=lambda x: float(x.get("score", 0)), reverse=True)
+            return [f["path"] for f in files if float(f.get("score", 0)) >= 0.7][:10]
+        except Exception:
+            return []
+
+    # ── Step 1.0a: Index Analysis ────────────────────────────────
+    def _step0_index_analysis(self, model: str) -> bool:
+        """
+        Analyse .tasks/project_index.json without reading any file content.
+        Produces scored_files.json: each project file scored 0–1 for relevance
+        to this task, with a one-line reason. Used by all subsequent steps to
+        prioritise reads and focus context.
+        """
+        wd = self.task.project_path or self.state.working_dir
+        scored_path = os.path.join(self.task.task_dir, "scored_files.json")
+        global_index_path = os.path.join(wd, ".tasks", "project_index.json")
+        index_content = self._read_file_safe(global_index_path)
+
+        executor = self._make_planning_executor(wd)
+        msg = (
+            f"Task: {self.task.title}\n"
+            f"Description: {self.task.description}\n\n"
+            f"PROJECT INDEX (all project files with metadata):\n{index_content}\n\n"
+            f"Write scored_files.json to: {self._rel(scored_path)}\n\n"
+            "For EVERY file in the index, output a relevance score 0.0–1.0 and a one-line reason.\n"
+            "Score based on: symbols match task keywords, file is likely to be modified, "
+            "imports/used_by chain connects to task-relevant code.\n"
+            "Include ALL files (even score=0.0 ones) so subsequent steps have the full picture."
+        )
+
+        def validate():
+            return _validate_scored_files(scored_path)
+
+        return self.run_loop(
+            "1.0a Index Analysis", "p0_analysis.md",
+            ANALYSIS_TOOLS, executor, msg, validate, model,
+            max_outer_iterations=5,
+            max_tool_rounds=3,
+            reconstruct_after=2,
+        )
+
     def _make_planning_executor(self, wd: str, **kw):
         """Executor for planning phase — hides .tasks dir from list_directory
         so the model doesn't waste rounds reading other tasks' artifacts."""
