@@ -310,17 +310,24 @@ class OllamaClient:
         log_fn: Optional[Callable[[str], None]] = None,
         is_aborted: Optional[Callable[[], bool]] = None,
         max_tool_rounds: int = 40,
+        file_ttl: int = 3,
+        disable_write_nudge: bool = False,
     ) -> tuple[list[dict], str, int]:
         """
         Execute multi-turn tool-calling loop until the model stops calling
         tools or max_tool_rounds is reached.
 
+        file_ttl: TTL in rounds for entries in last_read_files (default 3,
+                  use 12 for read-only discovery phase so files survive all rounds).
+        disable_write_nudge: if True, suppress the "you haven't written anything"
+                             messages — used during read-only phases.
+
         Returns:
             (history, final_response, tool_calls_made)
         """
         REPEAT_LIMIT = 4
-        READ_FILE_TTL_ROUNDS = 3
-        READ_MAX_ROUNDS = 6
+        READ_FILE_TTL_ROUNDS = file_ttl   # use caller-supplied TTL
+        READ_MAX_ROUNDS = 6 if not disable_write_nudge else 999  # disable forced exit in read-only mode
 
         def _truncate(value: object, limit: int = 1200) -> str:
             text = str(value)
@@ -361,7 +368,7 @@ class OllamaClient:
             for path in expired_files:
                 del last_read_files[path]
 
-            if _rounds_without_write >= 5:
+            if not disable_write_nudge and _rounds_without_write >= 5:
                 already_read = ", ".join(sorted(_files_read)[:5])
                 if already_read:
                     already_read = f"[{already_read}{'...' if len(_files_read) > 5 else ''}]"

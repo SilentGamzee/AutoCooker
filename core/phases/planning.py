@@ -9,7 +9,7 @@ from core.dumb_util import get_dumb_task_workdir_diff
 import eel  # For UI updates via websocket
 
 from core.state import AppState, KanbanTask
-from core.tools import ToolExecutor, PLANNING_TOOLS
+from core.tools import ToolExecutor, PLANNING_TOOLS, DISCOVERY_READ_TOOLS
 from core.sandbox import create_sandbox, WORKDIR_NAME
 from core.project_index import analyze_cross_deps
 from core.validator import (
@@ -603,6 +603,12 @@ class PlanningPhase(BasePhase):
         self.log("═══ PLANNING PHASE COMPLETE ═══")
         return True
     def _step1_discovery(self, model: str) -> bool:
+        """
+        Two-phase discovery:
+          Phase A (read):  5 rounds, read-only tools, TTL=12, dedup enforced.
+          Phase B (write): up to 5 outer retries, write-only pass using
+                           accumulated file contents from Phase A.
+        """
         wd = self.task.project_path or self.state.working_dir
         proj_index_path = os.path.join(self.task.task_dir, "project_index.json")
         context_path    = os.path.join(self.task.task_dir, "context.json")
@@ -691,17 +697,54 @@ class PlanningPhase(BasePhase):
             )
             self.log("  Index not available — using raw file list", "warn")
 
-        msg = (
+        # ── Shared bridge: read phase fills this, write phase reads from it ──
+        # last_read_files is passed by reference so both phases share the same
+        # dict — the write phase automatically sees every file read in phase A.
+        shared_read_files: dict = {}
+
+        # ── Phase A: Read (5 rounds, read-only, TTL=12, dedup) ────────────
+        read_msg = (
             f"Project directory: {wd}\n"
             f"Task: {self.task.title}\n"
             f"Task description: {self.task.description}\n\n"
             f"{cross_deps_msg}"
             f"{file_context_msg}\n\n"
-            f"Write project_index.json to this EXACT path: {self._rel(proj_index_path)}\n"
-            f"Write context.json to this EXACT path: {self._rel(context_path)}\n\n"
-            "Read the most relevant source files to understand the codebase, "
-            "then write both output files immediately. "
-            "Focus only on files relevant to the task — do not read everything."
+            "READ PHASE: Read all files relevant to the task above. "
+            "You have 5 rounds. Do NOT re-read files — each file should be read once only. "
+            "Do NOT write any files — writing is done automatically in the next phase."
+        )
+
+        self.log("─── Step 1.1a Discovery Read (5 rounds) ───")
+        self.run_loop(
+            "1.1a Discovery Read",
+            "p1a_discovery_read.md",
+            DISCOVERY_READ_TOOLS,
+            executor,
+            read_msg,
+            lambda: (True, "OK"),   # read phase always "passes" — no validation needed
+            model,
+            max_outer_iterations=1,   # one pass, no retries for read phase
+            max_tool_rounds=5,        # exactly 5 inner rounds of reading
+            file_ttl=12,              # files survive all 5 read rounds + write phase
+            disable_write_nudge=True, # suppress "you haven't written" messages
+            shared_last_read_files=shared_read_files,
+        )
+
+        files_read_count = len(executor.session_read_files)
+        self.log(f"  Read phase complete: {files_read_count} file(s) read", "ok")
+
+        # ── Phase B: Write (mandatory, up to 5 outer retries) ────────────
+        write_msg = (
+            f"Project directory: {wd}\n"
+            f"Task: {self.task.title}\n"
+            f"Task description: {self.task.description}\n\n"
+            f"WRITE PHASE: All relevant files have been read (see 'Read files from last call' above).\n"
+            f"Files collected during read phase: {sorted(executor.session_read_files.keys())}\n\n"
+            f"You MUST now write BOTH output files:\n"
+            f"  - project_index.json → EXACT path: {self._rel(proj_index_path)}\n"
+            f"  - context.json       → EXACT path: {self._rel(context_path)}\n\n"
+            "Do NOT read more files. All data is already collected above. "
+            "Write project_index.json first, then context.json."
         )
 
         def validate():
@@ -713,9 +756,18 @@ class PlanningPhase(BasePhase):
                 return False, f"context.json: {m2}"
             return True, "OK"
 
+        self.log("─── Step 1.1b Discovery Write ───")
         return self.run_loop(
-            "1.1 Discovery", "p1_discovery.md",
-            PLANNING_TOOLS, executor, msg, validate, model,
+            "1.1b Discovery Write",
+            "p1b_discovery_write.md",
+            PLANNING_TOOLS,
+            executor,
+            write_msg,
+            validate,
+            model,
+            max_outer_iterations=5,
+            file_ttl=12,                             # keep same TTL so files stay visible
+            shared_last_read_files=shared_read_files,  # carry read context into write phase
         )
     # ── 1.2 Requirements ──────────────────────────────────────────
     def _step2_requirements(self, model: str) -> bool:

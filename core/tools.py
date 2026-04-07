@@ -329,6 +329,8 @@ CRITIC_VERDICT_TOOL = {
 # Planning: read-only access to project + write ONLY to task planning directory.
 # MODIFY_FILE is intentionally excluded — no reason to modify project files during planning.
 PLANNING_TOOLS = [READ_FILE, LIST_DIRECTORY, PLANNING_WRITE_FILE, CREATE_TASK]
+# Read-only tools for the Discovery read phase (no write allowed).
+DISCOVERY_READ_TOOLS = [READ_FILE, READ_FILE_RANGE, LIST_DIRECTORY]
 CODING_TOOLS   = [READ_FILE, READ_FILE_RANGE, LIST_DIRECTORY, WRITE_FILE, MODIFY_FILE, LINT_FILE, CONFIRM_TASK_DONE]
 
 # QA Reviewer: strictly read-only — it evaluates, never writes project files.
@@ -374,6 +376,9 @@ class ToolExecutor:
         self.hidden_dirs: set[str] = set()
         # Files that must be modified, never fully overwritten (set by coding phase)
         self.modify_only_files: set[str] = set()
+        # Session-level read deduplication: rel_path → content
+        # Populated during read-only phases; prevents re-reading the same file twice.
+        self.session_read_files: dict[str, str] = {}
 
         # Signals from tools back to the phase runner
         self.last_confirmed_task_id: Optional[str] = None
@@ -443,22 +448,39 @@ class ToolExecutor:
 
     def _read_file(self, args: dict) -> str:
         path_raw = args.get("path", "")
-        abs_path = self._safe_path(path_raw)
+        try:
+            abs_path = self._safe_path(path_raw)
+        except PermissionError as e:
+            return f"ERROR: {e}"
 
         # Validate with sandbox (blocks reads from other tasks)
         validation = self._validate_path(abs_path, "read")
         if validation != "OK":
             return validation
 
+        rel = self._to_rel(abs_path)
+
+        # Session-level deduplication: if already read, return cached content with note.
+        # This prevents the model from re-reading the same file multiple times during
+        # the read phase of Discovery.
+        if self.session_read_files and rel in self.session_read_files:
+            cached = self.session_read_files[rel]
+            return (
+                f"[ALREADY READ — content is current, do NOT read again]\n"
+                f"File: {rel}\n\n"
+                f"{cached}"
+            )
+
         if not os.path.isfile(abs_path):
             return f"ERROR: File not found: {path_raw}"
         try:
             with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
                 content = f.read()
-            path_rel = self._to_rel(abs_path)
-            self.cache.update_content(path_rel, content)
+            self.cache.update_content(rel, content)
             if self.on_content_cached:
-                self.on_content_cached(path_rel, content)
+                self.on_content_cached(rel, content)
+            # Register in session dedup cache
+            self.session_read_files[rel] = content
             return content
         except Exception as e:
             return f"ERROR reading file: {e}"

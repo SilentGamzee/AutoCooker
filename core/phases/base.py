@@ -810,7 +810,18 @@ Token count: {token_count} / {config['max_total_tokens']}
         validate_fn: Callable[[], tuple[bool, str]],
         model: str,
         max_outer_iterations: int = 10,
+        max_tool_rounds: int = 40,
+        file_ttl: int = 3,
+        disable_write_nudge: bool = False,
+        shared_last_read_files: Optional[dict] = None,
     ) -> bool:
+        """
+        max_tool_rounds:       inner tool-call rounds per outer iteration.
+        file_ttl:              TTL for read-file cache entries (default 3; use 12 for read phases).
+        disable_write_nudge:   suppress "you haven't written" nudges (for read-only phases).
+        shared_last_read_files: if provided, use this dict instead of creating a fresh one.
+                                Allows carrying file contents from a read phase into a write phase.
+        """
         self.set_step(step_name)
 
         # ── Build system prompt ONCE before the loop. ─────────────
@@ -827,7 +838,10 @@ Token count: {token_count} / {config['max_total_tokens']}
         messages = [{"role": "user", "content": initial_user_message}]
 
         tool_calls = []
-        last_read_files: dict[str, dict[str, object]] = {}
+        # Use shared dict if provided (bridges read→write phases), else fresh dict.
+        last_read_files: dict[str, dict[str, object]] = (
+            shared_last_read_files if shared_last_read_files is not None else {}
+        )
         for outer in range(max_outer_iterations):
             # ── Abort checkpoint ──────────────────────────────────
             self.state.check_abort(self.task.id)
@@ -851,6 +865,9 @@ Token count: {token_count} / {config['max_total_tokens']}
                     tool_executor=executor,
                     log_fn=self.log,
                     is_aborted=lambda: self.task.id in self.state.abort_requested,
+                    max_tool_rounds=max_tool_rounds,
+                    file_ttl=file_ttl,
+                    disable_write_nudge=disable_write_nudge,
                 )
                 
                 # Логирование после успешного завершения
