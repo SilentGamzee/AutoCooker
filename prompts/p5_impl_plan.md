@@ -86,6 +86,7 @@ Order: backend → HTML → JS → CSS (handlers need DOM elements)
           "completion_without_ollama": "web/index.html contains 'add-attachment-btn' AND web/js/app.js contains 'renderAttachments'",
           "completion_with_ollama": "User can upload, view, and delete attachments",
           "user_visible_impact": "User sees upload button and attachment list in task detail",
+          "visual_spec": "Button uses var(--accent), list items use var(--bg2) background, var(--r6) border-radius, var(--border) border. Gap: 8px between items.",
           "implementation_steps": [
             {
               "action": "Add attachment section to web/index.html after description div",
@@ -107,6 +108,9 @@ Order: backend → HTML → JS → CSS (handlers need DOM elements)
 
 ## FINISH
 After writing implementation_plan.json, call `confirm_phase_done`.
+
+## FRONTEND SUBTASKS
+Every subtask that touches `.css` or `.html` MUST include `visual_spec`: a one-sentence layout/style description using `var(--*)` token names (e.g. `"var(--accent) button, var(--bg2) list items, var(--r6) radius"`).
 
 ## FORBIDDEN PATTERNS
 - Backend subtasks without frontend subtasks for user-facing features

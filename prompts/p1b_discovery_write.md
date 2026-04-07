@@ -37,6 +37,7 @@ All files have been read. Write `project_index.json` then `context.json` using `
   "existing_patterns": {
     "eel_pattern": "@eel.expose decorates Python functions callable from JS"
   },
+  "design_system": "CSS vars in use: --bg, --accent, --text, --r6 (copy from CSS DESIGN TOKENS above)",
   "existing_implementations": [
     { "description": "Pattern in file", "file": "core/state.py", "relevant_because": "Shows how to..." }
   ],

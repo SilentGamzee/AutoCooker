@@ -165,6 +165,15 @@ Rules:
 
 ---
 
+## UI RULES (apply only when `files_to_modify` includes `.css` or `.html`)
+
+- Follow `visual_spec` exactly — it defines the expected look
+- Use `var(--*)` CSS tokens from `visual_spec`; **never hardcode** colors, radii, or font values
+- Match surrounding element styles (margin, padding, font-size) by reading neighboring CSS rules first
+- Do not add new CSS custom properties; use what already exists in `:root`
+
+---
+
 ## QUALITY BAR
 
 Your implementation is done when:

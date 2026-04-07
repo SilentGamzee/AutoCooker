@@ -1,7 +1,9 @@
 """Planning phase: Discovery → Requirements → Spec → Critique → Implementation Plan."""
 from __future__ import annotations
+import glob as _glob
 import json
 import os
+import re
 import shutil
 import time
 from core.dumb_util import get_dumb_task_workdir_diff
@@ -20,6 +22,29 @@ from core.validator import (
 from core.project_index import ProjectIndex
 from core.phases.base import BasePhase
 from core.git_utils import get_branch_diff, get_workdir_diff, get_changed_files_on_branch
+
+
+# ── Style audit (deterministic, no LLM) ──────────────────────────
+
+def _extract_style_audit(project_path: str) -> str:
+    """Parse CSS custom properties from :root. Returns compact token summary."""
+    css_files = _glob.glob(os.path.join(project_path, "web", "css", "*.css"))
+    if not css_files:
+        css_files = _glob.glob(os.path.join(project_path, "**", "*.css"), recursive=True)
+    tokens: dict[str, str] = {}
+    for css_file in css_files[:3]:
+        try:
+            content = open(css_file, encoding="utf-8").read()
+            m = re.search(r":root\s*\{([^}]+)\}", content, re.DOTALL)
+            if m:
+                for tok in re.finditer(r"(--[\w-]+)\s*:\s*([^;]+);", m.group(1)):
+                    tokens[tok.group(1)] = tok.group(2).strip()
+        except Exception:
+            continue
+    if not tokens:
+        return ""
+    pairs = "  " + "\n  ".join(f"{k}: {v}" for k, v in list(tokens.items())[:25])
+    return f"CSS DESIGN TOKENS (always use var(--*), never hardcode):\n{pairs}\n"
 
 
 # ── Validators ────────────────────────────────────────────────────
@@ -348,13 +373,24 @@ def _validate_impl_plan(path: str, project_path: str = "") -> tuple[bool, str]:
     if has_frontend_files and has_backend_files:
         # Check that frontend subtasks have user_visible_impact
         frontend_without_impact = [
-            s.get("id", "?") for s in frontend_subtasks 
+            s.get("id", "?") for s in frontend_subtasks
             if not s.get("user_visible_impact")
         ]
         if frontend_without_impact:
             errors.append(
                 f"Frontend subtasks missing 'user_visible_impact' field: {', '.join(frontend_without_impact)}. "
                 f"All frontend subtasks must explain what user sees/does as a result of the change."
+            )
+
+    # CSS/HTML subtasks must have visual_spec
+    _CSS_HTML_EXT = (".css", ".html", ".htm")
+    for s in all_subtasks:
+        files = s.get("files_to_create", []) + s.get("files_to_modify", [])
+        touches_ui = any(f.endswith(_CSS_HTML_EXT) for f in files)
+        if touches_ui and not s.get("visual_spec", "").strip():
+            errors.append(
+                f"Subtask {s.get('id','?')} touches CSS/HTML but has no 'visual_spec'. "
+                f"Add visual_spec describing expected look: layout, spacing, colors (use var(--*) tokens)."
             )
         
         # Warn if all subtasks are mixed together without phases
@@ -738,6 +774,10 @@ class PlanningPhase(BasePhase):
                 lines.append(f"  - {p}")
             priority_msg = "\n".join(lines) + "\n\n"
 
+        # ── Style audit (deterministic CSS token extraction) ──────────────
+        style_audit = _extract_style_audit(wd)
+        style_msg = f"\n{style_audit}" if style_audit else ""
+
         # ── Phase A: Read (5 rounds, read-only, TTL=12, dedup) ────────────
         read_msg = (
             f"Project directory: {wd}\n"
@@ -746,6 +786,7 @@ class PlanningPhase(BasePhase):
             f"{priority_msg}"
             f"{cross_deps_msg}"
             f"{file_context_msg}\n\n"
+            f"{style_msg}"
             "READ PHASE: Read all files relevant to the task above. "
             "You have 5 rounds. Do NOT re-read files — each file should be read once only. "
             "Do NOT write any files — writing is done automatically in the next phase."
@@ -777,6 +818,7 @@ class PlanningPhase(BasePhase):
             f"Task description: {self.task.description}\n\n"
             f"WRITE PHASE: All relevant files have been read (see 'Read files from last call' above).\n"
             f"Files collected during read phase: {sorted(executor.session_read_files.keys())}\n\n"
+            f"{style_msg}"
             f"You MUST now write BOTH output files:\n"
             f"  - project_index.json → EXACT path: {self._rel(proj_index_path)}\n"
             f"  - context.json       → EXACT path: {self._rel(context_path)}\n\n"
@@ -2088,6 +2130,7 @@ Be concrete and specific. Return ONLY the JSON, no other text.
                     "files_to_modify": s.get("files_to_modify", []),
                     "patterns_from":   s.get("patterns_from", []),
                     "implementation_steps": s.get("implementation_steps", []),
+                    "visual_spec": s.get("visual_spec", ""),
                     # Preserve status from JSON (patch mode keeps "done" subtasks intact)
                     "status": s.get("status", "pending"),
                 })
