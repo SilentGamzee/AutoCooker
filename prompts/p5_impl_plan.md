@@ -8,7 +8,7 @@ Write `implementation_plan.json` from `spec.json` and `context.json`.
 - EVERY user-facing feature needs BOTH backend AND frontend subtasks
 - NEVER create a subtask titled "Verify…", "Check…", "Test…", "Ensure…", "Validate…"
 - Every subtask MUST have at least one entry in `files_to_create` OR `files_to_modify`
-- `implementation_steps` is MANDATORY — at least 2 steps, at least one with `code`
+- `implementation_steps` is MANDATORY — at least 2 steps, each with real `code`
 
 ## PRE-PLANNING: MANDATORY VERIFICATION BEFORE WRITING ANY SUBTASK
 
@@ -19,6 +19,11 @@ For every function, DOM element, or API call you plan to use or modify:
 2. Confirm the exact function/element name exists in that file
 3. If it does NOT exist → either create a preceding subtask to add it, or remove the reference
 4. Add confirmed names to `verify_methods` in the implementation step
+
+**Before writing subtasks, ask yourself:**
+- Does existing code already solve 80% of this? → make the subtask patch that code, not replace it
+- Is there already a function/pattern in the file that handles this case? → reuse it
+- Can this be done in < 10 lines in an existing file? → do it in one step, not a new class
 
 **Specifically required:**
 - Before any JS subtask touching `app.js`: read `app.js` to confirm the exact function names and the exact DOM element IDs (e.g. `btn-continue`, `btn-restart`) that exist
@@ -48,6 +53,47 @@ Order: backend → HTML → JS → CSS (handlers need DOM elements)
 - If a subtask adds < 20 lines: merge with its neighbor
 - Simple: 1–3 subtasks | Standard: 4–10 | Complex: 8–15 per phase
 
+## IMPLEMENTATION STEPS — QUALITY REQUIREMENTS
+
+Each step must be **copy-paste ready** — the coding agent must be able to apply it without additional research.
+
+**For modifications to existing code**, every step MUST include:
+- `find`: the exact existing code block to locate (≥ 2 lines of context so it's unambiguous)
+- `replace`: the complete replacement code
+- `code`: same as `replace` (for backward compatibility)
+
+**For new code additions**, every step MUST include:
+- `insert_after`: the exact line/block after which to insert (verbatim from the file)
+- `code`: the complete new code to insert
+
+**Code quality rules:**
+- No ellipsis (`...`), no `# existing code`, no `# TODO`, no `# rest of function`
+- No placeholder comments like `// implementation here`
+- Each `code` block must be ≥ 3 lines OR be a complete standalone expression
+- Show real variable names from the actual codebase (confirmed via `read_file`)
+- If modifying a function: show the whole modified function, not just the changed line
+
+**Bad step (rejected):**
+```json
+{
+  "action": "Add restart check to state.py",
+  "code": "if restart_signal and current_state['phase'] == 'QA':\n    return {'status': 'Planning'}"
+}
+```
+Why bad: `restart_signal` and `current_state` don't exist; no context where to insert.
+
+**Good step (accepted):**
+```json
+{
+  "action": "In _updateTaskButtons (app.js): change hasStarted to exclude empty task_dir",
+  "find": "const hasStarted = !!(task.task_dir || (task.subtasks && task.subtasks.length) ||\n                        (task.logs && task.logs.length));",
+  "replace": "const hasStarted = !!((task.subtasks && task.subtasks.length) ||\n                        (task.logs && task.logs.length));",
+  "code": "const hasStarted = !!((task.subtasks && task.subtasks.length) ||\n                        (task.logs && task.logs.length));",
+  "verify_methods": ["_updateTaskButtons"]
+}
+```
+Why good: exact find/replace, real variable names from read file, no invented API.
+
 ## OUTPUT FORMAT
 ```json
 {
@@ -76,8 +122,9 @@ Order: backend → HTML → JS → CSS (handlers need DOM elements)
               "code": "from dataclasses import dataclass, field\nfrom datetime import datetime\n\n@dataclass\nclass Attachment:\n    id: str\n    task_id: str\n    filename: str\n    filepath: str\n    uploaded_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())"
             },
             {
-              "action": "Add to_dict method",
-              "code": "def to_dict(self) -> dict:\n    return {\"id\": self.id, \"filename\": self.filename, \"uploaded_at\": self.uploaded_at}"
+              "action": "Add to_dict method inside Attachment class",
+              "insert_after": "    uploaded_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())",
+              "code": "    def to_dict(self) -> dict:\n        return {\"id\": self.id, \"filename\": self.filename, \"uploaded_at\": self.uploaded_at}"
             }
           ],
           "status": "pending"
@@ -104,13 +151,16 @@ Order: backend → HTML → JS → CSS (handlers need DOM elements)
           "visual_spec": "Button uses var(--accent), list items use var(--bg2) background, var(--r6) border-radius, var(--border) border. Gap: 8px between items.",
           "implementation_steps": [
             {
-              "action": "Add attachment section to web/index.html after description div",
-              "code": "<div class=\"attachment-section\">\n  <button id=\"add-attachment-btn\" class=\"btn-secondary\">Add Attachment</button>\n  <input type=\"file\" id=\"attachment-input\" style=\"display:none\">\n  <div id=\"attachment-list\"></div>\n</div>"
+              "action": "Add attachment section to web/index.html after #task-description div",
+              "find": "  <div id=\"task-description\"></div>",
+              "replace": "  <div id=\"task-description\"></div>\n  <div class=\"attachment-section\">\n    <button id=\"add-attachment-btn\" class=\"btn-secondary\">Add Attachment</button>\n    <input type=\"file\" id=\"attachment-input\" style=\"display:none\">\n    <div id=\"attachment-list\"></div>\n  </div>",
+              "code": "  <div class=\"attachment-section\">\n    <button id=\"add-attachment-btn\" class=\"btn-secondary\">Add Attachment</button>\n    <input type=\"file\" id=\"attachment-input\" style=\"display:none\">\n    <div id=\"attachment-list\"></div>\n  </div>"
             },
             {
-              "action": "Add all attachment handlers to web/js/app.js",
-              "code": "function handleAddAttachment() { document.getElementById('attachment-input').click(); }\nasync function renderAttachments(taskId) {\n  const list = await eel.get_attachments(taskId)();\n  document.getElementById('attachment-list').innerHTML = list.map(a =>\n    `<div class=\"attachment-item\">${a.filename} <button onclick=\"handleDeleteAttachment('${taskId}','${a.id}')\">✕</button></div>`\n  ).join('');\n}\nasync function handleDeleteAttachment(taskId, id) {\n  await eel.delete_attachment(taskId, id)();\n  renderAttachments(taskId);\n}",
-              "verify_methods": ["eel.get_attachments", "eel.delete_attachment"]
+              "action": "Add attachment handlers to web/js/app.js after restartActiveTask function",
+              "insert_after": "async function restartActiveTask() {",
+              "code": "function handleAddAttachment() { document.getElementById('attachment-input').click(); }\nasync function renderAttachments(taskId) {\n  const list = await eel.get_attachments(taskId)();\n  document.getElementById('attachment-list').innerHTML = list.map(a =>\n    `<div class=\"attachment-item\">${_esc(a.filename)} <button onclick=\"handleDeleteAttachment('${taskId}','${a.id}')\">✕</button></div>`\n  ).join('');\n}\nasync function handleDeleteAttachment(taskId, id) {\n  await eel.delete_attachment(taskId, id)();\n  renderAttachments(taskId);\n}",
+              "verify_methods": ["eel.get_attachments", "eel.delete_attachment", "_esc"]
             }
           ],
           "status": "pending"
@@ -138,3 +188,5 @@ Every subtask that touches `.css` or `.html` MUST include `visual_spec`: a one-s
 - A subtask whose only purpose is to "ensure styling is consistent" when no new CSS is needed
 - A subtask that modifies planning/workflow logic to "skip steps on restart" unless the task description explicitly requires it
 - `verify_methods` listing a name that was NOT found in the file read (remove the reference instead)
+- `code` containing `...`, `# existing code`, `# TODO`, `# rest of`, `// implementation here`
+- Steps that say "locate the function" or "find the existing" without providing the exact `find` string

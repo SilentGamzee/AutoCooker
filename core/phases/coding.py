@@ -8,7 +8,7 @@ from core.dumb_util import get_dumb_task_workdir_diff
 from core.state import AppState, KanbanTask
 from core.sandbox import WORKDIR_NAME
 from core.tools import ToolExecutor, CODING_TOOLS
-from core.validator import validate_readme
+from core.validator import validate_readme, validate_json_file
 from core.phases.base import BasePhase
 from core.git_utils import get_workdir_diff
 
@@ -442,12 +442,10 @@ class CodingPhase(BasePhase):
             for i in rule_issues_obj
         ]
 
-        # Always run LLM critic — rule issues are passed as context.
-        # LLM covers semantic checks (description compliance, logic, style)
-        # that rule-based checks cannot catch.
+        # LLM critic: 3 sub-phases (completeness, symbols, simplicity)
         llm_issues: list[dict] = []
         try:
-            llm_issues = self._run_llm_critic(subtask_dict, rule_issues, model)
+            llm_issues = self._run_critic_subphases(subtask_dict, rule_issues, model)
         except Exception as e:
             self.log(f"  [WARN] LLM critic crashed: {e}", "warn")
 
@@ -520,114 +518,114 @@ class CodingPhase(BasePhase):
             self.log(f"  [WARN] Critic batch {idx}/{total} failed: {e}", "warn")
             return ""
 
-    def _run_llm_critic(
+    def _run_critic_subphases(
         self,
         subtask_dict: dict,
         rule_issues: list[dict],
         model: str,
     ) -> list[dict]:
         """
-        Batch critic: split diff into chunks → per-chunk analysis (no tools) →
-        final verdict call with all summaries (max_tool_rounds=6).
-        Returns list of critical issue dicts.
+        Run 3 LLM critic sub-phases with file-reading tools:
+          A: completeness   — all steps implemented?
+          B: symbols        — all cross-file references valid?
+          C: simplicity     — any overengineering?
+        Returns list of critical issue dicts (same shape as rule_issues).
         """
-        workdir = os.path.join(self.task.task_dir, WORKDIR_NAME)
+        import json as _json
+        from core.tools import PLANNING_TOOLS  # includes read_file
+
+        workdir      = os.path.join(self.task.task_dir, WORKDIR_NAME)
         project_path = self.task.project_path or self.state.working_dir
+        sid          = subtask_dict.get("id", "?")
 
-        # 1. Build diff chunks (new lines only, ≤2500 chars each)
+        # Build diff for context (new lines only)
         chunks = self._build_diff_chunks(subtask_dict, workdir, project_path)
-        if not chunks:
-            chunks = ["(no diff available)"]
-
-        # 2. Batch analysis passes — collect plain-text summaries
-        batch_summaries: list[str] = []
-        for i, chunk in enumerate(chunks, 1):
-            self.log(f"  ◉ Critic batch {i}/{len(chunks)}...", "info")
-            summary = self._critic_analyze_chunk(chunk, subtask_dict, i, len(chunks), model)
-            if summary.strip():
-                batch_summaries.append(f"Batch {i}/{len(chunks)}: {summary.strip()}")
-
-        # 3. Final verdict pass
-        return self._critic_final_verdict(subtask_dict, rule_issues, batch_summaries, model, workdir)
-
-    def _critic_final_verdict(
-        self,
-        subtask_dict: dict,
-        rule_issues: list[dict],
-        batch_summaries: list[str],
-        model: str,
-        workdir: str,
-    ) -> list[dict]:
-        """Final verdict call: aggregates batch summaries + rule issues → submit_critic_verdict."""
-        from core.tools import CRITIC_VERDICT_TOOL
+        diff_text = "\n\n".join(chunks) if chunks else "(no diff available)"
 
         rule_text = (
             "\n".join(
                 f"  [{i.get('severity','?').upper()}] {i.get('file','?')}: {i.get('description','')}"
                 for i in rule_issues
-            )
-            if rule_issues else "  (none)"
-        )
-        summaries_text = (
-            "\n".join(batch_summaries) if batch_summaries else "  (no issues found in any batch)"
+            ) if rule_issues else "  (none)"
         )
 
-        sid = subtask_dict.get("id", "?")
-        critic_msg = (
-            f"Subtask: {sid} — {subtask_dict.get('title', '')}\n\n"
-            f"## Batch Analysis Summaries\n{summaries_text}\n\n"
-            f"## Rule-based Issues\n{rule_text}\n\n"
-            "Based on the summaries above, call submit_critic_verdict with your final verdict."
-        )
-
-        critic_executor = self._make_executor(workdir)
-        critic_executor.critic_verdict = None
-        critic_executor.critic_verdict_issues = []
-        critic_executor.critic_verdict_summary = ""
-
-        def validate_fn() -> tuple[bool, str]:
-            if critic_executor.critic_verdict is None:
-                return False, "submit_critic_verdict not yet called"
-            if critic_executor.critic_verdict not in ("PASS", "FAIL"):
-                return False, f"Invalid verdict: {critic_executor.critic_verdict!r}"
-            return True, "OK"
-
-        ok = self.run_loop(
-            f"critic-final {sid}",
-            "p6_critic.md",
-            [CRITIC_VERDICT_TOOL],   # only verdict tool — no read tools needed
-            critic_executor,
-            critic_msg,
-            validate_fn,
-            model,
-            max_outer_iterations=1,
-            max_tool_rounds=6,
-            disable_write_nudge=True,
-        )
-
-        if not ok or critic_executor.critic_verdict is None:
-            self.log("  [WARN] LLM critic did not submit verdict in 6 rounds → PASS", "warn")
-            return []
-
-        verdict = critic_executor.critic_verdict
-        summary = critic_executor.critic_verdict_summary
-        issues = critic_executor.critic_verdict_issues or []
-        self.log(f"  LLM critic verdict: {verdict} — {summary}", "info")
-
-        if verdict == "PASS":
-            return []
-
-        return [
-            {
-                "severity": i.get("severity", "critical"),
-                "category": "llm_critic",
-                "file": i.get("file", ""),
-                "description": i.get("description", ""),
-                "line": "",
-            }
-            for i in issues
-            if isinstance(i, dict) and i.get("severity") == "critical"
+        sub_phases = [
+            ("critic-A completeness", "p6a_critic_completeness.md", "critic_completeness.json"),
+            ("critic-B symbols",      "p6b_critic_symbols.md",      "critic_symbols.json"),
+            ("critic-C simplicity",   "p6c_critic_simplicity.md",   "critic_simplicity.json"),
         ]
+
+        all_issues: list[dict] = []
+
+        for step_name, prompt_file, output_filename in sub_phases:
+            self.log(f"  ─── {step_name} ───", "info")
+            output_path  = os.path.join(self.task.task_dir, output_filename)
+            executor     = self._make_executor(workdir)
+
+            msg = (
+                f"Subtask ID: {sid}\n"
+                f"Subtask title: {subtask_dict.get('title', '')}\n"
+                f"Description: {subtask_dict.get('description', '')}\n\n"
+                f"files_to_create: {subtask_dict.get('files_to_create', [])}\n"
+                f"files_to_modify: {subtask_dict.get('files_to_modify', [])}\n\n"
+                f"implementation_steps:\n"
+                + _json.dumps(subtask_dict.get("implementation_steps", []), ensure_ascii=False, indent=2)
+                + f"\n\nDiff (new lines):\n{diff_text}\n\n"
+                f"Rule-based issues already found:\n{rule_text}\n\n"
+                f"Workdir (implemented files): {workdir}\n"
+                f"Project dir (original files): {project_path}\n\n"
+                f"Write {output_filename} to: {output_path}\n"
+            )
+
+            def _make_validator(out=output_path):
+                def validate():
+                    ok, err = validate_json_file(out)
+                    if not ok:
+                        return False, f"{os.path.basename(out)}: {err}"
+                    try:
+                        with open(out, encoding="utf-8") as f:
+                            d = _json.load(f)
+                        if "issues" not in d:
+                            return False, f"{os.path.basename(out)}: missing 'issues' array"
+                    except Exception as e:
+                        return False, str(e)
+                    return True, "OK"
+                return validate
+
+            ok = self.run_loop(
+                step_name, prompt_file,
+                PLANNING_TOOLS, executor, msg, _make_validator(),
+                model,
+                max_outer_iterations=2,
+                max_tool_rounds=6,
+                disable_write_nudge=True,
+            )
+
+            if not ok:
+                self.log(f"  [WARN] {step_name} failed — skipping", "warn")
+                continue
+
+            try:
+                with open(output_path, encoding="utf-8") as f:
+                    report = _json.load(f)
+                issues  = report.get("issues", [])
+                passed  = report.get("passed", True)
+                icon    = "✓" if passed else "⚠️"
+                self.log(f"  {icon} {step_name}: {len(issues)} issue(s)", "ok" if passed else "warn")
+                # Only carry forward critical issues (minor/major are informational)
+                for issue in issues:
+                    if isinstance(issue, dict):
+                        all_issues.append({
+                            "severity": issue.get("severity", "minor"),
+                            "category": f"llm_{step_name.split()[1]}",
+                            "file": issue.get("location", issue.get("file", "")),
+                            "description": issue.get("description", ""),
+                            "line": issue.get("line", ""),
+                        })
+            except Exception as e:
+                self.log(f"  [WARN] Could not read {output_filename}: {e}", "warn")
+
+        return [i for i in all_issues if i.get("severity") == "critical"]
 
     def _handle_subtask_failure(
         self, subtask_dict: dict, critic_feedback: list[str]

@@ -1846,155 +1846,117 @@ Be concrete and specific. Return ONLY the JSON, no other text.
         )
 
     # ── 1.4 Critique ──────────────────────────────────────────────
-    def _step4_critique(self, model: str, iteration: int = 0) -> tuple[bool, list[str]]:
-        """
-        Run critique on the spec and return status + issues found.
-        
-        ИЗМЕНЕНИЯ:
-        - Теперь возвращает tuple[bool, list[str]]: (success, issues)
-        - success = False только при критическом сбое (не при найденных проблемах)
-        - issues = список найденных проблем из critique_report.json
-        - Добавлен параметр iteration для логирования
-        
-        Returns:
-            tuple[bool, list[str]]: (success, issues)
-            - success: True если критика прошла успешно (даже если нашла проблемы)
-            - issues: список найденных проблем (пустой если проблем нет)
+    def _step4_critique(self, model: str, iteration: int = 0) -> tuple[bool, list]:
+        """Run critique as 3 sequential sub-phases (A: scope, B: symbols, C: simplicity).
+        Returns (success, issues) where success=False only on unrecoverable failure.
         """
         if iteration > 0:
-            self.log(f"  Running critique (iteration {iteration + 1})...", "info")
-        
-        # Запускаем первый проход критики
-        ok = self._run_critique_once(model)
-        if not ok:
-            # Критический сбой (не смогли даже запустить критику)
-            return False, []
-        
-        # Читаем результаты критики
-        critique_path = os.path.join(self.task.task_dir, "critique_report.json")
-        issues = []
-        fixes_applied = 0
-        
-        try:
-            import json as _json
-            with open(critique_path, encoding="utf-8") as _f:
-                report = _json.load(_f)
-            
-            # Извлекаем найденные проблемы (поддерживаем оба ключа: issues_found и issues)
-            issues = report.get("issues_found", report.get("issues", []))
-            fixes_applied = report.get("fixes_applied", 0)
-            
-            # Логируем результаты первого прохода
-            if issues:
-                self.log(f"  First pass: found {len(issues)} issue(s)", "info")
-            else:
-                self.log(f"  First pass: no issues found", "ok")
-            
-            # Если были автоматические исправления, делаем второй проход для проверки
-            if fixes_applied > 0:
-                self.log(f"  Re-running critique on fixed spec (fixes_applied={fixes_applied})…", "info")
-                ok2 = self._run_critique_once(model)
-                
-                if ok2:
-                    # Перечитываем отчет после второго прохода
+            self.log(f"  Running critique sub-phases (iteration {iteration + 1})...", "info")
+
+        all_issues, any_fixes = self._run_critique_subphases(model)
+
+        # If any sub-phase applied fixes, re-run once to verify the spec is now clean
+        if any_fixes:
+            self.log("  Sub-phases applied fixes — re-running to verify...", "info")
+            all_issues, _ = self._run_critique_subphases(model)
+
+        return True, all_issues
+
+    def _run_critique_subphases(self, model: str) -> tuple[list, bool]:
+        """Run three critique sub-phases sequentially.
+        Returns (merged_issues, any_fixes_applied).
+        """
+        import json as _json
+
+        wd           = self.task.project_path or self.state.working_dir
+        spec_path    = os.path.join(self.task.task_dir, "spec.json")
+        req_path     = os.path.join(self.task.task_dir, "requirements.json")
+        context_path = os.path.join(self.task.task_dir, "context.json")
+
+        spec_content = self._read_file_safe(spec_path)
+        req_content  = self._read_file_safe(req_path)
+        ctx_content  = self._read_file_safe(context_path)
+
+        sub_phases = [
+            ("1.4a Critique: Scope",      "p4a_critique_scope.md",      "critique_scope.json"),
+            ("1.4b Critique: Symbols",    "p4b_critique_symbols.md",    "critique_symbols.json"),
+            ("1.4c Critique: Simplicity", "p4c_critique_simplicity.md", "critique_simplicity.json"),
+        ]
+
+        all_issues: list = []
+        any_fixes = False
+
+        for step_name, prompt_file, output_filename in sub_phases:
+            self.log(f"  ─── {step_name} ───", "info")
+            output_path = os.path.join(self.task.task_dir, output_filename)
+            executor    = self._make_planning_executor(wd)
+
+            msg = (
+                f"spec.json:\n{spec_content}\n\n"
+                f"requirements.json:\n{req_content}\n\n"
+                f"context.json:\n{ctx_content}\n\n"
+                f"Project directory: {wd}\n\n"
+                f"Write {output_filename} to: {self._rel(output_path)}\n"
+                f"If you fix issues in spec.json, rewrite it at: {self._rel(spec_path)}\n"
+            )
+
+            def _make_validator(out_path=output_path, sp=spec_path):
+                def validate():
+                    ok, err = validate_json_file(out_path)
+                    if not ok:
+                        return False, f"{os.path.basename(out_path)}: {err}"
                     try:
-                        with open(critique_path, encoding="utf-8") as _f:
-                            report2 = _json.load(_f)
-                        issues = report2.get("issues_found", report2.get("issues", []))
-                        
-                        if issues:
-                            self.log(f"  Second pass: found {len(issues)} issue(s)", "info")
-                        else:
-                            self.log(f"  Second pass: no issues found", "ok")
-                    except Exception:
-                        pass
-        
-        except FileNotFoundError:
-            self.log(f"  [WARN] critique_report.json not found", "warn")
-            # Не критично, продолжаем
+                        with open(out_path, encoding="utf-8") as f:
+                            d = _json.load(f)
+                        if "issues" not in d:
+                            return False, f"{os.path.basename(out_path)}: missing 'issues' array"
+                    except Exception as e:
+                        return False, f"{os.path.basename(out_path)}: {e}"
+                    return _validate_spec_json(sp)
+                return validate
+
+            ok = self.run_loop(
+                step_name, prompt_file,
+                PLANNING_TOOLS, executor, msg, _make_validator(),
+                model, max_outer_iterations=3,
+            )
+
+            if not ok:
+                self.log(f"  [WARN] {step_name} failed — skipping", "warn")
+                continue
+
+            # Read results and accumulate
+            try:
+                with open(output_path, encoding="utf-8") as f:
+                    report = _json.load(f)
+                issues = report.get("issues", [])
+                fixes  = report.get("fixes_applied", 0)
+                passed = report.get("passed", True)
+                icon   = "✓" if passed else "⚠️"
+                self.log(f"  {icon} {step_name}: {len(issues)} issue(s)", "ok" if passed else "warn")
+                all_issues.extend(issues)
+                if fixes:
+                    any_fixes = True
+                    spec_content = self._read_file_safe(spec_path)  # reload after fix
+            except Exception as e:
+                self.log(f"  [WARN] Could not read {output_filename}: {e}", "warn")
+
+        # Merge into critique_report.json for downstream consumers
+        critique_path = os.path.join(self.task.task_dir, "critique_report.json")
+        try:
+            merged = {
+                "critique_completed": True,
+                "issues_found": all_issues,
+                "fixes_applied": int(any_fixes),
+                "no_issues_found": len(all_issues) == 0,
+                "summary": f"{len(all_issues)} issue(s) across 3 sub-phases.",
+            }
+            with open(critique_path, "w", encoding="utf-8") as f:
+                _json.dump(merged, f, ensure_ascii=False, indent=2)
         except Exception as e:
-            self.log(f"  [WARN] Could not read critique report: {e}", "warn")
-            # Не критично, продолжаем
-        
-        # Возвращаем успех (критика прошла) и список проблем
-        return True, issues
-    
-    
-    def _run_critique_once(self, model: str) -> bool:
-        """
-        Single critique pass — called once or twice by _step4_critique.
-        
-        БЕЗ ИЗМЕНЕНИЙ (остается как есть)
-        """
-        wd            = self.task.project_path or self.state.working_dir
-        spec_path = os.path.join(self.task.task_dir, "spec.json")
-        req_path      = os.path.join(self.task.task_dir, "requirements.json")
-        context_path  = os.path.join(self.task.task_dir, "context.json")
-        critique_path = os.path.join(self.task.task_dir, "critique_report.json")
-    
-        spec_content = self._read_file_safe(spec_path)
-        req_content  = self._read_file_safe(req_path)
-        ctx_content  = self._read_file_safe(context_path)
-    
-        executor = self._make_planning_executor(wd)
-        msg = (
-            f"spec.json:\n{spec_content}\n\n"
-            f"requirements.json:\n{req_content}\n\n"
-            f"context.json:\n{ctx_content}\n\n"
-            f"Write critique_report.json to: {self._rel(critique_path)}\n"
-            f"If you fix issues, rewrite spec.json at: {self._rel(spec_path)}\n\n"
-            "Focus on: validation drift (requirements that describe only verification, "
-            "not actual implementation), unverifiable acceptance criteria, and invented file paths."
-        )
-    
-        def validate():
-            ok, msg = validate_json_file(critique_path)
-            if not ok:
-                return False, f"critique_report.json: {msg}"
-            # Spec must still be valid after any fixes
-            return _validate_spec_json(spec_path)
-    
-        return self.run_loop(
-            "1.4 Critique", "p4_critique.md",
-            PLANNING_TOOLS, executor, msg, validate, model,
-            max_outer_iterations=5,
-        )
-    def _run_critique_once(self, model: str) -> bool:
-        """Single critique pass — called once or twice by _step4_critique."""
-        wd            = self.task.project_path or self.state.working_dir
-        spec_path = os.path.join(self.task.task_dir, "spec.json")
-        req_path      = os.path.join(self.task.task_dir, "requirements.json")
-        context_path  = os.path.join(self.task.task_dir, "context.json")
-        critique_path = os.path.join(self.task.task_dir, "critique_report.json")
+            self.log(f"  [WARN] Could not write critique_report.json: {e}", "warn")
 
-        spec_content = self._read_file_safe(spec_path)
-        req_content  = self._read_file_safe(req_path)
-        ctx_content  = self._read_file_safe(context_path)
-
-        executor = self._make_planning_executor(wd)
-        msg = (
-            f"spec.json:\n{spec_content}\n\n"
-            f"requirements.json:\n{req_content}\n\n"
-            f"context.json:\n{ctx_content}\n\n"
-            f"Write critique_report.json to: {self._rel(critique_path)}\n"
-            f"If you fix issues, rewrite spec.json at: {self._rel(spec_path)}\n\n"
-            "Focus on: validation drift (requirements that describe only verification, "
-            "not actual implementation), unverifiable acceptance criteria, and invented file paths."
-        )
-
-        def validate():
-            ok, msg = validate_json_file(critique_path)
-            if not ok:
-                return False, f"critique_report.json: {msg}"
-            # Spec must still be valid after any fixes
-            return _validate_spec_json(spec_path)
-
-        return self.run_loop(
-            "1.4 Critique", "p4_critique.md",
-            PLANNING_TOOLS, executor, msg, validate, model,
-            max_outer_iterations=5,
-        )
-
+        return all_issues, any_fixes
     # ── 1.5 Implementation Plan ───────────────────────────────────
     def _step5_impl_plan(self, model: str) -> bool:
         wd          = self.task.project_path or self.state.working_dir
@@ -2015,11 +1977,34 @@ Be concrete and specific. Return ONLY the JSON, no other text.
         ) or "  (none scanned)"
 
         scored = self._scored_files_ctx()
+
+        # Inject critique report so planner knows which overengineering / symbol issues were found
+        critique_path = os.path.join(self.task.task_dir, "critique_report.json")
+        critique_note = ""
+        try:
+            import json as _json
+            with open(critique_path, encoding="utf-8") as _f:
+                _cr = _json.load(_f)
+            _issues = _cr.get("issues_found", _cr.get("issues", []))
+            if _issues:
+                _lines = ["CRITIQUE ISSUES (address these in your subtasks):"]
+                for _i in _issues[:8]:
+                    _sev = _i.get("severity", "?").upper()
+                    _desc = _i.get("description", str(_i))[:150]
+                    _simpler = _i.get("simpler_approach", "")
+                    _lines.append(f"  [{_sev}] {_desc}")
+                    if _simpler:
+                        _lines.append(f"    → Simpler: {_simpler[:120]}")
+                critique_note = "\n".join(_lines) + "\n\n"
+        except Exception:
+            pass
+
         msg = (
             f"{scored}"
             f"spec.json:\n{spec_content}\n\n"
             f"context.json:\n{ctx_content}\n\n"
             f"requirements.json:\n{req_content}\n\n"
+            f"{critique_note}"
             f"Existing project files (ONLY these paths are valid for files_to_modify):\n"
             f"{existing_files}\n\n"
             f"Write implementation_plan.json to: {self._rel(plan_path)}\n\n"
