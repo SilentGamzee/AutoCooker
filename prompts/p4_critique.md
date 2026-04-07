@@ -5,8 +5,9 @@ Review `spec.json` and write `critique_report.json`. If issues found, also rewri
 ## RULES
 - Call at least one tool per response — text-only responses cause task failure
 - Write PURE JSON — no `//` or `/* */` comments
+- **CRITICAL severity issues BLOCK the pipeline** — never use critical unless it's truly blocking
 
-## 5 CHECKS (in order of importance)
+## 6 CHECKS (in order of importance)
 
 **1. Validation drift** — most common failure
 Each requirement must describe WHAT to build, not just WHAT to verify.
@@ -27,10 +28,28 @@ Flag anything not in the original task description.
 **5. Patterns are real**
 Patterns must come from files in `context.json.files_read`. Flag invented patterns.
 
+**6. Symbols and DOM elements exist** ← NEW
+For every function, method, DOM element ID, or API endpoint named in `patterns` or `user_flow`:
+- Use `read_file` on the relevant source file to verify it actually exists
+- Flag as CRITICAL if: a named function is not defined, a `#id` element is absent from HTML, an API method is not exposed
+- Flag as MAJOR if: a class/module is referenced but not confirmed in context
+
+Examples of invented symbols to catch:
+- JS calls `main.execute_phase()` but `execute_phase` is not in `main.py`
+- Frontend checks `task.isRestarted` but that field is not in the state dataclass
+- HTML id `#action-buttons` referenced but that element doesn't exist in `index.html`
+- Subtask proposes to "skip discovery on restart" but planning.py has no such branch
+
+**How to verify:**
+1. Find which files are mentioned in `patterns` / `user_flow`
+2. `read_file` each one
+3. Search for the exact function/element name
+4. If not found → flag CRITICAL with the missing symbol name
+
 ## SEVERITY
-- **CRITICAL**: Wrong implementation direction, invented paths, unverifiable criteria
-- **MAJOR**: Incomplete examples, missing edge cases, inconsistent paths
-- **MINOR**: Unclear wording
+- **CRITICAL**: blocks implementation — invented symbols/paths, wrong implementation direction, unverifiable criteria. **These block the pipeline.**
+- **MAJOR**: reduces quality but doesn't break — incomplete examples, missing edge cases
+- **MINOR**: unclear wording only
 
 ## OUTPUT: critique_report.json
 ```json
@@ -39,8 +58,8 @@ Patterns must come from files in `context.json.files_read`. Flag invented patter
   "issues_found": [
     {
       "severity": "critical|major|minor",
-      "check": "validation_drift|file_traceability|verifiability|scope_creep|invented_patterns",
-      "description": "What is wrong",
+      "check": "validation_drift|file_traceability|verifiability|scope_creep|invented_patterns|symbols_exist",
+      "description": "What is wrong and what was verified",
       "location": "Section in spec.json",
       "fix_applied": "What was changed to fix this"
     }

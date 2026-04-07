@@ -70,13 +70,32 @@ def _read_json(path: str) -> tuple[bool, dict | list | None, str]:
         )
 
 
-def _validate_project_index(path: str) -> tuple[bool, str]:
+def _validate_project_index(path: str, project_path: str = "") -> tuple[bool, str]:
     """Validate project_index.json - includes file path in error messages."""
     ok, data, err = _read_json(path)
     if not ok:
         return False, f"[FILE: {path}] {err}"
     if "services" not in data:
         return False, f"[FILE: {path}] Missing 'services' key"
+
+    # Verify that every file path listed in services.*.files actually exists on disk
+    if project_path:
+        invented: list[str] = []
+        for svc_name, svc in data.get("services", {}).items():
+            if not isinstance(svc, dict):
+                continue
+            for fpath in svc.get("files", {}).keys():
+                abs_p = os.path.join(project_path, fpath)
+                if not os.path.isfile(abs_p):
+                    invented.append(fpath)
+        if invented:
+            sample = invented[:5]
+            return False, (
+                f"[FILE: {path}] project_index contains non-existent file paths "
+                f"(invented by model): {sample}. "
+                f"Only include paths that actually exist on disk."
+            )
+
     return True, "OK"
 
 
@@ -634,12 +653,26 @@ class PlanningPhase(BasePhase):
                     )
                     # НЕ break - продолжаем цикл
                 elif iteration == max_critique_iterations - 1:
-                    # Последняя итерация и достигли минимума - пропускаем к реализации
+                    # Последняя итерация — проверяем severity оставшихся проблем
+                    critical_remaining = [
+                        i for i in critique_issues
+                        if isinstance(i, dict) and i.get("severity") == "critical"
+                    ]
+                    if critical_remaining:
+                        self.log(
+                            f"✗ {len(critical_remaining)} CRITICAL issue(s) not resolved after "
+                            f"{max_critique_iterations} iteration(s) — blocking implementation.",
+                            "error",
+                        )
+                        for i, issue in enumerate(critical_remaining[:3], 1):
+                            desc = issue.get("description", str(issue))[:120]
+                            self.log(f"  CRITICAL {i}: {desc}", "error")
+                        return False
+                    # Только MAJOR/MINOR — предупреждаем, но продолжаем
                     self.log(
-                        f"⚠️ Completed {iteration + 1} critique iteration(s) (minimum: {min_critique_iterations}). "
-                        f"Proceeding with current spec despite {len(critique_issues)} remaining issue(s). "
-                        f"Issues will be addressed during implementation or QA.",
-                        "warn"
+                        f"⚠️ Completed {iteration + 1} critique iteration(s). "
+                        f"{len(critique_issues)} non-critical issue(s) remain. Proceeding.",
+                        "warn",
                     )
                     critique_passed = True
                     break
@@ -822,12 +855,22 @@ class PlanningPhase(BasePhase):
         self.log(f"  Read phase complete: {files_read_count} file(s) read", "ok")
 
         # ── Phase B: Write (mandatory, up to 5 outer retries) ────────────
+        read_phase_files = sorted(executor.session_read_files.keys())
+        valid_paths_note = (
+            "CRITICAL — VALID FILE PATHS ONLY:\n"
+            "project_index.json must list ONLY files that physically exist on disk.\n"
+            f"The only valid paths are those you actually read in Phase A:\n"
+            + "\n".join(f"  {p}" for p in read_phase_files)
+            + "\nDo NOT invent any file path not in this list."
+        )
         write_msg = (
             f"Project directory: {wd}\n"
             f"Task: {self.task.title}\n"
             f"Task description: {self.task.description}\n\n"
             f"WRITE PHASE: All relevant files have been read (see 'Read files from last call' above).\n"
-            f"Files collected during read phase: {sorted(executor.session_read_files.keys())}\n\n"
+            f"Files collected during read phase: {read_phase_files}\n\n"
+            f"{priority_msg}"
+            f"{valid_paths_note}\n\n"
             f"{style_msg}"
             f"You MUST now write BOTH output files:\n"
             f"  - project_index.json → EXACT path: {self._rel(proj_index_path)}\n"
@@ -837,7 +880,7 @@ class PlanningPhase(BasePhase):
         )
 
         def validate():
-            ok1, m1 = _validate_project_index(proj_index_path)
+            ok1, m1 = _validate_project_index(proj_index_path, project_path=wd)
             if not ok1:
                 return False, f"project_index.json: {m1}"
             ok2, m2 = validate_json_file(context_path)
@@ -969,7 +1012,7 @@ class PlanningPhase(BasePhase):
                     with open(critique_path, encoding="utf-8") as _f:
                         critique_report = _json.load(_f)
                     
-                    critique_issues = critique_report.get("issues", [])
+                    critique_issues = critique_report.get("issues_found", critique_report.get("issues", []))
                     if critique_issues:
                         additional_context += f"""
     
@@ -1159,7 +1202,7 @@ class PlanningPhase(BasePhase):
                         with open(critique_path, encoding="utf-8") as _f:
                             critique_report = _json.load(_f)
                         
-                        critique_issues = critique_report.get("issues", [])
+                        critique_issues = critique_report.get("issues_found", critique_report.get("issues", []))
                         if critique_issues:
                             additional_context += f"""
     
@@ -1369,7 +1412,7 @@ Review them and improve based on the critique feedback below.
                         with open(critique_path, encoding="utf-8") as _f:
                             critique_report = _json.load(_f)
                         
-                        critique_issues = critique_report.get("issues", [])
+                        critique_issues = critique_report.get("issues_found", critique_report.get("issues", []))
                         if critique_issues:
                             additional_context += f"""
 
@@ -1549,7 +1592,7 @@ Be concrete and specific. Return ONLY the JSON, no other text.
                         with open(critique_path, encoding="utf-8") as _f:
                             critique_report = _json.load(_f)
                         
-                        critique_issues = critique_report.get("issues", [])
+                        critique_issues = critique_report.get("issues_found", critique_report.get("issues", []))
                         if critique_issues:
                             additional_context += f"""
     
@@ -1837,8 +1880,8 @@ Be concrete and specific. Return ONLY the JSON, no other text.
             with open(critique_path, encoding="utf-8") as _f:
                 report = _json.load(_f)
             
-            # Извлекаем найденные проблемы
-            issues = report.get("issues", [])
+            # Извлекаем найденные проблемы (поддерживаем оба ключа: issues_found и issues)
+            issues = report.get("issues_found", report.get("issues", []))
             fixes_applied = report.get("fixes_applied", 0)
             
             # Логируем результаты первого прохода
@@ -1857,7 +1900,7 @@ Be concrete and specific. Return ONLY the JSON, no other text.
                     try:
                         with open(critique_path, encoding="utf-8") as _f:
                             report2 = _json.load(_f)
-                        issues = report2.get("issues", [])
+                        issues = report2.get("issues_found", report2.get("issues", []))
                         
                         if issues:
                             self.log(f"  Second pass: found {len(issues)} issue(s)", "info")
@@ -2261,15 +2304,15 @@ Be concrete and specific. Return ONLY the JSON, no other text.
             return ""
         return f"FILE RELEVANCE ANALYSIS (scored_files.json):\n{content}\n\n"
 
-    def _priority_files(self) -> list[str]:
-        """Return priority file paths: score >= 0.7, max 10, sorted by score desc."""
+    def _priority_files(self, top_n: int = 10) -> list[str]:
+        """Return top-N priority file paths sorted by score desc, no score threshold."""
         path = os.path.join(self.task.task_dir, "scored_files.json")
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             files = data.get("files", [])
             files.sort(key=lambda x: float(x.get("score", 0)), reverse=True)
-            return [f["path"] for f in files if float(f.get("score", 0)) >= 0.7][:10]
+            return [f["path"] for f in files[:top_n]]
         except Exception:
             return []
 

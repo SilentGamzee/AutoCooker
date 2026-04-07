@@ -10,15 +10,30 @@ Write `implementation_plan.json` from `spec.json` and `context.json`.
 - Every subtask MUST have at least one entry in `files_to_create` OR `files_to_modify`
 - `implementation_steps` is MANDATORY — at least 2 steps, at least one with `code`
 
-## PRE-PLANNING: VERIFY BEFORE YOU WRITE
-Before creating a subtask that references a method/class from another file:
-1. `read_file` that file to confirm the method/class exists
-2. If it doesn't exist: create a preceding subtask to add it first
-3. Add confirmed method names to `verify_methods`
+## PRE-PLANNING: MANDATORY VERIFICATION BEFORE WRITING ANY SUBTASK
+
+**You MUST call `read_file` before writing any subtask that references a symbol.**
+
+For every function, DOM element, or API call you plan to use or modify:
+1. `read_file` the relevant source file
+2. Confirm the exact function/element name exists in that file
+3. If it does NOT exist → either create a preceding subtask to add it, or remove the reference
+4. Add confirmed names to `verify_methods` in the implementation step
+
+**Specifically required:**
+- Before any JS subtask touching `app.js`: read `app.js` to confirm the exact function names and the exact DOM element IDs (e.g. `btn-continue`, `btn-restart`) that exist
+- Before any backend subtask touching `main.py`: read `main.py` to confirm the exposed `@eel.expose` functions and their signatures
+- Before any subtask touching `core/state.py`: read it to confirm the actual dataclass fields and method names
+- Before any HTML subtask: read `index.html` to confirm which element IDs exist
+
+**Never invent:**
+- DOM element IDs not found in HTML (`#action-buttons`, `#start-planning` etc.)
+- Task state fields not in the dataclass (`task.isRestarted`, `task.restart_flag` etc.)
+- API methods not decorated with `@eel.expose` (`main.execute_phase` etc.)
+- Function parameters not in the actual signature
 
 Also verify:
-- `files_to_modify` paths actually exist on disk (use `read_file` or check `History of tool calls:`)
-- HTML elements exist before creating JS handler subtasks
+- `files_to_modify` paths actually exist on disk (check `Existing project files` list above)
 - Don't re-read files already in `Read files from last call:`
 
 ## PHASE STRUCTURE
@@ -118,3 +133,8 @@ Every subtask that touches `.css` or `.html` MUST include `visual_spec`: a one-s
 - Multiple subtasks modifying the same element
 - JS subtask before the HTML subtask that creates the elements it needs
 - `code` referencing a method not confirmed to exist via `read_file`
+- `code` referencing a DOM id (`#something`) not confirmed to exist in HTML via `read_file`
+- `code` referencing a task state field not confirmed to exist in the dataclass via `read_file`
+- A subtask whose only purpose is to "ensure styling is consistent" when no new CSS is needed
+- A subtask that modifies planning/workflow logic to "skip steps on restart" unless the task description explicitly requires it
+- `verify_methods` listing a name that was NOT found in the file read (remove the reference instead)
