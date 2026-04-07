@@ -75,13 +75,17 @@ def _validate_project_index(path: str, project_path: str = "") -> tuple[bool, st
     ok, data, err = _read_json(path)
     if not ok:
         return False, f"[FILE: {path}] {err}"
-    if "services" not in data:
-        return False, f"[FILE: {path}] Missing 'services' key"
+    services = data.get("services", {})
+    if not isinstance(services, dict):
+        return False, (
+            f"[FILE: {path}] 'services' must be a JSON object {{...}}, "
+            f"got {type(services).__name__}. Do not use a JSON array []."
+        )
 
     # Verify that every file path listed in services.*.files actually exists on disk
     if project_path:
         invented: list[str] = []
-        for svc_name, svc in data.get("services", {}).items():
+        for svc_name, svc in services.items():
             if not isinstance(svc, dict):
                 continue
             for fpath in svc.get("files", {}).keys():
