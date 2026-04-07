@@ -7,7 +7,7 @@ import subprocess
 from core.dumb_util import get_dumb_task_workdir_diff
 from core.state import AppState, KanbanTask
 from core.sandbox import WORKDIR_NAME
-from core.tools import ToolExecutor, CODING_TOOLS, CRITIC_TOOLS
+from core.tools import ToolExecutor, CODING_TOOLS
 from core.validator import validate_readme
 from core.phases.base import BasePhase
 from core.git_utils import get_workdir_diff
@@ -453,6 +453,73 @@ class CodingPhase(BasePhase):
 
         return rule_issues, llm_issues
 
+    _SKIP_DIFF_PATTERNS = (
+        "__pycache__", ".pyc", ".pyo", ".pyd",
+        ".git", ".svn", ".hg",
+        "node_modules", ".DS_Store", "Thumbs.db",
+        ".egg-info", ".dist-info", ".mypy_cache", ".ruff_cache",
+        ".pytest_cache", ".tox", "dist/", "build/",
+    )
+
+    def _build_diff_chunks(
+        self, subtask_dict: dict, workdir: str, project_path: str, chunk_size: int = 2500
+    ) -> list[str]:
+        """Build diff chunks using only new (+) lines. Each chunk ≤ chunk_size chars."""
+        files = (subtask_dict.get("files_to_create") or []) + (subtask_dict.get("files_to_modify") or [])
+        sections: list[str] = []
+        for rel_path in files:
+            if any(pat in rel_path for pat in self._SKIP_DIFF_PATTERNS):
+                continue
+            abs_workdir = os.path.join(workdir, rel_path)
+            abs_original = os.path.join(project_path, rel_path)
+            if not os.path.isfile(abs_workdir):
+                continue
+            try:
+                new_lines = open(abs_workdir, encoding="utf-8", errors="replace").readlines()
+                old_lines = (
+                    open(abs_original, encoding="utf-8", errors="replace").readlines()
+                    if os.path.isfile(abs_original) else []
+                )
+                diff = list(difflib.unified_diff(
+                    old_lines, new_lines,
+                    fromfile=f"a/{rel_path}", tofile=f"b/{rel_path}", lineterm="",
+                ))
+                added = [l[1:] for l in diff if l.startswith("+") and not l.startswith("+++")]
+                if added:
+                    sections.append(f"=== {rel_path} ===\n" + "\n".join(added[:100]))
+            except Exception:
+                continue
+
+        if not sections:
+            return []
+
+        full = "\n\n".join(sections)
+        chunks: list[str] = []
+        while full:
+            chunk, full = full[:chunk_size], full[chunk_size:]
+            if chunk.strip():
+                chunks.append(chunk)
+        return chunks
+
+    def _critic_analyze_chunk(
+        self, chunk: str, subtask_dict: dict, idx: int, total: int, model: str
+    ) -> str:
+        """One-shot batch analysis via complete() — no tools, returns plain text summary."""
+        prompt = (
+            "You are a code critic. Analyze the new code lines below and list any problems.\n"
+            "Be concise (2-5 sentences). Focus on: wrong/missing implementations, broken logic, "
+            "missing imports. Do NOT give a final verdict.\n\n"
+            f"Subtask: {subtask_dict.get('title', '')}\n"
+            f"Description: {subtask_dict.get('description', '')[:400]}\n\n"
+            f"New code (chunk {idx}/{total}):\n```\n{chunk}\n```\n\n"
+            "List issues found. If nothing wrong, say 'No issues'."
+        )
+        try:
+            return self.ollama.complete(model=model, prompt=prompt, max_tokens=300, log_fn=self.log)
+        except Exception as e:
+            self.log(f"  [WARN] Critic batch {idx}/{total} failed: {e}", "warn")
+            return ""
+
     def _run_llm_critic(
         self,
         subtask_dict: dict,
@@ -460,74 +527,60 @@ class CodingPhase(BasePhase):
         model: str,
     ) -> list[dict]:
         """
-        Run the LLM critic using p6_critic.md + submit_critic_verdict tool.
-        Returns list of issue dicts from the LLM verdict.
+        Batch critic: split diff into chunks → per-chunk analysis (no tools) →
+        final verdict call with all summaries (max_tool_rounds=6).
+        Returns list of critical issue dicts.
         """
         workdir = os.path.join(self.task.task_dir, WORKDIR_NAME)
         project_path = self.task.project_path or self.state.working_dir
 
-        # Build diff text for context
-        files_to_check = (
-            (subtask_dict.get("files_to_create") or [])
-            + (subtask_dict.get("files_to_modify") or [])
-        )
-        diff_sections: list[str] = []
-        for rel_path in files_to_check:
-            abs_workdir = os.path.join(workdir, rel_path)
-            abs_original = os.path.join(project_path, rel_path)
-            if not os.path.isfile(abs_workdir):
-                continue
-            try:
-                with open(abs_workdir, "r", encoding="utf-8", errors="replace") as fh:
-                    new_lines = fh.readlines()
-                old_lines: list[str] = []
-                if os.path.isfile(abs_original):
-                    with open(abs_original, "r", encoding="utf-8", errors="replace") as fh:
-                        old_lines = fh.readlines()
-                diff = list(
-                    difflib.unified_diff(
-                        old_lines, new_lines,
-                        fromfile=f"a/{rel_path}", tofile=f"b/{rel_path}",
-                        lineterm="",
-                    )
-                )
-                if diff:
-                    diff_sections.append("\n".join(diff[:200]))  # cap per file
-            except Exception:
-                pass
+        # 1. Build diff chunks (new lines only, ≤2500 chars each)
+        chunks = self._build_diff_chunks(subtask_dict, workdir, project_path)
+        if not chunks:
+            chunks = ["(no diff available)"]
 
-        diff_text = "\n\n".join(diff_sections) if diff_sections else "(no diff available)"
+        # 2. Batch analysis passes — collect plain-text summaries
+        batch_summaries: list[str] = []
+        for i, chunk in enumerate(chunks, 1):
+            self.log(f"  ◉ Critic batch {i}/{len(chunks)}...", "info")
+            summary = self._critic_analyze_chunk(chunk, subtask_dict, i, len(chunks), model)
+            if summary.strip():
+                batch_summaries.append(f"Batch {i}/{len(chunks)}: {summary.strip()}")
 
-        # Format rule issues
-        if rule_issues:
-            rule_issues_text = "\n".join(
-                f"  [{i.get('severity','?').upper()}] [{i.get('category','?')}] "
-                f"{i.get('file', '?')}: {i.get('description', '')}"
+        # 3. Final verdict pass
+        return self._critic_final_verdict(subtask_dict, rule_issues, batch_summaries, model, workdir)
+
+    def _critic_final_verdict(
+        self,
+        subtask_dict: dict,
+        rule_issues: list[dict],
+        batch_summaries: list[str],
+        model: str,
+        workdir: str,
+    ) -> list[dict]:
+        """Final verdict call: aggregates batch summaries + rule issues → submit_critic_verdict."""
+        from core.tools import CRITIC_VERDICT_TOOL
+
+        rule_text = (
+            "\n".join(
+                f"  [{i.get('severity','?').upper()}] {i.get('file','?')}: {i.get('description','')}"
                 for i in rule_issues
             )
-        else:
-            rule_issues_text = "  (none)"
-
-        # Build critic message
-        sid = subtask_dict.get("id", "?")
-        critic_msg = (
-            f"Subtask ID: {sid}\n"
-            f"Title: {subtask_dict.get('title', '')}\n\n"
-            f"Description:\n{subtask_dict.get('description', '')}\n\n"
-            f"Files to create: {subtask_dict.get('files_to_create', [])}\n"
-            f"Files to modify: {subtask_dict.get('files_to_modify', [])}\n\n"
-            f"## Diff (workdir vs project baseline)\n"
-            f"```diff\n{diff_text[:6000]}\n```\n\n"
-            f"## Rule-based pre-check results\n"
-            f"{rule_issues_text}\n\n"
-            "Review the above diff and rule-based results. "
-            "Call submit_critic_verdict with your verdict."
+            if rule_issues else "  (none)"
+        )
+        summaries_text = (
+            "\n".join(batch_summaries) if batch_summaries else "  (no issues found in any batch)"
         )
 
-        # Create a fresh executor for the critic (read-only workdir)
-        critic_executor = self._make_executor(workdir)
+        sid = subtask_dict.get("id", "?")
+        critic_msg = (
+            f"Subtask: {sid} — {subtask_dict.get('title', '')}\n\n"
+            f"## Batch Analysis Summaries\n{summaries_text}\n\n"
+            f"## Rule-based Issues\n{rule_text}\n\n"
+            "Based on the summaries above, call submit_critic_verdict with your final verdict."
+        )
 
-        # Reset verdict state
+        critic_executor = self._make_executor(workdir)
         critic_executor.critic_verdict = None
         critic_executor.critic_verdict_issues = []
         critic_executor.critic_verdict_summary = ""
@@ -539,46 +592,42 @@ class CodingPhase(BasePhase):
                 return False, f"Invalid verdict: {critic_executor.critic_verdict!r}"
             return True, "OK"
 
-        # Run the LLM critic loop (fewer iterations — it just reads and judges)
         ok = self.run_loop(
-            f"critic {sid}",
+            f"critic-final {sid}",
             "p6_critic.md",
-            CRITIC_TOOLS,
+            [CRITIC_VERDICT_TOOL],   # only verdict tool — no read tools needed
             critic_executor,
             critic_msg,
             validate_fn,
             model,
-            max_outer_iterations=4,
+            max_outer_iterations=1,
+            max_tool_rounds=6,
+            disable_write_nudge=True,
         )
 
         if not ok or critic_executor.critic_verdict is None:
-            self.log("  [WARN] LLM critic did not submit a verdict", "warn")
+            self.log("  [WARN] LLM critic did not submit verdict in 6 rounds → PASS", "warn")
             return []
 
         verdict = critic_executor.critic_verdict
-        issues = critic_executor.critic_verdict_issues or []
         summary = critic_executor.critic_verdict_summary
-
+        issues = critic_executor.critic_verdict_issues or []
         self.log(f"  LLM critic verdict: {verdict} — {summary}", "info")
 
         if verdict == "PASS":
             return []
 
-        # Return issues as dicts (ensure required fields present)
-        result: list[dict] = []
-        for issue in issues:
-            if not isinstance(issue, dict):
-                continue
-            result.append(
-                {
-                    "severity": issue.get("severity", "critical"),
-                    "category": "llm_critic",
-                    "file": issue.get("file", ""),
-                    "description": issue.get("description", ""),
-                    "line": "",
-                }
-            )
-        return result
+        return [
+            {
+                "severity": i.get("severity", "critical"),
+                "category": "llm_critic",
+                "file": i.get("file", ""),
+                "description": i.get("description", ""),
+                "line": "",
+            }
+            for i in issues
+            if isinstance(i, dict) and i.get("severity") == "critical"
+        ]
 
     def _handle_subtask_failure(
         self, subtask_dict: dict, critic_feedback: list[str]

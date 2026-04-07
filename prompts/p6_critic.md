@@ -21,14 +21,6 @@ You MUST call `submit_critic_verdict` exactly once before finishing. Do not writ
 5. **Cross-file consistency** — if a function signature changed, are all callers updated?
 6. **No duplicate logic** — was existing code reused instead of reimplemented?
 
-## RULE-BASED PRE-CHECKS (already run — use these results)
-
-The following rule-based checks have already been run:
-
-{rule_issues}
-
-Focus your LLM analysis on what rules cannot catch: semantic correctness, description compliance, and logic quality.
-
 ## SEVERITY GUIDE
 
 - `critical`: blocks functionality (wrong method name, missing implementation, syntax the linter missed)

@@ -385,8 +385,8 @@ QA_REVIEWER_TOOLS = [READ_FILE, READ_FILE_RANGE, LIST_DIRECTORY, LINT_FILE, SUBM
 QA_FIXER_TOOLS    = [READ_FILE, READ_FILE_RANGE, LIST_DIRECTORY, WRITE_FILE, MODIFY_FILE, LINT_FILE]
 QA_TOOLS          = QA_REVIEWER_TOOLS
 
-# Critic: read-only + verdict submission
-CRITIC_TOOLS = [READ_FILE, READ_FILE_RANGE, LIST_DIRECTORY, LINT_FILE, CRITIC_VERDICT_TOOL]
+# Critic: verdict only — diff/summaries already in message, no file reads needed
+CRITIC_TOOLS = [CRITIC_VERDICT_TOOL, LINT_FILE]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
