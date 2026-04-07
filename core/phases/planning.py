@@ -768,6 +768,7 @@ class PlanningPhase(BasePhase):
             max_outer_iterations=5,
             file_ttl=12,                             # keep same TTL so files stay visible
             shared_last_read_files=shared_read_files,  # carry read context into write phase
+            reconstruct_after=3,
         )
     # ── 1.2 Requirements ──────────────────────────────────────────
     def _step2_requirements(self, model: str) -> bool:
@@ -798,6 +799,7 @@ class PlanningPhase(BasePhase):
         return self.run_loop(
             "1.2 Requirements", "p2_requirements.md",
             PLANNING_TOOLS, executor, msg, validate, model,
+            reconstruct_after=2,
         )
     
     # ── 1.2.1 Extract Requirements Checklist ──────────────────────
@@ -1697,6 +1699,7 @@ Be concrete and specific. Return ONLY the JSON, no other text.
         return self.run_loop(
             "1.3 Spec", "p3_spec.json",  # Промпт остается тот же для инструкций
             PLANNING_TOOLS, executor, msg, validate, model,
+            reconstruct_after=2,
         )
 
     # ── 1.4 Critique ──────────────────────────────────────────────
@@ -1896,6 +1899,7 @@ Be concrete and specific. Return ONLY the JSON, no other text.
         return self.run_loop(
             "1.5 Impl Plan", "p5_impl_plan.md",
             PLANNING_TOOLS, executor, msg, validate, model,
+            reconstruct_after=3,
         )
 
     # ── 1.5b Patch plan (corrections mode) ───────────────────────
@@ -2007,6 +2011,7 @@ Be concrete and specific. Return ONLY the JSON, no other text.
         return self.run_loop(
             "1.5 Patch Plan", "p5_impl_plan.md",
             PLANNING_TOOLS, executor, msg, validate, model,
+            reconstruct_after=2,
         )
 
     # ── 1.6 Load subtasks ─────────────────────────────────────────

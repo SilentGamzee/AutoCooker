@@ -1,7 +1,11 @@
 """Base phase runner — structured logging, Ollama loop."""
 from __future__ import annotations
+import json
 import os
+from pathlib import Path
 from typing import Callable, Optional
+
+from core.json_repair import repair_json
 
 import eel
 
@@ -799,6 +803,42 @@ Token count: {token_count} / {config['max_total_tokens']}
             **kwargs,
         )
 
+    # ── Extract data from broken file ───────────────────────────
+    def _extract_data_from_broken_file(self, file_path: str) -> str:
+        """
+        Read a file that failed validation and extract whatever data is recoverable.
+        Tries json.loads first, then repair_json, then falls back to raw text.
+        Returns a formatted string suitable for inclusion in a reconstruct prompt.
+        """
+        try:
+            raw = Path(file_path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return "(file not found on disk)"
+
+        if not raw.strip():
+            return "(file is empty)"
+
+        # Try parsing as-is
+        try:
+            parsed = json.loads(raw)
+            return json.dumps(parsed, ensure_ascii=False, indent=2)
+        except json.JSONDecodeError:
+            pass
+
+        # Try repair_json
+        try:
+            repaired, was_repaired = repair_json(raw)
+            parsed = json.loads(repaired)
+            note = "\n(NOTE: data was partially repaired — verify completeness before using)"
+            return json.dumps(parsed, ensure_ascii=False, indent=2) + note
+        except Exception:
+            pass
+
+        # Fallback: raw text, capped at 3000 chars
+        truncated = raw[:3000]
+        suffix = f"\n…(truncated, total {len(raw)} chars)" if len(raw) > 3000 else ""
+        return f"(raw, could not parse as JSON)\n{truncated}{suffix}"
+
     # ── Ollama outer loop ────────────────────────────────────────
     def run_loop(
         self,
@@ -814,6 +854,7 @@ Token count: {token_count} / {config['max_total_tokens']}
         file_ttl: int = 3,
         disable_write_nudge: bool = False,
         shared_last_read_files: Optional[dict] = None,
+        reconstruct_after: Optional[int] = None,
     ) -> bool:
         """
         max_tool_rounds:       inner tool-call rounds per outer iteration.
@@ -821,6 +862,8 @@ Token count: {token_count} / {config['max_total_tokens']}
         disable_write_nudge:   suppress "you haven't written" nudges (for read-only phases).
         shared_last_read_files: if provided, use this dict instead of creating a fresh one.
                                 Allows carrying file contents from a read phase into a write phase.
+        reconstruct_after:     if set, after this many failed outer iterations switch from
+                               "fix the file" mode to "rewrite from scratch" mode.
         """
         self.set_step(step_name)
 
@@ -1018,16 +1061,72 @@ Token count: {token_count} / {config['max_total_tokens']}
                 # combines the original task with the current error context.
                 # This prevents unbounded context growth across retries while
                 # still giving the model everything it needs to fix the issue.
-                messages = [{
-                    "role": "user",
-                    "content": (
-                        initial_user_message
-                        + f"\n\n{'─' * 60}\n"
-                        + f"RETRY {outer + 1}/{max_outer_iterations - 1}\n"
-                        + f"{'─' * 60}\n\n"
-                        + retry_msg
-                    ),
-                }]
+
+                use_reconstruct = (
+                    reconstruct_after is not None
+                    and outer >= reconstruct_after - 1  # 0-based: trigger after reconstruct_after failures
+                )
+
+                if use_reconstruct:
+                    reconstruct_num = outer - (reconstruct_after - 1) + 1
+                    self.log(
+                        f"  [RECONSTRUCT] Switching to full-rewrite mode "
+                        f"(attempt {reconstruct_num}, triggered after {reconstruct_after} failures)",
+                        "warn",
+                    )
+                    print(
+                        f"[RUN_LOOP] reconstruct mode: outer={outer}, reconstruct_after={reconstruct_after}, attempt={reconstruct_num}",
+                        flush=True,
+                    )
+
+                    extracted = ""
+                    if failed_file_path:
+                        extracted = self._extract_data_from_broken_file(failed_file_path)
+
+                    reconstruct_msg = (
+                        f"{'━' * 60}\n"
+                        f"REWRITE FROM SCRATCH (attempt {reconstruct_num})\n"
+                        f"{'━' * 60}\n\n"
+                        f"The file failed validation {outer + 1} time(s) in a row.\n"
+                        f"Previous error: {reason}\n\n"
+                        "DO NOT attempt to patch or fix the existing file.\n"
+                        "Write a COMPLETELY NEW, VALID version from scratch.\n\n"
+                    )
+                    if extracted:
+                        reconstruct_msg += (
+                            "EXTRACTED DATA FROM CURRENT FILE\n"
+                            "(incorporate the valid parts; discard anything broken):\n"
+                            f"{extracted}\n\n"
+                        )
+                    reconstruct_msg += (
+                        "REQUIREMENTS:\n"
+                        "1. Write PURE, VALID JSON — no comments, no markdown, no truncation.\n"
+                        "2. Include ALL required fields as described in the original task above.\n"
+                        "3. Call write_file with the COMPLETE new content.\n"
+                        "4. Do NOT describe what you will do — just call write_file.\n"
+                    )
+                    if failed_file_path:
+                        reconstruct_msg += f"\nPATH TO USE: {failed_file_path}\n"
+
+                    messages = [{
+                        "role": "user",
+                        "content": (
+                            initial_user_message
+                            + f"\n\n{'─' * 60}\n"
+                            + reconstruct_msg
+                        ),
+                    }]
+                else:
+                    messages = [{
+                        "role": "user",
+                        "content": (
+                            initial_user_message
+                            + f"\n\n{'─' * 60}\n"
+                            + f"RETRY {outer + 1}/{max_outer_iterations - 1}\n"
+                            + f"{'─' * 60}\n\n"
+                            + retry_msg
+                        ),
+                    }]
 
         self.log(
             f"  [WARN] Step '{step_name}' exhausted {max_outer_iterations} iterations",
