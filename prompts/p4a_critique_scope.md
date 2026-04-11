@@ -26,6 +26,22 @@ Compare spec.json scope vs requirements.json task_description.
 Every file path in spec.json (task_scope, patterns) must come from context.json files_read
 or be explicitly mentioned in the task description. Flag invented paths.
 
+## PROPORTIONALITY RULE
+
+Count the files in `context.json → files_read` that will be MODIFIED (not just read).
+- 1–2 files modified → max 3 issues total (across all checks)
+- 3–5 files modified → max 5 issues
+- 6+ files modified → no cap
+
+If you have more issues than the cap: keep the most severe ones, downgrade the rest to `minor` or omit.
+A small task must NOT produce a large spec — resist adding hypothetical edge cases.
+
+**Never generate issues for things NOT in the task description:**
+- No concurrency/race-condition issues unless the task explicitly mentions concurrency
+- No accessibility issues unless the task explicitly mentions accessibility
+- No rollback/undo issues unless the task explicitly mentions error recovery
+- No "future extensibility" or "potential future requirements" issues
+
 ## OUTPUT FORMAT
 ```json
 {

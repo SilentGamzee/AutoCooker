@@ -101,4 +101,18 @@ If no issues:
 }
 ```
 
+## SCOPE BOUNDARY RULE
+
+Only generate issues for things **explicitly mentioned or implied** by the task description. Do NOT invent:
+- Concurrency/race-condition issues unless the task description mentions concurrent access
+- Accessibility issues unless the task description mentions accessibility
+- Error recovery/rollback scenarios unless the task description mentions failure handling
+- "Future extensibility" concerns
+- Issues about features adjacent to the task but not part of it
+
+If the task is "change button text on restart" — critique only the restart flow, not state management at large.
+
+**Proportionality**: the number of issues should be proportional to the scope of the task.
+A 2-file, 20-line change should have ≤ 3 critical/major issues. If you have more, keep only the most impactful ones.
+
 After writing critique_report.json (and spec.json if fixes applied), call `confirm_phase_done`.

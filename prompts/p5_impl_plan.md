@@ -6,8 +6,10 @@ Write `implementation_plan.json` from `spec.json` and `context.json`.
 - Call at least one tool per response — text-only responses cause task failure
 - Write PURE JSON — no `//` or `/* */` comments
 - EVERY user-facing feature needs BOTH backend AND frontend subtasks
-- NEVER create a subtask titled "Verify…", "Check…", "Test…", "Ensure…", "Validate…"
-- Every subtask MUST have at least one entry in `files_to_create` OR `files_to_modify`
+- NEVER create a subtask titled "Verify…", "Check…", "Test…", "Ensure…", "Validate…", "Manual QA…", "Regression…", "Code review…"
+- NEVER create a phase titled "Testing", "Testing and Validation", "QA", "Quality Assurance", "Validation", "Verification" — AutoCooker runs QA separately
+- Every subtask MUST have at least one entry in `files_to_create` OR `files_to_modify` with actual source files
+- `files_to_modify` paths MUST be project-relative (e.g. `main.py`, `web/js/app.js`) — NEVER use `.tasks/` prefix
 - `implementation_steps` is MANDATORY — at least 2 steps, each with real `code`
 
 ## PRE-PLANNING: MANDATORY VERIFICATION BEFORE WRITING ANY SUBTASK
@@ -190,3 +192,5 @@ Every subtask that touches `.css` or `.html` MUST include `visual_spec`: a one-s
 - `verify_methods` listing a name that was NOT found in the file read (remove the reference instead)
 - `code` containing `...`, `# existing code`, `# TODO`, `# rest of`, `// implementation here`
 - Steps that say "locate the function" or "find the existing" without providing the exact `find` string
+- A "Testing", "QA", or "Validation" phase — delete it; keep only implementation phases
+- `files_to_modify` paths containing `.tasks/` prefix (e.g. `.tasks/task_021/main.py` is WRONG; use `main.py`)

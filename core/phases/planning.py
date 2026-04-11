@@ -374,6 +374,16 @@ def _validate_impl_plan(path: str, project_path: str = "") -> tuple[bool, str]:
         if not isinstance(phase, dict):
             errors.append(f"phases[{i}] must be an object, got {type(phase).__name__}: {str(phase)[:60]}")
             continue
+        # Reject testing/QA phases — AutoCooker handles QA separately
+        _TESTING_PHASE_KW = ("testing", "qa", "quality assurance", "validation", "verification")
+        _phase_title_lower = phase.get("title", "").lower()
+        if any(kw in _phase_title_lower for kw in _TESTING_PHASE_KW):
+            errors.append(
+                f"phases[{i}] title '{phase.get('title','')}' is a testing/QA phase. "
+                f"Remove this phase entirely — AutoCooker handles QA separately. "
+                f"Merge any implementation steps into phase-1 or phase-2."
+            )
+            continue
         subs = phase.get("subtasks", [])
         if not isinstance(subs, list) or len(subs) == 0:
             errors.append(f"phases[{i}] (id={phase.get('id','?')!r}) has no subtasks array")
@@ -388,7 +398,10 @@ def _validate_impl_plan(path: str, project_path: str = "") -> tuple[bool, str]:
             if not s.get("completion_without_ollama", "").strip():
                 sub_errors.append("missing 'completion_without_ollama'")
             if not (s.get("files_to_create") or s.get("files_to_modify")):
-                sub_errors.append("no files_to_create or files_to_modify")
+                sub_errors.append(
+                    "no files_to_create or files_to_modify — "
+                    "DELETE this subtask entirely; do NOT add fake log/report/test files"
+                )
             # Validate implementation_steps
             steps = s.get("implementation_steps", [])
             if not steps or not isinstance(steps, list):
@@ -416,12 +429,19 @@ def _validate_impl_plan(path: str, project_path: str = "") -> tuple[bool, str]:
                     continue
                 full = os.path.join(project_path, fpath)
                 if not os.path.isfile(full):
-                    # Changed from ERROR to WARNING - file might exist but path is wrong
-                    # or file will be created by earlier subtask
-                    warnings.append(
-                        f"Subtask {s.get('id','?')}: files_to_modify '{fpath}' "
-                        f"does not exist in the project (this is OK if file will be created earlier)"
-                    )
+                    if ".tasks/" in fpath:
+                        errors.append(
+                            f"Subtask {s.get('id','?')}: files_to_modify '{fpath}' "
+                            f"contains '.tasks/' prefix — use project-relative paths only "
+                            f"(e.g. 'main.py', not '.tasks/task_021/main.py')"
+                        )
+                    else:
+                        # Changed from ERROR to WARNING - file might exist but path is wrong
+                        # or file will be created by earlier subtask
+                        warnings.append(
+                            f"Subtask {s.get('id','?')}: files_to_modify '{fpath}' "
+                            f"does not exist in the project (this is OK if file will be created earlier)"
+                        )
 
     # Reject verify-only subtasks that have no files to write.
     # These are planning drift — they describe checking, not building.
@@ -429,16 +449,22 @@ def _validate_impl_plan(path: str, project_path: str = "") -> tuple[bool, str]:
         "verify ", "check ", "test ", "ensure ", "validate ",
         "confirm ", "make sure", "assert ",
     )
+    TESTING_KEYWORDS = (
+        "manual qa", "regression test", "code review", "manual test",
+        "qa testing", "end-to-end test", "e2e test",
+    )
     for s in all_subtasks:
         title_lower = s.get("title", "").lower().strip()
-        if any(title_lower.startswith(p) for p in VERIFY_PREFIXES):
+        is_verify = any(title_lower.startswith(p) for p in VERIFY_PREFIXES)
+        is_testing = any(kw in title_lower for kw in TESTING_KEYWORDS)
+        if is_verify or is_testing:
             has_files = s.get("files_to_create") or s.get("files_to_modify")
             if not has_files:
                 errors.append(
                     f"Subtask {s.get('id','?')}: title '{s.get('title','')}' "
-                    f"is a verify-only task (no files_to_create or files_to_modify). "
-                    f"Rewrite it as an implementation task with actual files to change, "
-                    f"or remove it entirely."
+                    f"is a manual testing/review task (no files_to_create or files_to_modify). "
+                    f"DELETE it — manual steps cannot be automated. Replace with an implementation "
+                    f"subtask that modifies actual source files."
                 )
 
     # Check for full-stack planning - if there are frontend files, must have frontend subtasks
