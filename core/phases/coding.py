@@ -133,8 +133,11 @@ class CodingPhase(BasePhase):
                 coding_ok = self._execute_one_task(subtask_dict, model, critic_feedback)
 
                 if not coding_ok:
-                    self.log(f"  ↻ Coding failed on iter {iteration}, retrying...", "warn")
-                    critic_feedback = []
+                    fail_reason = f"Iteration {iteration}: coding loop did not complete (no confirm_task_done called)"
+                    self.log(f"  ↻ {fail_reason}", "warn")
+                    # Не сбрасываем critic_feedback — накапливаем причины провалов
+                    if fail_reason not in critic_feedback:
+                        critic_feedback.append(fail_reason)
                     continue
 
                 # Coding succeeded → run critic
@@ -216,6 +219,7 @@ class CodingPhase(BasePhase):
             if task_id.strip() == sid.strip():
                 confirmed["done"] = True
                 confirmed["summary"] = summary
+                subtask_dict["done_summary"] = summary[:200]  # для completed_summary следующих subtasks
                 self.log(f"    ✓ confirm_task_done: {summary[:120]}", "confirm")
 
         executor = self._make_executor(
@@ -265,24 +269,27 @@ class CodingPhase(BasePhase):
                 try:
                     with open(fpath, "r", encoding="utf-8", errors="replace") as _pf:
                         _pc = _pf.read()
-                    _pp = _pc[:1500] + ("…(truncated)" if len(_pc) > 1500 else "")
+                    PATTERN_PREVIEW_LIMIT = 10000  # было 1500 — в 6.7 раза больше
+                    _pp = _pc[:PATTERN_PREVIEW_LIMIT] + (
+                        f"\n…(TRUNCATED: {len(_pc) - PATTERN_PREVIEW_LIMIT} chars hidden."
+                        f" Call read_file('{f}') to see full content if needed.)"
+                        if len(_pc) > PATTERN_PREVIEW_LIMIT else ""
+                    )
                     pattern_previews += f"\n=== PATTERN: {f} ===\n{_pp}\n"
                 except Exception:
                     pass
 
         # Build summary of already-completed subtasks so the model knows
         # what was already written and avoids duplicating or conflicting work.
+        def _format_done_subtask(s: dict) -> str:
+            files = s.get("files_to_modify", []) + s.get("files_to_create", [])
+            files_str = " → " + ", ".join(files) if files else ""
+            done_summary = s.get("done_summary", "")
+            summary_str = f"\n      summary: {done_summary[:150]}" if done_summary else ""
+            return f"  ✓ {s['id']}: {s.get('title', '')}{files_str}{summary_str}"
+
         completed_summary = "\n".join(
-            "  ✓ {id}: {title}{files}".format(
-                id=s["id"],
-                title=s.get("title", ""),
-                files=(
-                    " → " + ", ".join(
-                        s.get("files_to_modify", []) + s.get("files_to_create", [])
-                    )
-                    if s.get("files_to_modify") or s.get("files_to_create") else ""
-                ),
-            )
+            _format_done_subtask(s)
             for s in self.task.subtasks
             if s.get("status") == "done"
         )
@@ -306,7 +313,35 @@ class CodingPhase(BasePhase):
                 )
         except Exception as _diff_exc:
             pass  # diff is informational — never block execution
-        
+
+        # ── Текущее состояние files_to_modify в workdir при retry ────────
+        # Показываем актуальный контент файлов, которые уже могли быть изменены
+        # в предыдущей (провалившейся) итерации. Это предотвращает дублирование.
+        current_workdir_state = ""
+        if critic_feedback:  # Только при retry — в первой итерации не нужно
+            state_parts = []
+            for f in files_to_modify + files_to_create:
+                fpath = os.path.join(workdir, f)
+                if os.path.isfile(fpath):
+                    try:
+                        content = open(fpath, encoding="utf-8", errors="replace").read()
+                        WORKDIR_LIMIT = 6000
+                        preview = content[:WORKDIR_LIMIT] + (
+                            f"\n…(TRUNCATED: {len(content) - WORKDIR_LIMIT} chars)"
+                            if len(content) > WORKDIR_LIMIT else ""
+                        )
+                        state_parts.append(f"\n=== CURRENT WORKDIR STATE: {f} ===\n{preview}")
+                    except Exception:
+                        pass
+            if state_parts:
+                current_workdir_state = (
+                    "\n## CURRENT STATE OF FILES IN WORKDIR (after previous attempt)\n"
+                    "These files already contain changes from the previous iteration.\n"
+                    "Do NOT re-apply changes that are already present.\n"
+                    "Fix ONLY what the critic reported as missing or wrong.\n"
+                    + "".join(state_parts) + "\n"
+                )
+
         # Prepend critic feedback from previous iteration if present
         critic_prefix = ""
         if critic_feedback:
@@ -337,6 +372,7 @@ class CodingPhase(BasePhase):
             + (pattern_previews if pattern_previews else
                ("\n".join(f"  - {f}" for f in patterns_from) if patterns_from else "  (none)"))
             + branch_diff_section
+            + current_workdir_state
             + f"\n\nCompletion condition:\n  {completion_cond}\n\n"
             f"Quality condition:\n  {subtask_dict.get('completion_with_ollama', '')}\n\n"
             "RULES:\n"
@@ -408,7 +444,8 @@ class CodingPhase(BasePhase):
         return self.run_loop(
             f"2.2 Task {sid}", "p6_coding.md",
             CODING_TOOLS, executor, msg, validate_fn, model,
-            max_outer_iterations=10,  # Reduced from 20 - each attempt gets 10 internal rounds
+            max_outer_iterations=3,   # было 10: модель за 3 retry должна справиться или это проблема плана
+            max_tool_rounds=20,       # было 40 (default): уменьшить накопление лишних вызовов
         )
 
     # ── Critic ────────────────────────────────────────────────────
@@ -532,7 +569,7 @@ class CodingPhase(BasePhase):
         Returns list of critical issue dicts (same shape as rule_issues).
         """
         import json as _json
-        from core.tools import PLANNING_TOOLS  # includes read_file
+        from core.tools import CRITIC_SUBPHASE_TOOLS
 
         workdir      = os.path.join(self.task.task_dir, WORKDIR_NAME)
         project_path = self.task.project_path or self.state.working_dir
@@ -560,7 +597,9 @@ class CodingPhase(BasePhase):
         for step_name, prompt_file, output_filename in sub_phases:
             self.log(f"  ─── {step_name} ───", "info")
             output_path  = os.path.join(self.task.task_dir, output_filename)
-            executor     = self._make_executor(workdir)
+            executor     = self._make_executor(self.task.task_dir)  # critic пишет в task_dir
+            if executor.sandbox is not None:
+                executor.sandbox.new_files_allowed = True  # critic создаёт новые JSON-файлы
 
             msg = (
                 f"Subtask ID: {sid}\n"
@@ -574,7 +613,9 @@ class CodingPhase(BasePhase):
                 f"Rule-based issues already found:\n{rule_text}\n\n"
                 f"Workdir (implemented files): {workdir}\n"
                 f"Project dir (original files): {project_path}\n\n"
-                f"Write {output_filename} to: {output_path}\n"
+                f"Write {output_filename} as a NEW file using write_file.\n"
+                f"Use ONLY the relative filename: {output_filename}\n"
+                f"(absolute output path for reference: {output_path})\n"
             )
 
             def _make_validator(out=output_path):
@@ -594,7 +635,7 @@ class CodingPhase(BasePhase):
 
             ok = self.run_loop(
                 step_name, prompt_file,
-                PLANNING_TOOLS, executor, msg, _make_validator(),
+                CRITIC_SUBPHASE_TOOLS, executor, msg, _make_validator(),
                 model,
                 max_outer_iterations=2,
                 max_tool_rounds=6,

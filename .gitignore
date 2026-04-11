@@ -3,3 +3,5 @@ core/phases/__pycache__
 .tasks
 autocooker.log
 .claude
+AUTOCOOKER_FIXES.md
+FIXED_BUGS.md

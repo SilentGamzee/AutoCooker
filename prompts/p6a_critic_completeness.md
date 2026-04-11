@@ -1,5 +1,39 @@
 # Coding Critic — Sub-phase A: Completeness
 
+## CRITICAL: OUTPUT FORMAT
+
+Your ONLY job is to write ONE JSON file: `critic_completeness.json`
+
+The file MUST have this exact structure:
+```json
+{
+  "issues": [
+    {
+      "severity": "critical",
+      "location": "web/js/app.js",
+      "description": "Function handleRestartClick is missing — required by Step 2"
+    }
+  ],
+  "passed": false,
+  "summary": "1 critical issue: missing function"
+}
+```
+
+If no issues found:
+```json
+{
+  "issues": [],
+  "passed": true,
+  "summary": "All implementation steps verified — no issues found"
+}
+```
+
+DO NOT write subtask data, implementation_steps, or any other content.
+DO NOT write absolute Windows paths like C:\Projects\...
+Use write_file with ONLY the filename: `critic_completeness.json`
+
+---
+
 You are verifying that the implementation covers everything in the subtask description
 and all `implementation_steps`.
 
@@ -51,4 +85,4 @@ Rules:
 - `passed: true` if zero critical issues
 - You MUST read at least one implementation file before writing output
 - Write PURE JSON — no comments
-- Call `confirm_phase_done` after writing
+- After writing the file, you are done — do NOT call any other tools

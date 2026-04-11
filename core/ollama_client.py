@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 import json
+import os
 import sys
 import threading
 import traceback
@@ -15,6 +16,8 @@ import requests
 from typing import Callable, Optional
 
 from core.state import FileCache
+
+_DEBUG = os.environ.get("AUTOCOOKER_DEBUG", "").lower() in ("1", "true", "yes")
 
 
 def shutdown_all_clients() -> None:
@@ -114,18 +117,17 @@ class OllamaClient:
             hub = _gh.get_hub()
             # getcurrent() is not hub → we're inside a greenlet, not the hub itself
             if hub is not None and _gevent.getcurrent() is not hub:
-                print(f"[GEVENT] Using threadpool for async POST", flush=True)
+                if _DEBUG: print(f"[GEVENT] Using threadpool for async POST", flush=True)
                 # threadpool.apply() runs _do_post in a real OS thread
                 # and yields the current greenlet back to the hub while waiting
                 result = hub.threadpool.apply(_do_post)
-                print(f"[GEVENT] Threadpool returned result", flush=True)
+                if _DEBUG: print(f"[GEVENT] Threadpool returned result", flush=True)
                 return result
         except ImportError:
-            print(f"[GEVENT] gevent not available, using direct call", flush=True)
+            if _DEBUG: print(f"[GEVENT] gevent not available, using direct call", flush=True)
         except Exception as e:
-            print(f"[GEVENT] Exception in gevent setup: {type(e).__name__}: {e}, falling back to direct call", flush=True)
+            if _DEBUG: print(f"[GEVENT] Exception in gevent setup: {type(e).__name__}: {e}, falling back to direct call", flush=True)
 
-        print(f"[DIRECT] Using direct POST call (no gevent)", flush=True)
         return _do_post()
 
     # ══════════════════════════════════════════════════════════════
@@ -354,10 +356,27 @@ class OllamaClient:
         #   "ttl": 3
         # }
         _last_validation_reason = ""
+        _injected_files: set = set()  # пути файлов, уже инжектированных в messages (SIMP-1)
 
         for _round in range(max_tool_rounds):
             if is_aborted and is_aborted():
                 raise RuntimeError("__ABORTED__")
+
+            # SIMP-4: скользящее окно — сжимаем старые messages при переполнении
+            MAX_MESSAGES_BEFORE_COMPRESS = 20
+            if len(messages) > MAX_MESSAGES_BEFORE_COMPRESS:
+                first_msg = messages[0]
+                recent = messages[-6:]
+                skipped = len(messages) - 7
+                compress_note = {
+                    "role": "user",
+                    "content": (
+                        f"[Context compressed: {skipped} earlier messages omitted to save space. "
+                        "The original task is in the first message above. "
+                        "Focus on completing what's still missing.]\n"
+                    )
+                }
+                messages = [first_msg, compress_note] + recent
 
             # Expire old read-file entries by round count.
             expired_files: list[str] = []
@@ -418,31 +437,50 @@ class OllamaClient:
                     messages.append({"role": "user", "content": nudge})
 
             if len(tool_call_history) > 0:
+                # Компактный summary вместо полных словарей (было: tool_call_history[-30:])
+                history_lines = []
+                for h in tool_call_history[-15:]:
+                    name = h.get("tool_name", "?")
+                    status = h.get("status", "?")
+                    args = h.get("arguments", {})
+                    if name in ("write_file", "modify_file"):
+                        detail = f"path={args.get('path', '?')}"
+                    elif name == "read_file":
+                        detail = f"path={args.get('path', '?')}"
+                    elif name == "confirm_task_done":
+                        detail = str(h.get("result", ""))[:60]
+                    else:
+                        detail = str(args)[:80]
+                    result_preview = str(h.get("result", ""))[:100]
+                    history_lines.append(f"  {name}({detail}) → {status}: {result_preview}")
                 history_message = (
-                    f"History of tool calls: {tool_call_history[-30:]}\n"
-                    "Don't use template from history and dont use history in response. "
-                    "Only use history for understanding what you have done and what you need to do."
+                    "Recent tool calls (summary):\n"
+                    + "\n".join(history_lines)
+                    + "\nUse this to understand what's already done. Don't repeat completed work."
                 )
                 messages.append({"role": "user", "content": history_message})
-                
+
             if _last_validation_reason:
                 validation_message = (
                     f"Last validation failure reason: {_last_validation_reason}. "
                 )
                 messages.append({"role": "user", "content": validation_message})
 
-            if len(last_read_files) > 0:
-                read_files_message = {
-                    path: info["content"]
-                    for path, info in last_read_files.items()
-                }
+            # Инжектировать только новые файлы (не те, что уже были в предыдущих раундах)
+            new_read_files = {
+                path: info["content"]
+                for path, info in last_read_files.items()
+                if path not in _injected_files
+            }
+            if new_read_files:
                 messages.append({
                     "role": "user",
                     "content": (
-                        f"Read files from last call: {read_files_message}. "
-                        "Use this only as context; do not repeat it unless needed."
+                        f"Files read this round: {new_read_files}\n"
+                        "Use as context only."
                     )
                 })
+                _injected_files.update(new_read_files.keys())
 
             payload: dict = {
                 "model": model,
@@ -680,7 +718,7 @@ class OllamaClient:
 
                 if not _skip_execution:
                     try:
-                        print(f"[EXEC] Executing tool: {tool_name}")
+                        if _DEBUG: print(f"[EXEC] Executing tool: {tool_name}")
                         result = tool_executor(tool_name, raw_args)
 
                         if tool_name == "read_file":
@@ -725,7 +763,7 @@ class OllamaClient:
                             _rounds_without_write = -1
                             _dedup_count = 0  # real write clears the dedup loop counter
 
-                        print(f"[EXEC] Tool completed successfully: {tool_name}")
+                        if _DEBUG: print(f"[EXEC] Tool completed successfully: {tool_name}")
                     except Exception as e:
                         call_status = "FAILED"
                         error_text = f"{type(e).__name__}: {e}"

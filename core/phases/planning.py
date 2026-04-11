@@ -10,6 +10,8 @@ from core.dumb_util import get_dumb_task_workdir_diff
 
 import eel  # For UI updates via websocket
 
+_DEBUG = os.environ.get("AUTOCOOKER_DEBUG", "").lower() in ("1", "true", "yes")
+
 from core.state import AppState, KanbanTask
 from core.tools import ToolExecutor, PLANNING_TOOLS, DISCOVERY_READ_TOOLS, ANALYSIS_TOOLS
 from core.sandbox import create_sandbox, WORKDIR_NAME
@@ -637,32 +639,32 @@ class PlanningPhase(BasePhase):
             return False
         
         # ═══════════════════════════════════════════════════════════
-        # ЦИКЛ КРИТИКИ: Итеративное улучшение требований и спеки
+        # Metadata extraction — выполняется ОДИН РАЗ до цикла критики
+        # (было: 4 шага × max_critique_iterations = до 40 complete()-вызовов)
         # ═══════════════════════════════════════════════════════════
-        
-        max_critique_iterations = 10
-        min_critique_iterations = 2
+        self.log("─── Step 1.2 Metadata extraction ───")
+        for step_name, step_fn in [
+            ("1.2.1 Extract Checklist", lambda m: self._step2_1_extract_checklist(m, 0)),
+            ("1.2.2 Extract User Flow",  lambda m: self._step2_2_extract_user_flow(m, 0)),
+        ]:
+            self.log(f"─── Step {step_name} ───")
+            if not step_fn(model):
+                self.log(f"[FAIL] Step {step_name} failed – aborting planning", "error")
+                return False
+
+        # ═══════════════════════════════════════════════════════════
+        # ЦИКЛ КРИТИКИ: только Spec + Critique, без extraction steps
+        # ═══════════════════════════════════════════════════════════
+
+        max_critique_iterations = 3   # было 10: для большинства задач достаточно 2-3 итераций
+        min_critique_iterations = 1   # было 2: убрать принудительную вторую итерацию
         critique_passed = False
-        
+
         for iteration in range(max_critique_iterations):
             self.log("=" * 60)
             self.log(f"CRITIQUE ITERATION {iteration + 1}/{max_critique_iterations}")
             self.log("=" * 60)
-            
-            # Шаги 2.1-2.4: Извлечение метаданных (ВСЕ учитывают предыдущие результаты и критику)
-            extraction_steps = [
-                ("1.2.1 Extract Checklist", lambda m: self._step2_1_extract_checklist(m, iteration)),
-                ("1.2.2 Extract User Flow", lambda m: self._step2_2_extract_user_flow(m, iteration)),
-                ("1.2.3 Extract System Flow", lambda m: self._step2_3_extract_system_flow(m, iteration)),
-                ("1.2.4 Extract Purpose", lambda m: self._step2_4_extract_purpose(m, iteration)),
-            ]
-            
-            for name, fn in extraction_steps:
-                self.log(f"─── Step {name} ───")
-                if not fn(model):
-                    self.log(f"[FAIL] Step {name} failed – aborting planning", "error")
-                    return False
-            
+
             # Шаг 3: Spec (создание/обновление спецификации)
             self.log(f"─── Step 1.3 Spec ───")
             if not self._step3_spec(model):
@@ -702,7 +704,6 @@ class PlanningPhase(BasePhase):
                 # Проблемы найдены
                 self.log(f"⚠️ Critique found {len(critique_issues)} issue(s):", "warn")
                 for i, issue in enumerate(critique_issues[:5], 1):
-                    self.log(f"DEBUG issue type: {type(issue)}, value: {issue}", "warn")
                     text = issue if isinstance(issue, str) else str(issue)
                     self.log(f"  {i}. {text[:100]}{'...' if len(text) > 100 else ''}", "warn")
                 if len(critique_issues) > 5:
@@ -743,12 +744,22 @@ class PlanningPhase(BasePhase):
                     critique_passed = True
                     break
                 else:
-                    # Не последняя итерация - продолжаем исправлять
-                    self.log(
-                        f"🔄 Regenerating requirements and spec to fix issues "
-                        f"(iteration {iteration + 2}/{max_critique_iterations})...",
-                        "info"
-                    )
+                    # Продолжать только при CRITICAL issues; MAJOR не требует повторения spec
+                    critical_issues = [i for i in critique_issues if isinstance(i, dict) and i.get("severity") == "critical"]
+                    major_issues = [i for i in critique_issues if isinstance(i, dict) and i.get("severity") in ("major", "MAJOR")]
+                    if not critical_issues:
+                        self.log(
+                            f"✓ No critical issues. {len(major_issues)} major issue(s) noted (will inform impl planner).",
+                            "ok"
+                        )
+                        critique_passed = True
+                        break
+                    else:
+                        self.log(
+                            f"🔄 {len(critical_issues)} critical issue(s) — regenerating spec "
+                            f"(iter {iteration + 2}/{max_critique_iterations})...",
+                            "info"
+                        )
         
         # Проверка результата цикла критики
         if not critique_passed:
@@ -1130,16 +1141,16 @@ class PlanningPhase(BasePhase):
                     )
                     
                     # Debug: log raw response
-                    self.log(f"  [DEBUG] Raw Ollama response length: {len(response)} chars", "info")
+                    if _DEBUG: self.log(f"  [DEBUG] Raw Ollama response length: {len(response)} chars", "info")
                     if len(response) > 0:
-                        self.log(f"  [DEBUG] First 200 chars: {response[:200]}...", "info")
+                        if _DEBUG: self.log(f"  [DEBUG] First 200 chars: {response[:200]}...", "info")
                     
                     # Parse numbered list
                     requirements = self._parse_requirements_list(response)
                     
                     # If parsing failed, try alternative: just split by newlines
                     if not requirements:
-                        self.log("  [DEBUG] Numbered list parsing failed, trying line-by-line", "warn")
+                        if _DEBUG: self.log("  [DEBUG] Numbered list parsing failed, trying line-by-line", "warn")
                         lines = [line.strip() for line in response.split('\n') if line.strip()]
                         # Filter lines that look like requirements (not too short, not headers)
                         requirements = [
@@ -1316,14 +1327,14 @@ class PlanningPhase(BasePhase):
                     )
                     
                     # Debug: log raw response
-                    self.log(f"  [DEBUG] Raw response: {response[:200]}...", "info")
+                    if _DEBUG: self.log(f"  [DEBUG] Raw response: {response[:200]}...", "info")
                     
                     # Parse numbered list
                     user_flow = self._parse_requirements_list(response)
                     
                     # Alternative parsing if failed
                     if not user_flow:
-                        self.log("  [DEBUG] Numbered list parsing failed, trying line-by-line", "warn")
+                        if _DEBUG: self.log("  [DEBUG] Numbered list parsing failed, trying line-by-line", "warn")
                         lines = [line.strip() for line in response.split('\n') if line.strip()]
                         user_flow = [
                             line for line in lines 
@@ -1530,14 +1541,14 @@ Focus on making steps more specific about:
                     )
                     
                     # Debug: log raw response
-                    self.log(f"  [DEBUG] Raw response: {response[:200]}...", "info")
+                    if _DEBUG: self.log(f"  [DEBUG] Raw response: {response[:200]}...", "info")
                     
                     # Parse numbered list
                     system_flow = self._parse_requirements_list(response)
                     
                     # Alternative parsing
                     if not system_flow:
-                        self.log("  [DEBUG] Numbered list parsing failed, trying line-by-line", "warn")
+                        if _DEBUG: self.log("  [DEBUG] Numbered list parsing failed, trying line-by-line", "warn")
                         lines = [line.strip() for line in response.split('\n') if line.strip()]
                         system_flow = [
                             line for line in lines 
@@ -1711,7 +1722,7 @@ Be concrete and specific. Return ONLY the JSON, no other text.
                     
                     # Debug: log raw response
                     resp_preview = response[:300] if len(response) > 300 else response
-                    self.log(f"  [DEBUG] Raw response: {resp_preview}...", "info")
+                    if _DEBUG: self.log(f"  [DEBUG] Raw response: {resp_preview}...", "info")
                     
                     # Parse JSON response
                     import json as _json

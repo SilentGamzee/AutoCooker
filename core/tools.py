@@ -388,6 +388,10 @@ QA_TOOLS          = QA_REVIEWER_TOOLS
 # Critic: verdict only — diff/summaries already in message, no file reads needed
 CRITIC_TOOLS = [CRITIC_VERDICT_TOOL, LINT_FILE]
 
+# Инструменты для LLM critic-субфаз (A/B/C) внутри coding phase.
+# Только чтение + запись одного verdict-файла. Без CREATE_TASK и CONFIRM_PHASE_DONE.
+CRITIC_SUBPHASE_TOOLS = [READ_FILE, READ_FILES_BATCH, READ_FILE_RANGE, LIST_DIRECTORY, PLANNING_WRITE_FILE]
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Executor

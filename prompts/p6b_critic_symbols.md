@@ -1,5 +1,39 @@
 # Coding Critic — Sub-phase B: Cross-file Symbol Validity
 
+## CRITICAL: OUTPUT FORMAT
+
+Your ONLY job is to write ONE JSON file: `critic_symbols.json`
+
+The file MUST have this exact structure:
+```json
+{
+  "issues": [
+    {
+      "severity": "critical",
+      "location": "web/js/app.js",
+      "description": "Function handleRestartClick references tasksById which does not exist in app.js"
+    }
+  ],
+  "passed": false,
+  "summary": "1 critical issue: missing symbol reference"
+}
+```
+
+If no issues found:
+```json
+{
+  "issues": [],
+  "passed": true,
+  "summary": "All symbol references verified — no issues found"
+}
+```
+
+DO NOT write subtask data, implementation_steps, or any other content.
+DO NOT write absolute Windows paths like C:\Projects\...
+Use write_file with ONLY the filename: `critic_symbols.json`
+
+---
+
 You are verifying that every cross-file reference in the NEW code actually exists
 in the target file.
 
@@ -56,4 +90,4 @@ Rules:
 - `passed: true` if zero critical issues
 - You MUST read at least one project file before writing output
 - Write PURE JSON — no comments
-- Call `confirm_phase_done` after writing
+- After writing the file, you are done — do NOT call any other tools

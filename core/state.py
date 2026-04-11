@@ -177,7 +177,7 @@ class KanbanTask:
     # ══════════════════════════════════════════════════════
     # Iterative subtask execution
     # ══════════════════════════════════════════════════════
-    subtask_max_loops: int = 6
+    subtask_max_loops: int = 3  # было 6: 3 итерации достаточно; больше → death spiral
     max_patches: int = 10
     patch_count: int = 0
     last_executed_subtask_id: str = ""

@@ -5,6 +5,8 @@ import os
 from pathlib import Path
 from typing import Callable, Optional
 
+_DEBUG = os.environ.get("AUTOCOOKER_DEBUG", "").lower() in ("1", "true", "yes")
+
 from core.json_repair import repair_json
 
 import eel
@@ -907,7 +909,7 @@ Token count: {token_count} / {config['max_total_tokens']}
                 # Детальное логирование перед вызовом
                 msg_count = len(messages)
                 system_len = len(system) if system else 0
-                print(f"[RUN_LOOP] Starting chat_with_tools: messages={msg_count}, system_len={system_len}, tools={len(tools)}", flush=True)
+                if _DEBUG: print(f"[RUN_LOOP] Starting chat_with_tools: messages={msg_count}, system_len={system_len}, tools={len(tools)}", flush=True)
                 
                 final_text, tool_calls_made = self.ollama.chat_with_tools(
                     model=model,
@@ -927,10 +929,10 @@ Token count: {token_count} / {config['max_total_tokens']}
                 )
                 
                 # Логирование после успешного завершения
-                print(f"[RUN_LOOP] chat_with_tools completed: tool_calls_made={tool_calls_made}, final_text_len={len(final_text)}", flush=True)
+                if _DEBUG: print(f"[RUN_LOOP] chat_with_tools completed: tool_calls_made={tool_calls_made}, final_text_len={len(final_text)}", flush=True)
                 
             except RuntimeError as e:
-                print(f"[RUN_LOOP] RuntimeError in chat_with_tools: {type(e).__name__}: {e}", flush=True)
+                if _DEBUG: print(f"[RUN_LOOP] RuntimeError in chat_with_tools: {type(e).__name__}: {e}", flush=True)
                 if "__ABORTED__" in str(e):
                     # Propagate as TaskAbortedError so the pipeline handler catches it
                     self.state.abort_requested.discard(self.task.id)
@@ -939,15 +941,15 @@ Token count: {token_count} / {config['max_total_tokens']}
                 continue
             except Exception as e:
                 # Логирование неожиданных ошибок
-                print(f"[RUN_LOOP] Unexpected exception in chat_with_tools: {type(e).__name__}: {e}", flush=True)
+                if _DEBUG: print(f"[RUN_LOOP] Unexpected exception in chat_with_tools: {type(e).__name__}: {e}", flush=True)
                 import traceback
                 traceback.print_exc()
                 self.log(f"  [ERROR] Unexpected error: {type(e).__name__}: {e}", "error")
                 raise
 
-            print(f"[RUN_LOOP] Starting validation for {step_name}", flush=True)
+            if _DEBUG: print(f"[RUN_LOOP] Starting validation for {step_name}", flush=True)
             ok, reason = validate_fn()
-            print(f"[RUN_LOOP] Validation result: ok={ok}", flush=True)
+            if _DEBUG: print(f"[RUN_LOOP] Validation result: ok={ok}", flush=True)
             if ok:
                 self.log(f"  ✓ Validation passed: {step_name}", "ok")
                 return True
@@ -963,7 +965,7 @@ Token count: {token_count} / {config['max_total_tokens']}
                     return False
                 
                 # НЕ последняя итерация - логируем коротко, но СОЗДАЕМ retry_msg
-                print(f"[RUN_LOOP] Validation failed on iteration {outer + 1}/{max_outer_iterations}, creating retry message...", flush=True)
+                if _DEBUG: print(f"[RUN_LOOP] Validation failed on iteration {outer + 1}/{max_outer_iterations}, creating retry message...", flush=True)
                 self.log(f"  ⚙️ Iteration {outer + 1}/{max_outer_iterations} - validation failed, retrying...", "info")
                 
                 # ВАЖНО: Создаем retry_msg чтобы модель знала что исправить
@@ -1087,7 +1089,7 @@ Token count: {token_count} / {config['max_total_tokens']}
                         f"(attempt {reconstruct_num}, triggered after {reconstruct_after} failures)",
                         "warn",
                     )
-                    print(
+                    if _DEBUG: print(
                         f"[RUN_LOOP] reconstruct mode: outer={outer}, reconstruct_after={reconstruct_after}, attempt={reconstruct_num}",
                         flush=True,
                     )
