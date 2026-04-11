@@ -2,3 +2,4 @@
 core/phases/__pycache__
 .tasks
 autocooker.log
+.claude
