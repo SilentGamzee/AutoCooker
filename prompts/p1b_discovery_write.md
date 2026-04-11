@@ -10,43 +10,49 @@ All files have been read. Write `project_index.json` then `context.json` using `
 - One `write_file` call per response; write project_index.json first
 
 ## VALID FILES
-Only include in `project_index.json → services.*.files` the paths listed under "VALID FILE PATHS ONLY" in the user message. If a file is not in that list, it MUST NOT appear in project_index.json. Validation will reject any invented path.
+Only include in `project_index.json → files` the paths listed under "VALID FILE PATHS ONLY" in the user message. If a file is not in that list, it MUST NOT appear in project_index.json. Validation will reject any invented path.
 
-## project_index.json — required fields
+## project_index.json — required format
 ```json
 {
-  "project_type": "single|monorepo",
-  "services": {
-    "main": {
-      "path": ".", "language": "python", "framework": "none",
-      "entry_point": "main.py", "dev_command": "python main.py",
-      "test_command": "pytest", "key_directories": ["core/", "web/"]
+  "files": {
+    "core/state.py": {
+      "description": "AppState and KanbanTask dataclass; manages board state and task fields",
+      "symbols": ["AppState", "KanbanTask", "save_kanban"],
+      "language": "python"
+    },
+    "web/js/app.js": {
+      "description": "Frontend logic; _updateTaskButtons controls Restart/Continue button visibility",
+      "symbols": ["_updateTaskButtons", "restartActiveTask", "btn-continue", "btn-restart"],
+      "language": "javascript"
     }
-  },
-  "infrastructure": { "docker": false, "database": "none", "has_tests": true, "has_ci": false },
-  "conventions": { "linter": "ruff", "formatter": "black", "import_style": "absolute", "naming_style": "snake_case" },
-  "dependencies": ["eel"],
-  "discovered_at": "2025-01-01T00:00:00"
+  }
 }
 ```
+Rules:
+- `files` is a flat dict: path → {description, symbols, language}
+- Include ONLY files from the "VALID FILE PATHS ONLY" list
+- `symbols` must list actual function/class/element names found in the file
+- `description` must describe what the file does relevant to THIS task (not generic)
+- Do NOT use a `services` wrapper
 
 ## context.json — required fields
 ```json
 {
   "task_relevant_files": {
-    "to_modify": ["core/state.py"],
-    "to_create": ["core/new_feature.py"],
-    "to_reference": ["core/phases/coding.py"]
+    "to_modify": [
+      {"path": "web/js/app.js", "reason": "_updateTaskButtons hasStarted logic needs fix"}
+    ],
+    "to_create": [],
+    "to_reference": [
+      {"path": "core/state.py", "reason": "KanbanTask.column field drives board column assignment"}
+    ]
   },
-  "existing_patterns": {
-    "eel_pattern": "@eel.expose decorates Python functions callable from JS"
+  "patterns": {
+    "eel_pattern": "@eel.expose in main.py exposes Python to JS as eel.methodName()()"
   },
-  "design_system": "CSS vars in use: --bg, --accent, --text, --r6 (copy from CSS DESIGN TOKENS above)",
-  "existing_implementations": [
-    { "description": "Pattern in file", "file": "core/state.py", "relevant_because": "Shows how to..." }
-  ],
-  "tech_notes": ["Key tech notes about the project"],
-  "files_read": ["core/state.py", "main.py"]
+  "design_tokens": "var(--bg), var(--accent), var(--r6) — copy from CSS DESIGN TOKENS above",
+  "files_read": ["core/state.py", "web/js/app.js"]
 }
 ```
 

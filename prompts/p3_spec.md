@@ -59,10 +59,11 @@ Write `spec.json` from `requirements.json` and `context.json`.
   },
   "patterns": [
     {
-      "name": "Eel endpoint pattern",
-      "source_file": "main.py",
-      "code_snippet": "@eel.expose\ndef update_task(task_id):\n    STATE._save_kanban()\n    return {'success': True}",
-      "key_points": ["Use @eel.expose", "Return dict with success flag"]
+      "file": "web/js/app.js",
+      "symbol": "_updateTaskButtons",
+      "description": "Modify hasStarted to not count task_dir alone as proof the task started",
+      "current_code": "const hasStarted = !!(task.task_dir || (task.subtasks && task.subtasks.length) || (task.logs && task.logs.length));",
+      "proposed_change": "const hasStarted = !!((task.subtasks && task.subtasks.length) || (task.logs && task.logs.length));"
     }
   ],
   "implementation_notes": {
@@ -82,10 +83,24 @@ Write `spec.json` from `requirements.json` and `context.json`.
 ## FINISH
 After writing spec.json, call `confirm_phase_done`.
 
+## PATTERNS FORMAT
+Patterns must be objects (not plain strings) with `file` and `description` required:
+```json
+{
+  "file": "web/js/app.js",
+  "symbol": "functionName",
+  "description": "What this pattern shows",
+  "current_code": "actual code read from file (optional but strongly recommended for modifications)",
+  "proposed_change": "what it should become (optional but strongly recommended)"
+}
+```
+`current_code` and `proposed_change` let the critic verify the code actually exists. Always read the file first with `read_file` before writing patterns.
+
 ## VALIDATION CHECKLIST
 - `overview` ≥ 50 chars
 - `user_flow.steps` array exists and non-empty
 - Each step has `step` (number) and `action_name` (string)
 - `acceptance_criteria` non-empty, copied verbatim from requirements.json
 - `task_scope.will_do` non-empty
+- Each entry in `patterns` is an object with `file` and `description` fields
 - No invented file paths — use only paths from requirements.json or context.json

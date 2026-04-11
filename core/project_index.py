@@ -52,7 +52,7 @@ _EXT_TO_LANG = {
 _IMAGE_EXTS   = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico", ".bmp"}
 _CONFIG_EXTS  = {".json", ".yaml", ".yml", ".toml", ".ini", ".env", ".cfg", ".conf"}
 _DOC_EXTS     = {".md", ".rst", ".txt"}
-_SKIP_DIRS    = {"__pycache__", "node_modules", ".git", "dist", "build",
+_SKIP_DIRS    = {"__pycache__", "node_modules", ".git", ".claude", "dist", "build",
                  ".venv", "venv", ".env", "env", "site-packages"}
 _SKIP_EXTS    = {".pyc", ".pyo", ".class", ".o", ".so", ".dll", ".exe",
                  ".lock", ".log", ".DS_Store"}
@@ -94,6 +94,53 @@ class ProjectIndex:
         except Exception as e:
             print(f"[ProjectIndex] save failed: {e}", flush=True)
 
+    # ── Internal helpers ──────────────────────────────────────────
+
+    def _purge_ignored(self, gitignore_patterns: list | None = None) -> int:
+        """Remove entries from self.data that match skip rules or no longer exist.
+
+        Covers:
+        - Any path whose directory segment is in _SKIP_DIRS (e.g. .claude/*)
+        - Extensions in _SKIP_EXTS
+        - Paths matching .gitignore patterns
+        - Files that no longer exist on disk
+
+        Also filters stale ignored paths out of used_by arrays in remaining entries.
+
+        Returns the number of entries removed.
+        """
+        def _is_ignored_path(rel: str) -> bool:
+            norm = rel.replace("\\", "/")
+            parts = norm.split("/")
+            if any(seg in _SKIP_DIRS for seg in parts[:-1]):
+                return True
+            if os.path.splitext(norm)[1].lower() in _SKIP_EXTS:
+                return True
+            if gitignore_patterns and _is_gitignored(norm, gitignore_patterns):
+                return True
+            return False
+
+        to_remove: list[str] = []
+        for rel in list(self.data.keys()):
+            if _is_ignored_path(rel):
+                to_remove.append(rel)
+                continue
+            # No longer on disk
+            if not os.path.isfile(os.path.join(self.project_path, rel)):
+                to_remove.append(rel)
+                continue
+
+        for rel in to_remove:
+            del self.data[rel]
+
+        # Clean stale ignored paths from used_by arrays in remaining entries
+        for entry in self.data.values():
+            ub = entry.get("used_by")
+            if isinstance(ub, list):
+                entry["used_by"] = [p for p in ub if not _is_ignored_path(p)]
+
+        return len(to_remove)
+
     # ── Public API ────────────────────────────────────────────────
 
     def scan_and_update(
@@ -112,6 +159,10 @@ class ProjectIndex:
         """
         self.load()
         gitignore_patterns = _parse_gitignore(self.project_path)
+
+        purged = self._purge_ignored(gitignore_patterns)
+        if purged:
+            log_fn(f"  [Index] Purged {purged} ignored/deleted entries from index")
 
         all_files = _walk_project(self.project_path, gitignore_patterns)
         log_fn(f"  [Index] Found {len(all_files)} project files")
@@ -197,8 +248,19 @@ class ProjectIndex:
         changed_files: project-relative paths.
         """
         self.load()
-        existing = [r for r in changed_files
-                    if os.path.isfile(os.path.join(project_path, r))]
+        gitignore_patterns = _parse_gitignore(project_path)
+        purged = self._purge_ignored(gitignore_patterns)
+        if purged:
+            log_fn(f"  [Index] Purged {purged} ignored/deleted entries from index")
+
+        # Filter out ignored files from the changed list itself
+        existing = [
+            r for r in changed_files
+            if os.path.isfile(os.path.join(project_path, r))
+            and not any(seg in _SKIP_DIRS for seg in r.replace("\\", "/").split("/")[:-1])
+            and os.path.splitext(r)[1].lower() not in _SKIP_EXTS
+            and not _is_gitignored(r.replace("\\", "/"), gitignore_patterns)
+        ]
         if not existing:
             return
         log_fn(f"  [Index] Updating {len(existing)} changed file(s)…")

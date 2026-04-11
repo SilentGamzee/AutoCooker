@@ -417,7 +417,7 @@ class RuleCritic:
             return issues
 
         _SKIP = (
-            "__pycache__", ".pyc", ".pyo", ".pyd", ".git",
+            "__pycache__", ".pyc", ".pyo", ".pyd", ".git", ".claude",
             "node_modules", ".egg-info", ".dist-info",
             ".mypy_cache", ".ruff_cache", ".pytest_cache",
         )

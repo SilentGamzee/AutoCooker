@@ -277,109 +277,115 @@ class BasePhase:
     def _filter_files_by_keywords(self, project_index: dict, keywords: set[str]) -> list[str]:
         """Filter files by keyword matching in path/description/symbols."""
         matches = []
-        
-        services = project_index.get("services", {})
-        
-        if isinstance(services, dict):
-            service_iter = services.items()
-        elif isinstance(services, list):
-            service_iter = (
-                (
-                    item.get("service_name", f"service_{i}"),
-                    item
-                )
-                for i, item in enumerate(services)
-                if isinstance(item, dict)
-            )
-        else:
-            service_iter = []
 
-        for service_name, service_data in service_iter:
-            # Защита: проверяем что service_data это dict
-            if not isinstance(service_data, dict):
-                print(f"[WARN] service_data for '{service_name}' is not a dict: {type(service_data)}", flush=True)
-                continue
-            
-            files = service_data.get("files", {})
-            
-            # Защита: проверяем что files это dict
-            if not isinstance(files, dict):
-                print(f"[WARN] files for '{service_name}' is not a dict: {type(files)}", flush=True)
-                continue
-            
-            for file_path, file_info in files.items():
-                # Защита: проверяем что file_info это dict
+        # New flat format: {files: {path: {description, symbols, language}}}
+        flat_files = project_index.get("files")
+        if isinstance(flat_files, dict):
+            for file_path, file_info in flat_files.items():
                 if not isinstance(file_info, dict):
-                    print(f"[WARN] file_info for '{file_path}' is not a dict: {type(file_info)}", flush=True)
                     continue
-                
                 path_lower = file_path.lower()
                 if any(kw in path_lower for kw in keywords):
                     matches.append(file_path)
                     continue
-                
                 desc = file_info.get("description", "").lower()
                 if any(kw in desc for kw in keywords):
                     matches.append(file_path)
                     continue
-                
                 symbols = file_info.get("symbols", [])
-                symbols_lower = [s.lower() for s in symbols]
-                if any(any(kw in sym for kw in keywords) for sym in symbols_lower):
+                if any(any(kw in s.lower() for kw in keywords) for s in symbols):
                     matches.append(file_path)
-        
+            return matches
+
+        # Legacy services format fallback
+        services = project_index.get("services", {})
+        if isinstance(services, dict):
+            service_iter = services.items()
+        elif isinstance(services, list):
+            service_iter = (
+                (item.get("service_name", f"service_{i}"), item)
+                for i, item in enumerate(services)
+                if isinstance(item, dict)
+            )
+        else:
+            return matches
+
+        for service_name, service_data in service_iter:
+            if not isinstance(service_data, dict):
+                continue
+            files = service_data.get("files", {})
+            if not isinstance(files, dict):
+                continue
+            for file_path, file_info in files.items():
+                if not isinstance(file_info, dict):
+                    continue
+                path_lower = file_path.lower()
+                if any(kw in path_lower for kw in keywords):
+                    matches.append(file_path)
+                    continue
+                desc = file_info.get("description", "").lower()
+                if any(kw in desc for kw in keywords):
+                    matches.append(file_path)
+                    continue
+                symbols = file_info.get("symbols", [])
+                if any(any(kw in s.lower() for kw in keywords) for s in symbols):
+                    matches.append(file_path)
+
         return matches
 
     def _get_relevant_files_via_ollama(self, task_description: str, project_index: dict, max_files: int = 20) -> list[str]:
         """Ask ollama which files are relevant to the task."""
         import json
         import re
-        
+
         config = PROJECT_CONTEXT_CONFIG
         model = config["ollama_filter_model"]
-        
-        compact_index = []
-        services = project_index.get("services", {})
-        
-        if isinstance(services, dict):
-            service_iter = services.items()
-        elif isinstance(services, list):
-            service_iter = (
-                (
-                    item.get("service_name", f"service_{i}"),
-                    item
-                )
-                for i, item in enumerate(services)
-                if isinstance(item, dict)
-            )
-        else:
-            service_iter = []
 
-        for service_name, service_data in service_iter:
-            # Защита: проверяем что service_data это dict
-            if not isinstance(service_data, dict):
-                continue
-            
-            files = service_data.get("files", {})
-            
-            # Защита: проверяем что files это dict
-            if not isinstance(files, dict):
-                continue
-            
-            for file_path, file_info in files.items():
-                # Защита: проверяем что file_info это dict
+        compact_index = []
+        all_paths: set[str] = set()
+
+        # New flat format: {files: {path: {description, symbols, language}}}
+        flat_files = project_index.get("files")
+        if isinstance(flat_files, dict):
+            for file_path, file_info in flat_files.items():
                 if not isinstance(file_info, dict):
                     continue
-                
                 desc = file_info.get("description", "No description")
                 compact_index.append(f"{file_path}: {desc}")
-        
+                all_paths.add(file_path)
+        else:
+            # Legacy services format fallback
+            services = project_index.get("services", {})
+            if isinstance(services, dict):
+                service_iter = services.items()
+            elif isinstance(services, list):
+                service_iter = (
+                    (item.get("service_name", f"service_{i}"), item)
+                    for i, item in enumerate(services)
+                    if isinstance(item, dict)
+                )
+            else:
+                service_iter = []
+
+            for service_name, service_data in service_iter:
+                if not isinstance(service_data, dict):
+                    continue
+                files = service_data.get("files", {})
+                if not isinstance(files, dict):
+                    continue
+                for file_path, file_info in files.items():
+                    if not isinstance(file_info, dict):
+                        continue
+                    desc = file_info.get("description", "No description")
+                    compact_index.append(f"{file_path}: {desc}")
+                    all_paths.add(file_path)
+
         if not compact_index:
             print("[WARN] No files found in project_index for ollama filter", flush=True)
             return []
-        
+
         compact_str = "\n".join(compact_index)
-        
+
         prompt = f"""You are analyzing a software project to determine which files are relevant to a task.
 
 TASK:
@@ -399,21 +405,14 @@ Maximum {max_files} files."""
 
         try:
             response = self.ollama.complete(model=model, prompt=prompt, max_tokens=6000)
-            
+
             json_match = re.search(r'\[.*\]', response, re.DOTALL)
             if json_match:
                 file_list = json.loads(json_match.group(0))
                 if isinstance(file_list, list):
-                    all_paths = set()
-                    for service in services.values():
-                        if isinstance(service, dict):
-                            files = service.get("files", {})
-                            if isinstance(files, dict):
-                                all_paths.update(files.keys())
-                    
                     valid_paths = [p for p in file_list if p in all_paths]
                     return valid_paths[:max_files]
-            
+
             print(f"[WARN] Ollama filter returned invalid JSON", flush=True)
             return []
         except Exception as e:

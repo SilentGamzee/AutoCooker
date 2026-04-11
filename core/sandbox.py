@@ -25,7 +25,15 @@ PLANNING_ALLOWED_FILES = {
     'context.json',
     'requirements.json',
     'spec.json',
+    # critique sub-phase outputs
     'critique_report.json',
+    'critique_scope.json',
+    'critique_symbols.json',
+    'critique_simplicity.json',
+    # coding critic sub-phase outputs
+    'critic_completeness.json',
+    'critic_symbols.json',
+    'critic_simplicity.json',
     'implementation_plan.json',
     'scored_files.json',
 }

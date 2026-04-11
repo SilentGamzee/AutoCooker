@@ -84,12 +84,67 @@ def _parse_structure(text: str) -> tuple[list[str], bool, bool]:
 
 
 # ─────────────────────────────────────────────────────────────────
+# Control-character sanitiser
+# ─────────────────────────────────────────────────────────────────
+
+_CTRL_ESCAPE: dict[str, str] = {
+    "\n": "\\n",
+    "\r": "\\r",
+    "\t": "\\t",
+    "\b": "\\b",
+    "\f": "\\f",
+}
+
+
+def _escape_raw_control_chars(text: str) -> str:
+    """Replace raw control characters inside JSON string literals with their
+    escaped equivalents (e.g. a literal newline → \\n).
+
+    LLMs often produce code snippets or multi-line values with real newlines
+    inside a JSON string, which is invalid per RFC 8259.  This pass fixes
+    that before the structural repair runs.
+    """
+    out: list[str] = []
+    in_string = False
+    escape_next = False
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if escape_next:
+            escape_next = False
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "\\" and in_string:
+            escape_next = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch == '"':
+            in_string = not in_string
+            out.append(ch)
+            i += 1
+            continue
+        if in_string and ch in _CTRL_ESCAPE:
+            out.append(_CTRL_ESCAPE[ch])
+            i += 1
+            continue
+        # Raw control chars outside strings (e.g. extra \r at top level) — drop
+        if not in_string and ord(ch) < 0x20 and ch not in (" ", "\t", "\n", "\r"):
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+# ─────────────────────────────────────────────────────────────────
 # Public API
 # ─────────────────────────────────────────────────────────────────
 
 def repair_json(text: str) -> tuple[str, bool]:
     """
-    Attempt to repair truncated JSON.
+    Attempt to repair truncated or malformed JSON.
 
     Returns:
       (result_text, was_repaired)
@@ -97,6 +152,7 @@ def repair_json(text: str) -> tuple[str, bool]:
         was_repaired=True   →  text was repaired (brackets closed etc.)
 
     The repair is best-effort:
+      - Escapes raw control characters (\\n, \\r, \\t …) inside strings
       - Closes an open string with '"'
       - If we were in the middle of an object value (after ':'), inserts null
       - Closes all unclosed arrays ']' and objects '}'
@@ -107,6 +163,16 @@ def repair_json(text: str) -> tuple[str, bool]:
         return text, False
     except json.JSONDecodeError:
         pass
+
+    # Pass 1: escape raw control chars inside strings (most common LLM mistake)
+    sanitised = _escape_raw_control_chars(text)
+    try:
+        json.loads(sanitised)
+        return sanitised, True
+    except json.JSONDecodeError:
+        pass
+    # Use sanitised text for further structural repair
+    text = sanitised
 
     # Strip trailing garbage after the last meaningful char
     # (e.g. a half-written key like  ,"incomple  )

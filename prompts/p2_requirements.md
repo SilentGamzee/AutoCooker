@@ -21,28 +21,14 @@ Produce `requirements.json` from the task description and project context.
 {
   "task_description": "Exact user task — do not paraphrase",
   "workflow_type": "feature|refactor|investigation|simple",
-  "workflow_rationale": "One sentence: why this type fits",
-  "services_involved": ["backend", "frontend"],
-  "files_to_create": ["src/services/cache.py"],
-  "files_to_modify": ["src/routes/api.py"],
-  "user_requirements": ["User-stated requirement 1", "Requirement 2"],
-  "acceptance_criteria": [
-    "File src/services/cache.py exists with class CacheService",
-    "GET /api/items returns JSON array with id, name fields"
-  ],
-  "constraints": ["Must not break existing API"],
-  "created_at": "ISO timestamp"
+  "user_requirements": ["User-stated requirement 1", "Requirement 2"]
 }
 ```
 
-## REQUIRED FIELDS
-`task_description`, `workflow_type`, `acceptance_criteria`
+- `user_requirements`: concrete list of what the user/system must do (not how to verify it)
 
-## ACCEPTANCE CRITERIA RULES
-- Every criterion must be verifiable by reading a file — not by subjective judgment
-- BAD: "The feature works correctly"
-- GOOD: "File src/cache.py exists and contains class CacheService"
-- GOOD: "Running pytest exits with code 0"
+## REQUIRED FIELDS
+`task_description`, `workflow_type`, `user_requirements`
 
 ## FILE PATHS
 - Use ONLY paths from context.json/project_index.json for `files_to_modify`

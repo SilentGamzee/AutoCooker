@@ -15,7 +15,7 @@ def get_dumb_task_workdir_diff(state:AppState, task_id: str) -> dict:
         return {"ok": False, "error": "Workdir not found — coding phase not run yet"}
 
     _SKIP = (
-        "__pycache__", ".pyc", ".pyo", ".pyd", ".git",
+        "__pycache__", ".pyc", ".pyo", ".pyd", ".git", ".claude",
         "node_modules", ".egg-info", ".dist-info",
         ".mypy_cache", ".ruff_cache", ".pytest_cache",
     )

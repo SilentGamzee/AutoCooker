@@ -453,7 +453,7 @@ class CodingPhase(BasePhase):
 
     _SKIP_DIFF_PATTERNS = (
         "__pycache__", ".pyc", ".pyo", ".pyd",
-        ".git", ".svn", ".hg",
+        ".git", ".claude", ".svn", ".hg",
         "node_modules", ".DS_Store", "Thumbs.db",
         ".egg-info", ".dist-info", ".mypy_cache", ".ruff_cache",
         ".pytest_cache", ".tox", "dist/", "build/",

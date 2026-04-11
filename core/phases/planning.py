@@ -71,35 +71,22 @@ def _read_json(path: str) -> tuple[bool, dict | list | None, str]:
 
 
 def _validate_project_index(path: str, project_path: str = "") -> tuple[bool, str]:
-    """Validate project_index.json - includes file path in error messages."""
+    """Validate project_index.json."""
     ok, data, err = _read_json(path)
     if not ok:
         return False, f"[FILE: {path}] {err}"
-    services = data.get("services", {})
-    if not isinstance(services, dict):
-        return False, (
-            f"[FILE: {path}] 'services' must be a JSON object {{...}}, "
-            f"got {type(services).__name__}. Do not use a JSON array []."
-        )
-
-    # Verify that every file path listed in services.*.files actually exists on disk
+    if not isinstance(data, dict):
+        return False, f"[FILE: {path}] Must be a JSON object"
+    files = data.get("files")
+    if not isinstance(files, dict) or not files:
+        return False, f"[FILE: {path}] Missing or empty 'files' object (must be dict, not array)"
     if project_path:
-        invented: list[str] = []
-        for svc_name, svc in services.items():
-            if not isinstance(svc, dict):
-                continue
-            for fpath in svc.get("files", {}).keys():
-                abs_p = os.path.join(project_path, fpath)
-                if not os.path.isfile(abs_p):
-                    invented.append(fpath)
+        invented = [p for p in files if not os.path.isfile(os.path.join(project_path, p))]
         if invented:
-            sample = invented[:5]
             return False, (
-                f"[FILE: {path}] project_index contains non-existent file paths "
-                f"(invented by model): {sample}. "
+                f"[FILE: {path}] Non-existent file paths: {invented[:5]}. "
                 f"Only include paths that actually exist on disk."
             )
-
     return True, "OK"
 
 
@@ -108,7 +95,7 @@ def _validate_requirements(path: str) -> tuple[bool, str]:
     ok, data, err = _read_json(path)
     if not ok:
         return False, f"[FILE: {path}] {err}"
-    required = ("task_description", "workflow_type", "acceptance_criteria")
+    required = ("task_description", "workflow_type", "user_requirements")
     missing = [k for k in required if k not in data]
     if missing:
         present = [k for k in required if k in data]
@@ -120,19 +107,49 @@ def _validate_requirements(path: str) -> tuple[bool, str]:
         )
     if not data.get("task_description", "").strip():
         return False, f"[FILE: {path}] task_description is empty"
+    user_requirements = data.get("user_requirements")
+    if not isinstance(user_requirements, list) or len(user_requirements) == 0:
+        return False, f"[FILE: {path}] user_requirements must be a non-empty list"
     return True, "OK"
 
 
-def _validate_scored_files(path: str) -> tuple[bool, str]:
-    """Validate scored_files.json produced by the index analysis step."""
+def _scored_files_to_list(files) -> list[dict]:
+    """Normalise scored_files 'files' field to a list of {path, score, reason} dicts.
+
+    Accepts two formats produced by the LLM:
+      - Array:  [{"path": "...", "score": 0.5, "reason": "..."},  ...]
+      - Dict:   {"core/state.py": {"score": 0.5, "reason": "..."}, ...}
+    """
+    if isinstance(files, list):
+        return files
+    if isinstance(files, dict):
+        result = []
+        for p, v in files.items():
+            if isinstance(v, dict):
+                result.append({"path": p, "score": v.get("score", 0.0), "reason": v.get("reason", "")})
+            elif isinstance(v, (int, float)):
+                result.append({"path": p, "score": float(v), "reason": ""})
+        return result
+    return []
+
+
+def _validate_scored_files(path: str, global_index_path: str = "") -> tuple[bool, str]:
+    """Validate scored_files.json produced by the index analysis step.
+
+    Accepts 'files' as either an array or a dict keyed by path.
+    If global_index_path is provided, also checks coverage against project_index.json.
+    """
     ok, data, err = _read_json(path)
     if not ok:
         return False, f"[FILE: {path}] {err}"
     if not isinstance(data, dict):
         return False, f"[FILE: {path}] Must be a JSON object"
-    files = data.get("files")
-    if not isinstance(files, list) or len(files) == 0:
-        return False, f"[FILE: {path}] Missing or empty 'files' array"
+    raw = data.get("files")
+    if not raw:
+        return False, f"[FILE: {path}] Missing or empty 'files' field"
+    files = _scored_files_to_list(raw)
+    if not files:
+        return False, f"[FILE: {path}] 'files' must be an array or object, got {type(raw).__name__}"
     for i, item in enumerate(files[:3]):
         if not isinstance(item, dict):
             return False, f"[FILE: {path}] files[{i}] must be an object"
@@ -142,6 +159,37 @@ def _validate_scored_files(path: str) -> tuple[bool, str]:
         score = item.get("score")
         if not isinstance(score, (int, float)) or not (0.0 <= float(score) <= 1.0):
             return False, f"[FILE: {path}] files[{i}].score must be float 0–1, got {score!r}"
+
+    # Coverage check: every file in project_index must appear in scored_files
+    if global_index_path and os.path.isfile(global_index_path):
+        ok2, idx, err2 = _read_json(global_index_path)
+        if ok2 and isinstance(idx, dict):
+            index_paths: set[str] = set()
+            services = idx.get("services", {})
+            if isinstance(services, dict):
+                for svc in services.values():
+                    if isinstance(svc, dict):
+                        for p in svc.get("files", {}).keys():
+                            index_paths.add(p)
+            elif isinstance(services, list):
+                for svc in services:
+                    if isinstance(svc, dict):
+                        for p in svc.get("files", {}).keys():
+                            index_paths.add(p)
+            flat = idx.get("files", {})
+            if isinstance(flat, dict):
+                index_paths.update(flat.keys())
+
+            scored_paths = {item["path"] for item in files if isinstance(item, dict) and "path" in item}
+            missing = index_paths - scored_paths
+            if missing:
+                sample = sorted(missing)[:5]
+                return False, (
+                    f"[FILE: {path}] scored_files is missing {len(missing)} file(s) from project_index. "
+                    f"EVERY file in project_index MUST be scored (even score=0.0). "
+                    f"Missing (first 5): {sample}"
+                )
+
     return True, "OK"
 
 
@@ -219,58 +267,71 @@ def _validate_spec_json(path: str) -> tuple[bool, str]:
         return False, f"[FILE: {path}] spec.json must be a JSON object"
     
     # Check required fields
-    required_fields = ["overview", "task_scope", "acceptance_criteria"]
-    for field in required_fields:
+    for field in ("overview", "task_scope", "acceptance_criteria"):
         if field not in spec:
             return False, f"[FILE: {path}] Missing required field: '{field}'"
-        
         if not spec[field]:
             return False, f"[FILE: {path}] Field '{field}' is empty"
-    
-    # Validate acceptance_criteria is a list
-    if not isinstance(spec["acceptance_criteria"], list):
-        return False, f"[FILE: {path}] 'acceptance_criteria' must be an array"
-    
-    if len(spec["acceptance_criteria"]) == 0:
-        return False, f"[FILE: {path}] 'acceptance_criteria' array is empty"
-    
-    # Check for user_flow if frontend task
-    content_str = _json.dumps(spec).lower()
-    has_frontend = any(marker in content_str for marker in 
-                      ['web/', '.html', '.js', '.css', 'frontend', 'ui ', 'user interface', 'button', 'form'])
-    
-    if has_frontend:
-        if "user_flow" not in spec:
-            return False, (
-                f"[FILE: {path}] "
-                f"Missing 'user_flow' field. "
-                f"This task involves frontend/UI changes and MUST include a user_flow array "
-                f"with step-by-step user interaction details."
-            )
-        
-        if not isinstance(spec["user_flow"], list):
-            return False, f"[FILE: {path}] 'user_flow' must be an array"
-        
-        if len(spec["user_flow"]) == 0:
-            return False, f"[FILE: {path}] 'user_flow' array is empty"
-        
-        # Validate user_flow structure
-        for i, step in enumerate(spec["user_flow"]):
-            if not isinstance(step, dict):
-                return False, f"[FILE: {path}] user_flow[{i}] must be an object"
-            
-            required_step_fields = ["step", "action"]
-            for field in required_step_fields:
-                if field not in step:
-                    return False, f"[FILE: {path}] user_flow[{i}] missing field: '{field}'"
-    
-    # Check minimum content length
+
+    # overview minimum length
     if len(spec.get("overview", "")) < 50:
         return False, f"[FILE: {path}] 'overview' is too short (< 50 chars)"
-    
-    if len(spec.get("task_scope", "")) < 50:
-        return False, f"[FILE: {path}] 'task_scope' is too short (< 50 chars)"
-    
+
+    # task_scope: accepts object {will_do, wont_do} or string
+    task_scope = spec["task_scope"]
+    if isinstance(task_scope, dict):
+        if not task_scope.get("will_do"):
+            return False, f"[FILE: {path}] 'task_scope.will_do' is missing or empty"
+    elif isinstance(task_scope, str):
+        if len(task_scope) < 50:
+            return False, f"[FILE: {path}] 'task_scope' is too short (< 50 chars)"
+    else:
+        return False, f"[FILE: {path}] 'task_scope' must be a string or object"
+
+    # acceptance_criteria must be a non-empty list
+    if not isinstance(spec["acceptance_criteria"], list) or len(spec["acceptance_criteria"]) == 0:
+        return False, f"[FILE: {path}] 'acceptance_criteria' must be a non-empty array"
+
+    # user_flow is mandatory for all tasks
+    if "user_flow" not in spec:
+        return False, f"[FILE: {path}] Missing required field: 'user_flow' (mandatory for all tasks)"
+
+    user_flow = spec["user_flow"]
+    if isinstance(user_flow, dict):
+        # New format: {current_state, target_state, steps: [...]}
+        steps = user_flow.get("steps", [])
+        if not isinstance(steps, list) or len(steps) == 0:
+            return False, f"[FILE: {path}] 'user_flow.steps' must be a non-empty array"
+        for i, step in enumerate(steps):
+            if not isinstance(step, dict):
+                return False, f"[FILE: {path}] user_flow.steps[{i}] must be an object"
+            if "step" not in step or "action_name" not in step:
+                return False, f"[FILE: {path}] user_flow.steps[{i}] missing 'step' or 'action_name'"
+    elif isinstance(user_flow, list):
+        # Legacy format: array of steps with step+action
+        if len(user_flow) == 0:
+            return False, f"[FILE: {path}] 'user_flow' array is empty"
+        for i, step in enumerate(user_flow):
+            if not isinstance(step, dict):
+                return False, f"[FILE: {path}] user_flow[{i}] must be an object"
+            if "step" not in step:
+                return False, f"[FILE: {path}] user_flow[{i}] missing field 'step'"
+    else:
+        return False, f"[FILE: {path}] 'user_flow' must be an object or array"
+
+    # Validate patterns — objects with file+description required (strings tolerated for compat)
+    patterns = spec.get("patterns")
+    if patterns is not None:
+        if not isinstance(patterns, list):
+            return False, f"[FILE: {path}] 'patterns' must be an array"
+        for i, pat in enumerate(patterns):
+            if isinstance(pat, dict):
+                for req_field in ("file", "description"):
+                    if req_field not in pat:
+                        return False, f"[FILE: {path}] patterns[{i}] missing required field: '{req_field}'"
+            elif not isinstance(pat, str):
+                return False, f"[FILE: {path}] patterns[{i}] must be a string or object"
+
     return True, "OK"
 
 
@@ -557,10 +618,11 @@ class PlanningPhase(BasePhase):
         # НОВЫЙ КОД: Полный цикл планирования с итеративной критикой
         # ═══════════════════════════════════════════════════════════
         
-        # Шаг 0: Index Analysis (non-fatal — enriches subsequent steps)
+        # Шаг 0: Index Analysis
         self.log("─── Step 1.0a Index Analysis ───")
         if not self._step0_index_analysis(model):
-            self.log("  [WARN] Index analysis failed — continuing without file scores", "warn")
+            self.log("  [FAIL] Index analysis exhausted all iterations — task moved to Human Review", "error")
+            return False
 
         # Шаг 1: Discovery (выполняется один раз)
         self.log(f"─── Step 1.1 Discovery ───")
@@ -1727,16 +1789,6 @@ Be concrete and specific. Return ONLY the JSON, no other text.
             self.task.purpose = purpose
             self.state._save_kanban()
             
-            # Save to JSON file
-            purpose_path = os.path.join(self.task.task_dir, "purpose.json")
-            try:
-                import json as _json
-                with open(purpose_path, "w", encoding="utf-8") as _f:
-                    _json.dump(purpose, _f, indent=2, ensure_ascii=False)
-                self.log(f"  ✓ Purpose saved to {self._rel(purpose_path)}", "ok")
-            except Exception as e:
-                self.log(f"  ⚠️ Failed to save purpose.json: {e}", "warn")
-            
             self.log(f"  ✓ Extracted purpose", "ok")
             self.log(f"    Problem: {purpose['problem'][:80]}...", "info")
             self.log(f"    Solution: {purpose['solution'][:80]}...", "info")
@@ -1787,10 +1839,15 @@ Be concrete and specific. Return ONLY the JSON, no other text.
         try:
             import json as _json
             ctx_data = _json.loads(ctx_content)
-            ref_files = (
-                ctx_data.get("task_relevant_files", {}).get("to_reference", [])
-                + ctx_data.get("task_relevant_files", {}).get("to_modify", [])
-            )
+            def _extract_paths(items):
+                return [
+                    item["path"] if isinstance(item, dict) else item
+                    for item in (items or [])
+                    if item
+                ]
+            to_ref = _extract_paths(ctx_data.get("task_relevant_files", {}).get("to_reference", []))
+            to_mod = _extract_paths(ctx_data.get("task_relevant_files", {}).get("to_modify", []))
+            ref_files = to_ref + to_mod
             # Deduplicate, take up to 3 files, read first 120 lines each
             seen: set = set()
             for fpath in ref_files:
@@ -2294,12 +2351,15 @@ Be concrete and specific. Return ONLY the JSON, no other text.
         return f"FILE RELEVANCE ANALYSIS (scored_files.json):\n{content}\n\n"
 
     def _priority_files(self, top_n: int = 10) -> list[str]:
-        """Return top-N priority file paths sorted by score desc, no score threshold."""
+        """Return top-N priority file paths sorted by score desc, no score threshold.
+
+        Handles both array and dict formats for scored_files.json 'files' field.
+        """
         path = os.path.join(self.task.task_dir, "scored_files.json")
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            files = data.get("files", [])
+            files = _scored_files_to_list(data.get("files", []))
             files.sort(key=lambda x: float(x.get("score", 0)), reverse=True)
             return [f["path"] for f in files[:top_n]]
         except Exception:
@@ -2331,7 +2391,7 @@ Be concrete and specific. Return ONLY the JSON, no other text.
         )
 
         def validate():
-            return _validate_scored_files(scored_path)
+            return _validate_scored_files(scored_path, global_index_path=global_index_path)
 
         return self.run_loop(
             "1.0a Index Analysis", "p0_analysis.md",
