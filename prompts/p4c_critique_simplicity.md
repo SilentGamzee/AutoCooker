@@ -59,6 +59,14 @@ that handles this case. Correct — don't flag it.
 }
 ```
 
+## PROPORTIONALITY RULE
+Count the files listed in `context.json → files_read` that will be modified (not just read).
+- 1–2 files modified → max 2 issues from this sub-phase
+- 3–5 files modified → max 3 issues
+- 6+ files modified → no cap
+
+If you have more candidates: keep only the most severe overengineering issues. Skip minor "could be simpler" observations if the core logic is sound.
+
 Rules:
 - `passed: true` — simplicity issues are MAJOR, never CRITICAL; they don't block but inform the planner
 - You MUST read at least one file before writing output

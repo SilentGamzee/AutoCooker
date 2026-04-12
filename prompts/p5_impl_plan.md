@@ -7,7 +7,8 @@ Write `implementation_plan.json` from `spec.json` and `context.json`.
 - Write PURE JSON — no `//` or `/* */` comments
 - EVERY user-facing feature needs BOTH backend AND frontend subtasks
 - NEVER create a subtask titled "Verify…", "Check…", "Test…", "Ensure…", "Validate…", "Manual QA…", "Regression…", "Code review…"
-- NEVER create a phase titled "Testing", "Testing and Validation", "QA", "Quality Assurance", "Validation", "Verification" — AutoCooker runs QA separately
+- NEVER create a phase titled "Testing", "Test and Validate", "QA", "Quality Assurance", "Validation", "Verification", "Analyze Current State", "Review...", "Examine..." — AutoCooker runs QA separately; every phase must produce code
+- NEVER create a phase or subtask for "analysis", "review", or "examination" — if you need to read files, do it inside the subtask's implementation_steps, not as a separate subtask
 - Every subtask MUST have at least one entry in `files_to_create` OR `files_to_modify` with actual source files
 - `files_to_modify` paths MUST be project-relative (e.g. `main.py`, `web/js/app.js`) — NEVER use `.tasks/` prefix
 - `implementation_steps` is MANDATORY — at least 2 steps, each with real `code`
@@ -192,5 +193,7 @@ Every subtask that touches `.css` or `.html` MUST include `visual_spec`: a one-s
 - `verify_methods` listing a name that was NOT found in the file read (remove the reference instead)
 - `code` containing `...`, `# existing code`, `# TODO`, `# rest of`, `// implementation here`
 - Steps that say "locate the function" or "find the existing" without providing the exact `find` string
-- A "Testing", "QA", or "Validation" phase — delete it; keep only implementation phases
+- A "Testing", "QA", "Validation", "Analyze", "Review", or "Examine" phase — keep only implementation phases
+- A subtask titled "Review...", "Examine...", "Analyze...", "Document..." — these have no code output
+- `implementation_steps` using field `code_snippet` instead of `code` — the required field name is `"code"`
 - `files_to_modify` paths containing `.tasks/` prefix (e.g. `.tasks/task_021/main.py` is WRONG; use `main.py`)

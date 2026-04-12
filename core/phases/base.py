@@ -1119,6 +1119,16 @@ Token count: {token_count} / {config['max_total_tokens']}
                         "2. Include ALL required fields as described in the original task above.\n"
                         "3. Call write_file with the COMPLETE new content.\n"
                         "4. Do NOT describe what you will do — just call write_file.\n"
+                        "\n"
+                        "STRUCTURAL RULES (violations likely caused this failure):\n"
+                        "- MAXIMUM 3 phases: phase-1 backend, phase-2 frontend, phase-3 integration (only if needed)\n"
+                        "- NEVER create phases titled: 'Analyze', 'Review', 'Examine', 'Test', 'Testing',\n"
+                        "  'Test and Validate', 'QA', 'Regression', 'Validation', 'Verification',\n"
+                        "  'Final Integration', 'Integration Testing' — every phase must write code\n"
+                        "- EVERY subtask MUST have 'files_to_create' OR 'files_to_modify' with real source files\n"
+                        "- NEVER create subtasks titled 'Review...', 'Examine...', 'Analyze...', 'Document...', 'Verify...'\n"
+                        "- implementation_steps MUST use field name 'code' (NOT 'code_snippet')\n"
+                        "- Each 'code' value must be real executable code (≥3 lines), not pseudocode or comments\n"
                     )
                     if failed_file_path:
                         reconstruct_msg += f"\nPATH TO USE: {failed_file_path}\n"

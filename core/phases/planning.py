@@ -374,14 +374,23 @@ def _validate_impl_plan(path: str, project_path: str = "") -> tuple[bool, str]:
         if not isinstance(phase, dict):
             errors.append(f"phases[{i}] must be an object, got {type(phase).__name__}: {str(phase)[:60]}")
             continue
-        # Reject testing/QA phases — AutoCooker handles QA separately
-        _TESTING_PHASE_KW = ("testing", "qa", "quality assurance", "validation", "verification")
+        # Reject non-implementation phases (testing, analysis, review, QA, etc.)
+        # Word-level matching to catch "Test and Validate", "Analyze Current State", etc.
+        _TESTING_PHASE_WORDS = {
+            "test", "testing", "qa", "quality",
+            "validation", "verify", "verification", "validate",
+            "regression", "analyze", "analysis",
+            "review", "examine", "examination", "investigation",
+        }
         _phase_title_lower = phase.get("title", "").lower()
-        if any(kw in _phase_title_lower for kw in _TESTING_PHASE_KW):
+        _phase_title_words = set(_phase_title_lower.split())
+        _matched_words = _phase_title_words & _TESTING_PHASE_WORDS
+        if _matched_words:
             errors.append(
-                f"phases[{i}] title '{phase.get('title','')}' is a testing/QA phase. "
-                f"Remove this phase entirely — AutoCooker handles QA separately. "
-                f"Merge any implementation steps into phase-1 or phase-2."
+                f"phases[{i}] title '{phase.get('title','')}' is a non-implementation phase "
+                f"(matched words: {sorted(_matched_words)}). "
+                f"Remove this phase entirely — every phase must produce code changes. "
+                f"Merge any implementation steps into phase-1 (backend) or phase-2 (frontend)."
             )
             continue
         subs = phase.get("subtasks", [])
@@ -448,6 +457,8 @@ def _validate_impl_plan(path: str, project_path: str = "") -> tuple[bool, str]:
     VERIFY_PREFIXES = (
         "verify ", "check ", "test ", "ensure ", "validate ",
         "confirm ", "make sure", "assert ",
+        "review ", "examine ", "analyze ", "analyse ",
+        "document ", "investigate ",
     )
     TESTING_KEYWORDS = (
         "manual qa", "regression test", "code review", "manual test",
