@@ -390,16 +390,33 @@ def _validate_impl_plan(path: str, project_path: str = "") -> tuple[bool, str]:
             errors.append(f"phases[{i}] must be an object, got {type(phase).__name__}: {str(phase)[:60]}")
             continue
         # Reject non-implementation phases (testing, analysis, review, QA, etc.)
-        # Word-level matching to catch "Test and Validate", "Analyze Current State", etc.
-        _TESTING_PHASE_WORDS = {
-            "test", "testing", "qa", "quality",
-            "validation", "verify", "verification", "validate",
-            "regression", "analyze", "analysis",
-            "review", "examine", "examination", "investigation",
+        # Two-tier matching to avoid false positives on implementation titles like
+        # "Backend: Add X with data integrity verification" or "Add input validation logic".
+        # STRICT words block anywhere in title; LEADING words only block when they are the
+        # first significant word (after stripping a known implementation-type prefix).
+        _TESTING_PHASE_STRICT = {
+            "test", "testing", "qa", "quality", "regression",
+            "analyze", "analysis", "review", "examine", "examination", "investigation",
+        }
+        _TESTING_PHASE_LEADING = {
+            "verify", "verification", "validate", "validation",
         }
         _phase_title_lower = phase.get("title", "").lower()
         _phase_title_words = set(_phase_title_lower.split())
-        _matched_words = _phase_title_words & _TESTING_PHASE_WORDS
+        # Strip "Backend:", "Frontend:", "Integration:", "phase-N:" prefix before LEADING check
+        _title_for_leading = _phase_title_lower
+        for _imp_pfx in ("backend", "frontend", "integration", "phase-"):
+            if _phase_title_lower.startswith(_imp_pfx):
+                if ":" in _phase_title_lower:
+                    _title_for_leading = _phase_title_lower.split(":", 1)[1].strip()
+                elif len(_phase_title_lower.split()) > 1:
+                    _title_for_leading = " ".join(_phase_title_lower.split()[1:])
+                break
+        _leading_word = _title_for_leading.split()[0] if _title_for_leading.split() else ""
+        _matched_words = (
+            (_phase_title_words & _TESTING_PHASE_STRICT) |
+            ({_leading_word} & _TESTING_PHASE_LEADING)
+        )
         if _matched_words:
             errors.append(
                 f"phases[{i}] title '{phase.get('title','')}' is a non-implementation phase "
@@ -2032,8 +2049,19 @@ Be concrete and specific. Return ONLY the JSON, no other text.
                     try:
                         with open(out_path, encoding="utf-8") as f:
                             d = _json.load(f)
+                        # Auto-unwrap: model sometimes wraps output as {"scope": {"issues": [...]}}
+                        # instead of {"issues": [...]} at root. Unwrap one level if needed.
                         if "issues" not in d:
-                            return False, f"{os.path.basename(out_path)}: missing 'issues' array"
+                            for _v in d.values():
+                                if isinstance(_v, dict) and "issues" in _v:
+                                    d = _v
+                                    break
+                        if "issues" not in d:
+                            return False, (
+                                f"{os.path.basename(out_path)}: missing 'issues' array. "
+                                f"Output must be a flat JSON object with 'issues' at the root level, "
+                                f"not wrapped inside another key. Keys found: {list(d.keys())[:5]}"
+                            )
                     except Exception as e:
                         return False, f"{os.path.basename(out_path)}: {e}"
                     return _validate_spec_json(sp)

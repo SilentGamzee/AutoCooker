@@ -73,7 +73,90 @@
 5. Сохранить файл
 ```
 
-### 3.3 Верификация после изменения
+### 3.3 Правила для изменений в промптах (`prompts/*.md`)
+
+Промпты — это инструкции для модели. Они должны работать для любого проекта, а не только для текущего состояния AutoCooker.
+
+**Не использовать конкретные файловые пути:**
+```
+❌  read `web/js/app.js` AND `web/index.html` before writing frontend subtasks
+✅  read the main JS application file and HTML entry point (check the project files list above)
+       — typically a file like app.js or main.js in the frontend directory,
+       and index.html or template.html
+```
+
+**Не использовать конкретные имена классов/функций из кода:**
+```
+❌  call eel.restart_task() to trigger the backend
+✅  call the relevant @eel.expose function (confirm its name via read_file on main.py)
+```
+
+**Не использовать конкретные CSS-классы или DOM ID:**
+```
+❌  look for element with id="btn-restart" or class="continue-btn"
+✅  check index.html for the actual button IDs used in this project
+```
+
+**Правило:** если упоминаешь путь к файлу в промпте — замени его на описание роли файла
+плюс инструкцию как его найти (`check context.json`, `check the project files list`,
+`identified via read_file on the relevant directory`).
+
+**Исключение:** допустимо упоминать стабильные архитектурные файлы проекта AutoCooker
+которые никогда не переименовываются и являются частью его архитектуры:
+`core/state.py`, `main.py`, `core/phases/*.py` — но не файлы задач и не web-ресурсы.
+
+### 3.4 Вспомогательные скрипты для анализа
+
+#### Порядок работы со скриптами
+
+**Перед написанием любого аналитического скрипта:**
+
+```
+1. Прочитать содержимое AgentInstructions_scripts/ (ls или glob)
+2. Найти скрипт, покрывающий нужную задачу (полностью или частично)
+3. Если подходящий скрипт есть — использовать его, при необходимости расширить
+4. Если нет — создать новый универсальный скрипт и сохранить туда
+```
+
+Никогда не писать одноразовый inline-скрипт если задача повторяется или может повториться.
+
+#### Требования к скриптам
+
+Все скрипты должны быть **адаптивными и универсальными**:
+
+```
+✅  Принимает путь к файлу/папке как аргумент:
+      bash extract_errors.sh .tasks/task_021/logs.json
+      bash extract_errors.sh .tasks/task_042/logs.json
+
+❌  Путь захардкожен внутри скрипта:
+      LOG_FILE=".tasks/task_021/logs.json"
+```
+
+```
+✅  Параметры через аргументы или с разумными дефолтами:
+      python analyze_logs.py --task task_021 --filter RECONSTRUCT
+
+❌  Константы внутри скрипта которые нужно менять вручную перед каждым запуском
+```
+
+Если существующий скрипт не покрывает новый случай — **расширить его** (добавить флаг,
+аргумент, режим), а не создавать дублирующий скрипт.
+
+#### Место хранения
+
+```
+✅  AgentInstructions_scripts/extract_errors.sh
+✅  AgentInstructions_scripts/analyze_logs.py
+❌  extract_errors.sh          (в корне проекта)
+❌  task_021/check_logs.sh     (в папке задачи)
+❌  /tmp/check_logs.sh         (временный путь)
+```
+
+Папку создавать при первом использовании. Скрипты не удалять — они служат документацией
+того, какой анализ проводился. Имя скрипта должно описывать его назначение.
+
+### 3.5 Верификация после изменения
 
 После каждого фикса выполнить соответствующую проверку:
 
@@ -85,7 +168,7 @@
 | Изменение промпта | Прочитать файл целиком и убедиться в логике |
 | Добавление новой функции | Убедиться что функция вызывается в нужном месте |
 
-### 3.4 Smoke test (если проект запускаем)
+### 3.6 Smoke test (если проект запускаем)
 
 Если проект доступен для запуска — после каждого критического фикса:
 ```bash
@@ -335,6 +418,7 @@ AutoCooker/
 │   ├── p4[abc]_critique_*.md ← Planning critique subphases
 │   └── p[0-8]_*.md          ← Остальные фазы
 ├── main.py                  ← Eel entry point, @eel.expose functions
+├── AgentInstructions_scripts/ ← Вспомогательные скрипты для анализа (не удалять)
 ├── AUTOCOOKER_FIXES.md      ← Очередь багов (читать первым)
 ├── FIXED_BUGS.md            ← Архив исправлений (создаётся по мере работы)
 └── AGENT_INSTRUCTIONS.md    ← Этот файл

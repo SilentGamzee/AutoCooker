@@ -3,6 +3,13 @@
 Write `implementation_plan.json` from `spec.json` and `context.json`.
 
 ## RULES
+
+**⛔ RULE 0 — implementation_steps HARD STOP:**
+NEVER write `implementation_plan.json` without `implementation_steps` filled in EVERY subtask.
+A plan with ANY subtask missing `implementation_steps` is IMMEDIATELY REJECTED with 12+ errors.
+Workflow: read all source files → plan steps → write ONE complete plan. Do NOT write a draft first.
+Every subtask MUST have `implementation_steps` with ≥ 1 step containing `action` + `code` fields.
+
 - Call at least one tool per response — text-only responses cause task failure
 - Write PURE JSON — no `//` or `/* */` comments
 - EVERY user-facing feature needs BOTH backend AND frontend subtasks
@@ -11,7 +18,8 @@ Write `implementation_plan.json` from `spec.json` and `context.json`.
 - NEVER create a phase or subtask for "analysis", "review", or "examination" — if you need to read files, do it inside the subtask's implementation_steps, not as a separate subtask
 - Every subtask MUST have at least one entry in `files_to_create` OR `files_to_modify` with actual source files
 - `files_to_modify` paths MUST be project-relative (e.g. `main.py`, `web/js/app.js`) — NEVER use `.tasks/` prefix
-- `implementation_steps` is MANDATORY — at least 2 steps, each with real `code`
+- Every subtask touching JS/HTML/CSS MUST include `"user_visible_impact"`: one sentence describing what the user sees after this change (e.g. `"User sees 'Start Planning' button replacing 'Continue' on QA-phase tasks"`)
+- Every subtask touching `.css` or `.html` MUST include `"visual_spec"`: layout and color tokens (e.g. `"var(--accent) button, var(--bg2) background, var(--r6) radius, 8px gap"`)
 
 ## PRE-PLANNING: MANDATORY VERIFICATION BEFORE WRITING ANY SUBTASK
 
@@ -29,10 +37,17 @@ For every function, DOM element, or API call you plan to use or modify:
 - Can this be done in < 10 lines in an existing file? → do it in one step, not a new class
 
 **Specifically required:**
-- Before any JS subtask touching `app.js`: read `app.js` to confirm the exact function names and the exact DOM element IDs (e.g. `btn-continue`, `btn-restart`) that exist
-- Before any backend subtask touching `main.py`: read `main.py` to confirm the exposed `@eel.expose` functions and their signatures
-- Before any subtask touching `core/state.py`: read it to confirm the actual dataclass fields and method names
-- Before any HTML subtask: read `index.html` to confirm which element IDs exist
+- **If spec.json `user_flow` mentions buttons, clicks, DOM updates, CSS, or visual changes:**
+  read the main JS application file and the HTML entry point BEFORE writing any frontend subtask —
+  even if they are not listed in context.json. Find them in the `Existing project files` list above:
+  look for `*.js` in frontend/web directories and `*.html` at the project root or web directory.
+- Before any JS subtask: read the main JS application file to confirm the exact function names
+  and DOM element IDs that exist (find it in the `Existing project files` list)
+- Before any backend subtask touching Python API functions: read the backend entry point (`main.py`
+  or equivalent) to confirm the exposed functions and their signatures
+- Before any subtask touching the data model: read the state/dataclass file to confirm the actual
+  field names and method names
+- Before any HTML subtask: read the HTML entry point to confirm which element IDs exist
 
 **Never invent:**
 - DOM element IDs not found in HTML (`#action-buttons`, `#start-planning` etc.)
@@ -45,9 +60,14 @@ Also verify:
 - Don't re-read files already in `Read files from last call:`
 
 ## PHASE STRUCTURE
-1. **Backend/Data Layer** — dataclasses, storage, API endpoints
-2. **Frontend/UI Layer** (depends on phase 1) — HTML, JS handlers, CSS
-3. **Integration** (if needed) — wiring frontend to backend
+1. **Backend/Data Layer** — dataclasses, storage, @eel.expose API endpoints
+2. **Frontend/UI Layer** (depends on phase-1) — HTML elements, JS handlers, CSS
+3. **Wiring** (rarely needed — skip for most tasks) — ONLY if a new @eel.expose function
+   added in phase-1 needs to be called from phase-2 JS and was NOT already connected there.
+   Max 1–2 subtasks. NOT for tests, NOT for scenarios, NOT for documentation.
+
+**Phase-3 "Wiring" is NOT "Integration Testing"** — do NOT create test files, scenario files,
+performance benchmarks, or documentation under phase-3. Those are out of scope entirely.
 
 Order: backend → HTML → JS → CSS (handlers need DOM elements)
 
@@ -197,3 +217,7 @@ Every subtask that touches `.css` or `.html` MUST include `visual_spec`: a one-s
 - A subtask titled "Review...", "Examine...", "Analyze...", "Document..." — these have no code output
 - `implementation_steps` using field `code_snippet` instead of `code` — the required field name is `"code"`
 - `files_to_modify` paths containing `.tasks/` prefix (e.g. `.tasks/task_021/main.py` is WRONG; use `main.py`)
+- Writing `implementation_plan.json` before reading source files — read first, then write once
+- Any subtask with empty or missing `implementation_steps` — every subtask needs at least 1 step with `code`
+- A phase-3 "Wiring" that creates files under `tests/`, `docs/`, or `*.md` files
+- A phase-3 that creates test scenarios, integration tests, performance benchmarks, or documentation

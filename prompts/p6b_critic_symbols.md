@@ -52,11 +52,11 @@ From the diff (new lines only), extract:
 
 **HTML → JS (event handlers):**
 - Every `onclick="funcName("` / `onchange="funcName("` in new HTML
-- `read_file web/js/app.js` and confirm `function funcName` exists
+- `read_file` the main JS application file and confirm `function funcName` exists
 
 **JS → DOM (element IDs):**
 - Every `document.getElementById('someId')` or `document.querySelector('#someId')` in new JS
-- `read_file web/index.html` and confirm `id="someId"` exists
+- `read_file` the HTML entry point and confirm `id="someId"` exists
 
 **Python → Python (imports and calls):**
 - Every `from module import Name` or `module.func()` in new Python code
