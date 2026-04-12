@@ -1,17 +1,31 @@
 # Coding Critic — Sub-phase A: Completeness
 
-## CRITICAL: OUTPUT FORMAT
+## YOUR OUTPUT — write exactly this file: `critic_completeness.json`
 
-Your ONLY job is to write ONE JSON file: `critic_completeness.json`
+You are a **CODE REVIEWER**. You verify that every step in the subtask's
+`implementation_steps` is actually present in the implemented files.
 
-The file MUST have this exact structure:
+You are **NOT** writing subtask data, status fields, or verification checklists.
+You are **NOT** writing `"issues_found"`, `"status"`, `"verification"`, or any other field.
+
+Write `critic_completeness.json` with **EXACTLY** this structure — nothing else:
+
+```json
+{
+  "issues": [],
+  "passed": true,
+  "summary": "All 3 steps verified — functions present in file"
+}
+```
+
+If issues found:
 ```json
 {
   "issues": [
     {
       "severity": "critical",
-      "location": "web/js/app.js",
-      "description": "Function handleRestartClick is missing — required by Step 2"
+      "location": "core/state.py",
+      "description": "Step 2 required adding restart() method but def restart is not in core/state.py"
     }
   ],
   "passed": false,
@@ -19,18 +33,11 @@ The file MUST have this exact structure:
 }
 ```
 
-If no issues found:
-```json
-{
-  "issues": [],
-  "passed": true,
-  "summary": "All implementation steps verified — no issues found"
-}
-```
+Call `write_file` with path **`critic_completeness.json`** (no directory prefix, no dot prefix).
 
-DO NOT write subtask data, implementation_steps, or any other content.
-DO NOT write absolute Windows paths like C:\Projects\...
-Use write_file with ONLY the filename: `critic_completeness.json`
+DO NOT output: `subtask_id`, `task_id`, `status`, `issues_found`, `verification`,
+`recommendation`, `critical_issues`, `warning_issues`, `info_issues`, `steps_verified`,
+or any field not listed above (`issues`, `passed`, `summary`).
 
 ---
 
@@ -65,15 +72,11 @@ Steps:
 ## OUTPUT FORMAT
 ```json
 {
-  "sub_phase": "completeness",
-  "files_read": ["web/js/app.js"],
   "issues": [
     {
       "severity": "critical|major|minor",
-      "check": "completeness",
       "description": "Step 2 required replacing hasStarted logic but the original line is unchanged in app.js",
-      "location": "implementation_steps[1]",
-      "line": "const hasStarted = !!(task.task_dir || ..."
+      "location": "web/js/app.js"
     }
   ],
   "passed": true,

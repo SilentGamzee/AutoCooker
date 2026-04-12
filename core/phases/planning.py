@@ -357,6 +357,18 @@ def _validate_impl_plan(path: str, project_path: str = "") -> tuple[bool, str]:
         with open(path, "w", encoding="utf-8") as _fout:
             _json_w.dump(data, _fout, indent=2, ensure_ascii=False)
 
+    # NEW-22: detect when model wrote a single subtask object instead of the full impl_plan.
+    # This happens in Patch Iteration when the model forgets the wrapper structure.
+    if isinstance(data, dict) and "id" in data and "phases" not in data:
+        _subtask_keys = {"title", "description", "implementation_steps", "files_to_create", "files_to_modify"}
+        if _subtask_keys & set(data.keys()):
+            return False, (
+                f"[FILE: {path}] You wrote a single subtask object instead of implementation_plan.json. "
+                f"Top-level keys found: {list(data.keys())}. "
+                f"The file MUST be a top-level object with a 'phases' array. "
+                f"Correct structure: {{\"feature\": \"...\", \"phases\": [{{\"id\": \"phase-1-backend\", \"subtasks\": [...]}}]}}"
+            )
+
     if "phases" not in data or not isinstance(data["phases"], list):
         top_keys = list(data.keys()) if isinstance(data, dict) else "not a dict"
         return False, f"[FILE: {path}] Missing 'phases' array. Top-level keys: {top_keys}"
@@ -513,6 +525,34 @@ def _validate_impl_plan(path: str, project_path: str = "") -> tuple[bool, str]:
                     f"is a manual testing/review task (no files_to_create or files_to_modify). "
                     f"DELETE it — manual steps cannot be automated. Replace with an implementation "
                     f"subtask that modifies actual source files."
+                )
+
+    # NEW-23: warn about documentation-only subtasks (no real code, only comments/README).
+    _DOC_TITLE_KEYWORDS = (
+        "add comment", "add inline comment", "update readme", "add docstring",
+        "document the", "add documentation", "write documentation", "update documentation",
+    )
+    for s in all_subtasks:
+        _title_l = s.get("title", "").lower()
+        _desc_l  = s.get("description", "").lower()
+        if any(kw in _title_l or kw in _desc_l for kw in _DOC_TITLE_KEYWORDS):
+            _steps = s.get("implementation_steps", [])
+            _all_code = " ".join(
+                st.get("code", "") for st in _steps if isinstance(st, dict)
+            )
+            _real_lines = [
+                ln for ln in _all_code.split("\n")
+                if ln.strip()
+                and not ln.strip().startswith("#")
+                and not ln.strip().startswith("//")
+                and not ln.strip().startswith("/*")
+                and not ln.strip().startswith("*")
+            ]
+            if len(_real_lines) < 3:
+                warnings.append(
+                    f"Subtask {s.get('id','?')}: '{s.get('title','')}' appears to be "
+                    f"documentation-only (no real code in implementation_steps). "
+                    f"Do not create subtasks whose only purpose is adding comments or updating README."
                 )
 
     # Check for full-stack planning - if there are frontend files, must have frontend subtasks

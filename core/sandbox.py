@@ -48,6 +48,10 @@ class Sandbox:
         # not already exist in workdir.  Planning pre-creates stub files for
         # every files_to_create entry, so the model can still overwrite them.
         self.new_files_allowed = new_files_allowed
+        # When set: only workdir-relative paths in this set may be written.
+        # Used during Coding phase to prevent cross-subtask file contamination.
+        # Paths are stored as forward-slash relative paths (e.g. "core/state.py").
+        self.allowed_write_paths: set[str] | None = None
 
     def _extract_task_number(self, task_dir: str) -> int:
         m = re.match(r'task_(\d+)', os.path.basename(task_dir))
@@ -100,13 +104,25 @@ class Sandbox:
             # Planning-фаза обязана заранее создать заглушки для всех
             # files_to_create (шаг 1.7 _step7_prepare_workdir).
             # ═══════════════════════════════════════════════════════════
+            rel = os.path.relpath(target_abs, self.workdir).replace(os.sep, "/")
             if not self.new_files_allowed and not os.path.exists(target_abs):
-                rel = os.path.relpath(target_abs, self.workdir).replace(os.sep, "/")
                 return False, (
                     f"Write blocked: cannot create new file '{rel}' during Coding phase. "
                     f"Only files pre-created in workdir by the Planning phase may be written. "
                     f"If this file should exist, it must be listed in 'files_to_create' in the "
                     f"implementation plan — Planning will then create an empty stub for it in workdir."
+                )
+            # ═══════════════════════════════════════════════════════════
+            # SCOPE GUARD: block writes to files outside this subtask's scope.
+            # Prevents cross-subtask contamination (modifying core/state.py
+            # while the current subtask only touches web/js/app.js).
+            # ═══════════════════════════════════════════════════════════
+            if self.allowed_write_paths is not None and rel not in self.allowed_write_paths:
+                allowed_list = ", ".join(sorted(self.allowed_write_paths)) or "(none)"
+                return False, (
+                    f"SANDBOX BLOCK: writing to '{rel}' is not allowed for this subtask. "
+                    f"Only these files may be written: {allowed_list}. "
+                    f"Modify only files listed in files_to_create / files_to_modify."
                 )
             return True, "OK"
         

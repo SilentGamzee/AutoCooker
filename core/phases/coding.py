@@ -236,6 +236,12 @@ class CodingPhase(BasePhase):
         # which version of _make_executor is present in base.py.
         if executor.sandbox is not None:
             executor.sandbox.new_files_allowed = False
+            # Block writes to files outside this subtask's scope (cross-subtask contamination guard)
+            _allowed = set()
+            for _f in files_to_create + files_to_modify:
+                _rel = self._to_rel_workdir(workdir, _f).replace("\\", "/")
+                _allowed.add(_rel)
+            executor.sandbox.allowed_write_paths = _allowed
         # Prevent write_file on modify-only files (would destroy existing code)
         executor.modify_only_files = {
             self._to_rel_workdir(workdir, f) for f in files_to_modify
@@ -624,11 +630,10 @@ class CodingPhase(BasePhase):
                 + _json.dumps(subtask_dict.get("implementation_steps", []), ensure_ascii=False, indent=2)
                 + f"\n\nDiff (new lines):\n{diff_text}\n\n"
                 f"Rule-based issues already found:\n{rule_text}\n\n"
-                f"Workdir (implemented files): {workdir}\n"
-                f"Project dir (original files): {project_path}\n\n"
                 f"Write {output_filename} using write_file.\n"
                 f"Use ONLY this exact filename with NO directory prefix: `{output_filename}`\n"
                 f"Example: write_file(path='{output_filename}', content='...')\n"
+                f"DO NOT use any directory path — write_file(path='{output_filename}', ...) only.\n"
             )
 
             def _make_validator(out=output_path):

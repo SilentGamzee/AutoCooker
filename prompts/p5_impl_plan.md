@@ -12,6 +12,7 @@ Every subtask MUST have `implementation_steps` with ≥ 1 step containing `actio
 
 - Call at least one tool per response — text-only responses cause task failure
 - Write PURE JSON — no `//` or `/* */` comments
+- When updating an existing plan (Patch mode): write the FULL `implementation_plan.json` with `phases` array — NEVER write a single subtask object `{"id": "T-001", ...}` as the top-level JSON
 - EVERY user-facing feature needs BOTH backend AND frontend subtasks
 - NEVER create a subtask titled "Verify…", "Check…", "Test…", "Ensure…", "Validate…", "Manual QA…", "Regression…", "Code review…"
 - NEVER create a phase titled "Testing", "Test and Validate", "QA", "Quality Assurance", "Validation", "Verification", "Analyze Current State", "Review...", "Examine..." — AutoCooker runs QA separately; every phase must produce code
@@ -211,3 +212,4 @@ Every subtask that touches `.css` or `.html` MUST include `visual_spec`: a one-s
 - Any subtask with empty or missing `implementation_steps` — every subtask needs at least 1 step with `code`
 - A phase-3 "Wiring" that creates files under `tests/`, `docs/`, or `*.md` files
 - A phase-3 that creates test scenarios, integration tests, performance benchmarks, or documentation
+- A subtask whose only purpose is adding inline comments, docstrings, or updating README/documentation — documentation is not a code change and will be rejected
