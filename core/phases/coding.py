@@ -13,19 +13,36 @@ from core.phases.base import BasePhase
 from core.git_utils import get_workdir_diff
 
 
+_PLACEHOLDER_STEP_PREFIXES = (
+    "read ", "read_", "test ", "test_", "verify ", "check ", "ensure ",
+    "validate ", "review ", "examine ", "analyze ", "investigate ",
+)
+
 def _format_implementation_steps(steps: list) -> str:
-    """Format implementation_steps list into a readable section for the coding agent."""
+    """Format implementation_steps list into a readable section for the coding agent.
+
+    NEW-25: Steps with empty 'code' that are just "Read..." / "Test..." placeholders
+    are dropped — they provide no implementation guidance and cause the coding agent
+    to skip actually reading files (the file content is already injected via modify_previews).
+    """
     if not steps or not isinstance(steps, list):
         return ""
     lines = ["Implementation Steps (follow in order):\n"]
-    for i, step in enumerate(steps, 1):
+    step_num = 0
+    for step in steps:
         if not isinstance(step, dict):
             continue
         action = step.get("action", "").strip()
         code = step.get("code", "").strip()
         verify = step.get("verify_methods", [])
+        # Drop placeholder steps: empty code + action that describes reading/testing
+        if not code:
+            action_lower = action.lower()
+            if any(action_lower.startswith(pfx) for pfx in _PLACEHOLDER_STEP_PREFIXES):
+                continue  # skip "Read current X" / "Test modified X" placeholders
+        step_num += 1
         if action:
-            lines.append(f"  Step {i}: {action}")
+            lines.append(f"  Step {step_num}: {action}")
         if verify:
             lines.append(f"    Verify exist before use: {', '.join(verify)}")
         if code:
@@ -259,8 +276,9 @@ class CodingPhase(BasePhase):
                     if len(_content) > PREVIEW_LIMIT:
                         preview = (
                             _content[:PREVIEW_LIMIT]
-                            + f"\n…(TRUNCATED: {len(_content) - PREVIEW_LIMIT} chars hidden."
-                            + f" Call read_file('{f}') to see full content before using modify_file.)"
+                            + f"\n⚠️ TRUNCATED: {len(_content) - PREVIEW_LIMIT} chars hidden.\n"
+                            + f"⛔ MANDATORY: call read_file('{f}') to see the FULL file before using modify_file.\n"
+                            + f"   Do NOT write code referencing anything beyond what is shown above.\n"
                         )
                     else:
                         preview = _content
@@ -414,7 +432,8 @@ class CodingPhase(BasePhase):
                if branch_diff_section else "")
             + "\nProcedure:\n"
             "1. Read pattern reference files to understand code style.\n"
-            "2. The current content of files_to_modify is shown above — no need to read them again.\n"
+            "2. Files to modify are shown above. If a file shows ⚠️ TRUNCATED — you MUST call\n"
+            "   read_file on that file before using modify_file. Only reference code you have seen.\n"
             "3. For MODIFY files: call modify_file with the exact old_text to replace.\n"
             "4. For CREATE files: call write_file with the full new content.\n"
             "5. Call read_file to verify, then call confirm_task_done.\n"

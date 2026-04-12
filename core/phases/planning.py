@@ -474,6 +474,18 @@ def _validate_impl_plan(path: str, project_path: str = "") -> tuple[bool, str]:
                         "implementation_steps must contain at least one step with 'code' snippet — "
                         "include actual code fragments showing what to write"
                     )
+                else:
+                    # NEW-25: warn when majority of steps are empty placeholders ("Read...", "Test...")
+                    empty_steps = [
+                        st for st in steps
+                        if isinstance(st, dict) and not st.get("code", "").strip()
+                    ]
+                    if len(steps) > 0 and len(empty_steps) / len(steps) > 0.4:
+                        warnings.append(
+                            f"Subtask {s.get('id','?')}: {len(empty_steps)}/{len(steps)} steps have "
+                            f"empty 'code' — remove placeholder steps like 'Read current X' and "
+                            f"'Test modified X'. Every step must contain actual code to implement."
+                        )
             if sub_errors:
                 errors.append(f"Subtask {s.get('id','?')}: {', '.join(sub_errors)}")
             else:

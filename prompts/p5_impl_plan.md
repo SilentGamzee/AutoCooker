@@ -213,3 +213,4 @@ Every subtask that touches `.css` or `.html` MUST include `visual_spec`: a one-s
 - A phase-3 "Wiring" that creates files under `tests/`, `docs/`, or `*.md` files
 - A phase-3 that creates test scenarios, integration tests, performance benchmarks, or documentation
 - A subtask whose only purpose is adding inline comments, docstrings, or updating README/documentation — documentation is not a code change and will be rejected
+- Steps with `"code": ""` (empty string) — every step must contain real implementation code; remove "Read current X" and "Test modified X" placeholder steps entirely
