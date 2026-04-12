@@ -204,6 +204,9 @@ class CodingPhase(BasePhase):
         completion_cond = subtask_dict.get("completion_without_ollama", "").strip()
         patterns_from   = subtask_dict.get("patterns_from") or []
 
+        # Tell build_system() which files are relevant to this subtask (SIMP-6)
+        self.task._current_subtask_files = set(files_to_modify + files_to_create + patterns_from)
+
         # Track whether any file writes actually happened
         writes_made: list[str] = []
 
@@ -362,6 +365,9 @@ class CodingPhase(BasePhase):
             f"Subtask ID: {sid}\n"
             f"Title: {title}\n\n"
             f"Description:\n{subtask_dict.get('description', '')}\n\n"
+            # In retry mode: show current file state BEFORE implementation_steps so the model
+            # sees what is already implemented and makes targeted fixes, not full re-implementations.
+            + (current_workdir_state if critic_feedback and current_workdir_state else "")
             + _format_implementation_steps(subtask_dict.get('implementation_steps', []))
             + f"Files to CREATE from scratch:\n"
             + ("\n".join(f"  - {f}" for f in files_to_create) if files_to_create else "  (none)")
@@ -372,11 +378,18 @@ class CodingPhase(BasePhase):
             + (pattern_previews if pattern_previews else
                ("\n".join(f"  - {f}" for f in patterns_from) if patterns_from else "  (none)"))
             + branch_diff_section
-            + current_workdir_state
+            # In first iteration: show current_workdir_state here (its original position).
+            # In retry: already shown above before impl_steps.
+            + (current_workdir_state if not critic_feedback else "")
             + f"\n\nCompletion condition:\n  {completion_cond}\n\n"
             f"Quality condition:\n  {subtask_dict.get('completion_with_ollama', '')}\n\n"
             "RULES:\n"
-            "- Files to CREATE: use write_file to create them from scratch.\n"
+            + ("⛔ RETRY MODE: The files above already contain changes from a previous iteration.\n"
+               "  Do NOT add a second version of any function that already exists in the current\n"
+               "  file state (shown above). Fix it IN PLACE using modify_file.\n"
+               "  Do NOT re-implement from scratch. Make ONLY targeted fixes for the critic issues.\n"
+               if critic_feedback else "")
+            + "- Files to CREATE: use write_file to create them from scratch.\n"
             "- Files to MODIFY: you MUST use modify_file (find and replace a specific block).\n"
             "  NEVER use write_file on a file listed under MODIFY — that destroys existing code.\n"
             "  Make only the minimal targeted change needed for this subtask.\n"
@@ -613,9 +626,9 @@ class CodingPhase(BasePhase):
                 f"Rule-based issues already found:\n{rule_text}\n\n"
                 f"Workdir (implemented files): {workdir}\n"
                 f"Project dir (original files): {project_path}\n\n"
-                f"Write {output_filename} as a NEW file using write_file.\n"
-                f"Use ONLY the relative filename: {output_filename}\n"
-                f"(absolute output path for reference: {output_path})\n"
+                f"Write {output_filename} using write_file.\n"
+                f"Use ONLY this exact filename with NO directory prefix: `{output_filename}`\n"
+                f"Example: write_file(path='{output_filename}', content='...')\n"
             )
 
             def _make_validator(out=output_path):

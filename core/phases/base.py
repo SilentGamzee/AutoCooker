@@ -123,14 +123,18 @@ class BasePhase:
                 + cache.paths_summary() + "\n```"
             )
         if cache.file_contents:
-            summary = cache.contents_summary()
-            CONTENT_SUMMARY_LIMIT = 8000
-            if len(summary) > CONTENT_SUMMARY_LIMIT:
-                summary = (
-                    summary[:CONTENT_SUMMARY_LIMIT]
-                    + "\n…(truncated — use read_file to see remaining files)"
-                )
-            parts.append("\n\n---\n## Cached file contents\n" + summary)
+            current_files = getattr(self.task, "_current_subtask_files", None)
+            if current_files:
+                # Only show files relevant to the current subtask (SIMP-6)
+                relevant = {p: c for p, c in cache.file_contents.items() if p in current_files}
+            else:
+                relevant = cache.file_contents
+            if relevant:
+                parts_list = [
+                    f"### {p}\n```\n{c[:3000]}\n```"
+                    for p, c in list(relevant.items())[:3]
+                ]
+                parts.append("\n\n---\n## Relevant cached files\n" + "\n\n".join(parts_list))
         recent_logs = self.task.logs[-10:]
         if recent_logs:
             log_lines = "\n".join(

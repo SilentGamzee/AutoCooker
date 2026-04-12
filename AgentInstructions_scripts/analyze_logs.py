@@ -20,6 +20,10 @@ import sys
 import argparse
 from collections import Counter
 
+# Fix UnicodeEncodeError on Windows (cp1251 terminal)
+if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf8"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 
 def load_logs(path: str) -> list:
     with open(path, "r", encoding="utf-8") as f:

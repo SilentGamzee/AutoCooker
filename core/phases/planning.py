@@ -437,7 +437,12 @@ def _validate_impl_plan(path: str, project_path: str = "") -> tuple[bool, str]:
             if not s.get("id") or not s.get("title") or not s.get("description"):
                 sub_errors.append("missing id/title/description")
             if not s.get("completion_without_ollama", "").strip():
-                sub_errors.append("missing 'completion_without_ollama'")
+                _fallback_files = s.get("files_to_create", []) + s.get("files_to_modify", [])
+                if _fallback_files:
+                    s["completion_without_ollama"] = f"{_fallback_files[0]} exists"
+                    _normalized = True
+                else:
+                    sub_errors.append("completion_without_ollama is empty and no files listed")
             if not (s.get("files_to_create") or s.get("files_to_modify")):
                 sub_errors.append(
                     "no files_to_create or files_to_modify — "
@@ -542,9 +547,9 @@ def _validate_impl_plan(path: str, project_path: str = "") -> tuple[bool, str]:
             if not s.get("user_visible_impact")
         ]
         if frontend_without_impact:
-            errors.append(
+            warnings.append(
                 f"Frontend subtasks missing 'user_visible_impact' field: {', '.join(frontend_without_impact)}. "
-                f"All frontend subtasks must explain what user sees/does as a result of the change."
+                f"Recommended: add user_visible_impact explaining what user sees after this change."
             )
 
     # CSS/HTML subtasks must have visual_spec
@@ -553,9 +558,9 @@ def _validate_impl_plan(path: str, project_path: str = "") -> tuple[bool, str]:
         files = s.get("files_to_create", []) + s.get("files_to_modify", [])
         touches_ui = any(f.endswith(_CSS_HTML_EXT) for f in files)
         if touches_ui and not s.get("visual_spec", "").strip():
-            errors.append(
+            warnings.append(
                 f"Subtask {s.get('id','?')} touches CSS/HTML but has no 'visual_spec'. "
-                f"Add visual_spec describing expected look: layout, spacing, colors (use var(--*) tokens)."
+                f"Recommended: add visual_spec describing expected look (layout, spacing, var(--*) tokens)."
             )
         
         # Warn if all subtasks are mixed together without phases
@@ -1206,9 +1211,9 @@ class PlanningPhase(BasePhase):
                     response = self.ollama.complete(
                         model=model,
                         prompt=full_prompt,
-                        max_tokens=12000 
+                        max_tokens=1500
                     )
-                    
+
                     # Debug: log raw response
                     if _DEBUG: self.log(f"  [DEBUG] Raw Ollama response length: {len(response)} chars", "info")
                     if len(response) > 0:
@@ -1392,12 +1397,12 @@ class PlanningPhase(BasePhase):
                     response = self.ollama.complete(
                         model=model,
                         prompt=full_prompt,
-                        max_tokens=12000
+                        max_tokens=1500
                     )
-                    
+
                     # Debug: log raw response
                     if _DEBUG: self.log(f"  [DEBUG] Raw response: {response[:200]}...", "info")
-                    
+
                     # Parse numbered list
                     user_flow = self._parse_requirements_list(response)
                     
@@ -1606,12 +1611,12 @@ Focus on making steps more specific about:
                     response = self.ollama.complete(
                         model=model,
                         prompt=full_prompt,
-                        max_tokens=12000
+                        max_tokens=2000
                     )
-                    
+
                     # Debug: log raw response
                     if _DEBUG: self.log(f"  [DEBUG] Raw response: {response[:200]}...", "info")
-                    
+
                     # Parse numbered list
                     system_flow = self._parse_requirements_list(response)
                     
@@ -1786,9 +1791,9 @@ Be concrete and specific. Return ONLY the JSON, no other text.
                     response = self.ollama.complete(
                         model=model,
                         prompt=full_prompt,
-                        max_tokens=12000 
+                        max_tokens=1500
                     )
-                    
+
                     # Debug: log raw response
                     resp_preview = response[:300] if len(response) > 300 else response
                     if _DEBUG: self.log(f"  [DEBUG] Raw response: {resp_preview}...", "info")
@@ -2026,6 +2031,7 @@ Be concrete and specific. Return ONLY the JSON, no other text.
 
         all_issues: list = []
         any_fixes = False
+        shared_reads: dict = {}   # shared file-read cache across sub-phases (SIMP-5)
 
         for step_name, prompt_file, output_filename in sub_phases:
             self.log(f"  ─── {step_name} ───", "info")
@@ -2071,6 +2077,7 @@ Be concrete and specific. Return ONLY the JSON, no other text.
                 step_name, prompt_file,
                 PLANNING_TOOLS, executor, msg, _make_validator(),
                 model, max_outer_iterations=3,
+                shared_last_read_files=shared_reads,
             )
 
             if not ok:

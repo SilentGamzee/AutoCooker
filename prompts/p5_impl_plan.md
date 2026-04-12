@@ -131,23 +131,18 @@ Why good: exact find/replace, real variable names from read file, no invented AP
       "subtasks": [
         {
           "id": "T-001",
-          "title": "Create Attachment dataclass",
-          "description": "Create core/attachment.py with @dataclass Attachment. Fields: id, task_id, filename, filepath, uploaded_at. Follow KanbanTask pattern in core/state.py. Do NOT add extra methods.",
-          "service": "backend",
-          "files_to_create": ["core/attachment.py"],
-          "files_to_modify": [],
+          "title": "Add restart_to_planning method to KanbanTask",
+          "description": "In core/state.py add restart_to_planning() that resets phase to 'planning' and clears qa_result.",
+          "files_to_create": [],
+          "files_to_modify": ["core/state.py"],
           "patterns_from": ["core/state.py"],
-          "completion_without_ollama": "File core/attachment.py exists AND contains '@dataclass' AND contains 'class Attachment'",
-          "completion_with_ollama": "Attachment dataclass has all required fields",
+          "completion_without_ollama": "core/state.py contains 'def restart_to_planning'",
+          "completion_with_ollama": "KanbanTask.restart_to_planning() resets phase correctly",
           "implementation_steps": [
             {
-              "action": "Create core/attachment.py with Attachment dataclass",
-              "code": "from dataclasses import dataclass, field\nfrom datetime import datetime\n\n@dataclass\nclass Attachment:\n    id: str\n    task_id: str\n    filename: str\n    filepath: str\n    uploaded_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())"
-            },
-            {
-              "action": "Add to_dict method inside Attachment class",
-              "insert_after": "    uploaded_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())",
-              "code": "    def to_dict(self) -> dict:\n        return {\"id\": self.id, \"filename\": self.filename, \"uploaded_at\": self.uploaded_at}"
+              "action": "Add restart_to_planning method to KanbanTask after update_status method",
+              "insert_after": "    def update_status(self, status: str) -> None:\n        self.status = status",
+              "code": "    def restart_to_planning(self) -> None:\n        self.phase = 'planning'\n        self.qa_result = None\n        self.updated_at = datetime.utcnow().isoformat()"
             }
           ],
           "status": "pending"
@@ -162,28 +157,22 @@ Why good: exact find/replace, real variable names from read file, no invented AP
       "subtasks": [
         {
           "id": "T-002",
-          "title": "Add attachment UI and handlers",
-          "description": "Modify web/index.html: add <button id='add-attachment-btn'> and <div id='attachment-list'> after description div. Modify web/js/app.js: add handleAddAttachment(), renderAttachments(), handleDeleteAttachment(). Follow existing event handler pattern. Modify web/css/styles.css: add .attachment-list and .attachment-item styles.",
-          "service": "frontend",
+          "title": "Replace Continue button with Start Planning on QA tasks",
+          "description": "In web/js/app.js change _updateTaskButtons to show 'Start Planning' instead of 'Continue' when task.phase === 'qa'.",
           "files_to_create": [],
-          "files_to_modify": ["web/index.html", "web/js/app.js", "web/css/styles.css"],
-          "patterns_from": ["web/index.html", "web/js/app.js"],
-          "completion_without_ollama": "web/index.html contains 'add-attachment-btn' AND web/js/app.js contains 'renderAttachments'",
-          "completion_with_ollama": "User can upload, view, and delete attachments",
-          "user_visible_impact": "User sees upload button and attachment list in task detail",
-          "visual_spec": "Button uses var(--accent), list items use var(--bg2) background, var(--r6) border-radius, var(--border) border. Gap: 8px between items.",
+          "files_to_modify": ["web/js/app.js"],
+          "patterns_from": ["web/js/app.js"],
+          "completion_without_ollama": "web/js/app.js contains 'Start Planning'",
+          "completion_with_ollama": "Button shows 'Start Planning' for QA-phase tasks",
+          "user_visible_impact": "User sees 'Start Planning' button instead of 'Continue' on QA-phase tasks",
+          "visual_spec": "Button uses existing var(--accent) style, no new CSS needed",
           "implementation_steps": [
             {
-              "action": "Add attachment section to web/index.html after #task-description div",
-              "find": "  <div id=\"task-description\"></div>",
-              "replace": "  <div id=\"task-description\"></div>\n  <div class=\"attachment-section\">\n    <button id=\"add-attachment-btn\" class=\"btn-secondary\">Add Attachment</button>\n    <input type=\"file\" id=\"attachment-input\" style=\"display:none\">\n    <div id=\"attachment-list\"></div>\n  </div>",
-              "code": "  <div class=\"attachment-section\">\n    <button id=\"add-attachment-btn\" class=\"btn-secondary\">Add Attachment</button>\n    <input type=\"file\" id=\"attachment-input\" style=\"display:none\">\n    <div id=\"attachment-list\"></div>\n  </div>"
-            },
-            {
-              "action": "Add attachment handlers to web/js/app.js after restartActiveTask function",
-              "insert_after": "async function restartActiveTask() {",
-              "code": "function handleAddAttachment() { document.getElementById('attachment-input').click(); }\nasync function renderAttachments(taskId) {\n  const list = await eel.get_attachments(taskId)();\n  document.getElementById('attachment-list').innerHTML = list.map(a =>\n    `<div class=\"attachment-item\">${_esc(a.filename)} <button onclick=\"handleDeleteAttachment('${taskId}','${a.id}')\">✕</button></div>`\n  ).join('');\n}\nasync function handleDeleteAttachment(taskId, id) {\n  await eel.delete_attachment(taskId, id)();\n  renderAttachments(taskId);\n}",
-              "verify_methods": ["eel.get_attachments", "eel.delete_attachment", "_esc"]
+              "action": "In _updateTaskButtons: change label to 'Start Planning' for qa phase",
+              "find": "  btn.textContent = task.phase === 'qa' ? 'Continue' : 'Start';",
+              "replace": "  btn.textContent = task.phase === 'qa' ? 'Start Planning' : 'Start';",
+              "code": "  btn.textContent = task.phase === 'qa' ? 'Start Planning' : 'Start';",
+              "verify_methods": ["_updateTaskButtons"]
             }
           ],
           "status": "pending"
@@ -211,6 +200,7 @@ Every subtask that touches `.css` or `.html` MUST include `visual_spec`: a one-s
 - A subtask whose only purpose is to "ensure styling is consistent" when no new CSS is needed
 - A subtask that modifies planning/workflow logic to "skip steps on restart" unless the task description explicitly requires it
 - `verify_methods` listing a name that was NOT found in the file read (remove the reference instead)
+- `service` field in subtasks — not read by runtime, omit it
 - `code` containing `...`, `# existing code`, `# TODO`, `# rest of`, `// implementation here`
 - Steps that say "locate the function" or "find the existing" without providing the exact `find` string
 - A "Testing", "QA", "Validation", "Analyze", "Review", or "Examine" phase — keep only implementation phases
