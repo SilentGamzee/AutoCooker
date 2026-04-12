@@ -342,6 +342,21 @@ def _validate_impl_plan(path: str, project_path: str = "") -> tuple[bool, str]:
     ok, data, err = _read_json(path)
     if not ok:
         return False, f"[FILE: {path}] {err}"
+
+    # Normalize: rename 'code_snippet' → 'code' in all implementation_steps.
+    # Models sometimes generate 'code_snippet' despite prompt instructions.
+    _normalized = False
+    for _phase in data.get("phases", []):
+        for _sub in _phase.get("subtasks", []) if isinstance(_phase, dict) else []:
+            for _step in _sub.get("implementation_steps", []) if isinstance(_sub, dict) else []:
+                if isinstance(_step, dict) and "code_snippet" in _step and "code" not in _step:
+                    _step["code"] = _step.pop("code_snippet")
+                    _normalized = True
+    if _normalized:
+        import json as _json_w
+        with open(path, "w", encoding="utf-8") as _fout:
+            _json_w.dump(data, _fout, indent=2, ensure_ascii=False)
+
     if "phases" not in data or not isinstance(data["phases"], list):
         top_keys = list(data.keys()) if isinstance(data, dict) else "not a dict"
         return False, f"[FILE: {path}] Missing 'phases' array. Top-level keys: {top_keys}"
