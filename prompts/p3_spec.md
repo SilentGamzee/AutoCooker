@@ -5,78 +5,55 @@ Write `spec.json` from `requirements.json` and `context.json`.
 ## RULES
 - Call at least one tool per response — text-only responses cause task failure
 - Write PURE JSON — no `//` or `/* */` comments, no markdown blocks
-- EVERY feature needs BOTH frontend AND backend work — never backend-only
-- `user_flow` is MANDATORY for all tasks
 - `acceptance_criteria` must be copied VERBATIM from requirements.json
+- `user_flow` is MANDATORY
 - Code snippets in `patterns` must be ACTUAL code read with `read_file` — never invented
 
 ## PROCEDURE
-1. Read reference files from `context.json.task_relevant_files.to_reference`
-2. Map every user action to frontend + backend changes
-3. Write spec.json
+1. Read every file listed in `context.json.task_relevant_files.to_reference`
+2. For each file, ask: "Does it already implement the required behavior?"
+   - Already done → do NOT add a pattern for it
+   - Missing/wrong → add ONE pattern describing the change
+3. Write spec.json with only the files that actually need changing
+
+## SIZE RULE — enforced by validator
+- `patterns`: ONE entry per file that needs changing
+  - 1 file needs changing → 1 pattern
+  - 2 files need changing → 2 patterns
+  - Do NOT add patterns for files that already handle the requirement
+- `task_scope.will_do`: ONE bullet per file changed — no more
 
 ## OUTPUT FORMAT
 ```json
 {
-  "title": "Task title from requirements",
-  "overview": "2-3 sentences: what is built, why, which codebase parts (min 50 chars)",
-  "workflow_type": { "type": "feature_add|bug_fix|refactor", "rationale": "why" },
+  "overview": "2-3 sentences: what is built, why, which files change (min 50 chars)",
   "task_scope": {
-    "will_do": ["Add upload button (web/index.html) so user can attach files"],
-    "wont_do": ["Cloud storage", "File preview"]
+    "will_do": ["web/js/app.js: change _updateTaskButtons to show 'Start Planning' when task.column === 'planning'"],
+    "wont_do": ["Modify backend — restart_task() already sets task.column correctly"]
   },
   "user_flow": {
-    "current_state": "What user can do NOW",
-    "target_state": "What user can do AFTER",
+    "current_state": "What user sees NOW",
+    "target_state": "What user sees AFTER",
     "steps": [
       {
         "step": 1,
-        "action_name": "User opens task detail",
-        "user_action": "Clicks task card",
-        "ui_element": "Button with id=\"add-btn\"",
-        "frontend_changes": ["web/index.html: Add button", "web/js/app.js: Add handler"],
-        "backend_changes": ["core/state.py: Add save_item()"],
-        "user_feedback": "Form appears"
+        "action_name": "User clicks Restart on QA task",
+        "user_action": "Clicks Restart button",
+        "ui_element": "Button with id=\"restart-btn\"",
+        "result": "Task moves to Planning phase, button text changes to 'Start Planning'"
       }
     ]
-  },
-  "data_flow": {
-    "trigger": "User clicks Save",
-    "frontend_to_backend": { "file": "web/js/app.js", "function": "handleSave()", "data": "{id, name}" },
-    "backend_processing": { "file": "core/state.py", "function": "save_task()", "storage": "kanban.json" },
-    "backend_to_frontend": { "response": "{success: true, task: {...}}" },
-    "frontend_display": { "file": "web/js/app.js", "function": "renderTask()", "ui_update": "Task appears in list" }
-  },
-  "files": {
-    "frontend": {
-      "to_create": [{ "path": "web/upload.html", "purpose": "Upload form", "user_impact": "User sees form" }],
-      "to_modify": [{ "path": "web/index.html", "changes": "Add upload button", "user_impact": "Button visible" }]
-    },
-    "backend": {
-      "to_create": [{ "path": "core/attachment.py", "purpose": "Attachment dataclass" }],
-      "to_modify": [{ "path": "core/state.py", "changes": "Add save_attachment()" }]
-    }
   },
   "patterns": [
     {
       "file": "web/js/app.js",
       "symbol": "_updateTaskButtons",
-      "description": "Modify hasStarted to not count task_dir alone as proof the task started",
-      "current_code": "const hasStarted = !!(task.task_dir || (task.subtasks && task.subtasks.length) || (task.logs && task.logs.length));",
-      "proposed_change": "const hasStarted = !!((task.subtasks && task.subtasks.length) || (task.logs && task.logs.length));"
+      "description": "Change Continue button text to 'Start Planning' when task.column === 'planning'",
+      "current_code": "continueBtn.textContent = 'Continue';",
+      "proposed_change": "continueBtn.textContent = (task.column === 'planning') ? 'Start Planning' : 'Continue';"
     }
   ],
-  "implementation_notes": {
-    "do": ["Full stack: every backend change needs UI"],
-    "dont": ["Don't create backend-only features"]
-  },
-  "acceptance_criteria": ["Criterion 1 verbatim from requirements.json"],
-  "gui_criteria": [
-    "User can complete full User Flow",
-    "All UI elements visible and styled",
-    "User receives feedback for all actions"
-  ],
-  "success_definition": "Complete when ALL acceptance criteria satisfied AND full User Flow works AND no placeholder code"
+  "acceptance_criteria": ["Criterion verbatim from requirements.json"]
 }
 ```
 
@@ -84,23 +61,23 @@ Write `spec.json` from `requirements.json` and `context.json`.
 After writing spec.json, call `confirm_phase_done`.
 
 ## PATTERNS FORMAT
-Patterns must be objects (not plain strings) with `file` and `description` required:
+Each pattern must be an object with `file` and `description` required:
 ```json
 {
   "file": "web/js/app.js",
   "symbol": "functionName",
-  "description": "What this pattern shows",
-  "current_code": "actual code read from file (optional but strongly recommended for modifications)",
-  "proposed_change": "what it should become (optional but strongly recommended)"
+  "description": "What needs to change and why",
+  "current_code": "exact code from file (read with read_file first)",
+  "proposed_change": "what it becomes"
 }
 ```
-`current_code` and `proposed_change` let the critic verify the code actually exists. Always read the file first with `read_file` before writing patterns.
+Always `read_file` before writing a pattern — `current_code` must be real, not invented.
 
 ## VALIDATION CHECKLIST
 - `overview` ≥ 50 chars
-- `user_flow.steps` array exists and non-empty
-- Each step has `step` (number) and `action_name` (string)
+- `user_flow.steps` non-empty, each step has `step` (number) and `action_name` (string)
 - `acceptance_criteria` non-empty, copied verbatim from requirements.json
 - `task_scope.will_do` non-empty
-- Each entry in `patterns` is an object with `file` and `description` fields
-- No invented file paths — use only paths from requirements.json or context.json
+- Each pattern is an object with `file` and `description`
+- No invented file paths — only paths from context.json or requirements.json
+- No patterns for files that already implement the requirement

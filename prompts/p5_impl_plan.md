@@ -13,64 +13,64 @@ Every subtask MUST have `implementation_steps` with ≥ 1 step containing `actio
 - Call at least one tool per response — text-only responses cause task failure
 - Write PURE JSON — no `//` or `/* */` comments
 - When updating an existing plan (Patch mode): write the FULL `implementation_plan.json` with `phases` array — NEVER write a single subtask object `{"id": "T-001", ...}` as the top-level JSON
-- EVERY user-facing feature needs BOTH backend AND frontend subtasks
+- Create subtasks ONLY for components that actually need changes — skip any component that already handles the requirement
 - NEVER create a subtask titled "Verify…", "Check…", "Test…", "Ensure…", "Validate…", "Manual QA…", "Regression…", "Code review…"
 - NEVER create a phase titled "Testing", "Test and Validate", "QA", "Quality Assurance", "Validation", "Verification", "Analyze Current State", "Review...", "Examine..." — AutoCooker runs QA separately; every phase must produce code
 - NEVER create a phase or subtask for "analysis", "review", or "examination" — if you need to read files, do it inside the subtask's implementation_steps, not as a separate subtask
 - Every subtask MUST have at least one entry in `files_to_create` OR `files_to_modify` with actual source files
 - `files_to_modify` paths MUST be project-relative (e.g. `main.py`, `web/js/app.js`) — NEVER use `.tasks/` prefix
-- Every subtask touching JS/HTML/CSS MUST include `"user_visible_impact"`: one sentence describing what the user sees after this change (e.g. `"User sees 'Start Planning' button replacing 'Continue' on QA-phase tasks"`)
-- Every subtask touching `.css` or `.html` MUST include `"visual_spec"`: layout and color tokens (e.g. `"var(--accent) button, var(--bg2) background, var(--r6) radius, 8px gap"`)
+- Every subtask touching JS/HTML/CSS SHOULD include `"user_visible_impact"`: one sentence describing what the user sees after this change (e.g. `"User sees 'Start Planning' button replacing 'Continue' on QA-phase tasks"`)
+- Every subtask touching `.css` or `.html` SHOULD include `"visual_spec"`: layout and color tokens (e.g. `"var(--accent) button, var(--bg2) background, var(--r6) radius, 8px gap"`)
 
-## PRE-PLANNING: MANDATORY VERIFICATION BEFORE WRITING ANY SUBTASK
+## PRE-PLANNING: MANDATORY FILE READS — DO THIS BEFORE WRITING ANY SUBTASK
 
-**You MUST call `read_file` before writing any subtask that references a symbol.**
+**Step 1 — Read every file spec.json mentions.**
+From `spec.json → patterns`, `user_flow`, `task_scope.will_do`: extract every file name.
+Call `read_file` on each one. No exceptions — do not write the plan until all files are read.
 
-For every function, DOM element, or API call you plan to use or modify:
-1. `read_file` the relevant source file
-2. Confirm the exact function/element name exists in that file
-3. If it does NOT exist → either create a preceding subtask to add it, or remove the reference
-4. Add confirmed names to `verify_methods` in the implementation step
+**Step 2 — For each file, decide: SKIP or CHANGE.**
 
-**Before writing subtasks, ask yourself:**
-- Does existing code already solve 80% of this? → make the subtask patch that code, not replace it
-- Is there already a function/pattern in the file that handles this case? → reuse it
-- Can this be done in < 10 lines in an existing file? → do it in one step, not a new class
+After reading a file, ask ONE question:
+> "Does this file already implement the required behavior?"
 
-**Specifically required:**
-- **If spec.json `user_flow` mentions buttons, clicks, DOM updates, CSS, or visual changes:**
-  read the main JS application file and the HTML entry point BEFORE writing any frontend subtask —
-  even if they are not listed in context.json. Find them in the `Existing project files` list above:
-  look for `*.js` in frontend/web directories and `*.html` at the project root or web directory.
-- Before any JS subtask: read the main JS application file to confirm the exact function names
-  and DOM element IDs that exist (find it in the `Existing project files` list)
-- Before any backend subtask touching Python API functions: read the backend entry point (`main.py`
-  or equivalent) to confirm the exposed functions and their signatures
-- Before any subtask touching the data model: read the state/dataclass file to confirm the actual
-  field names and method names
-- Before any HTML subtask: read the HTML entry point to confirm which element IDs exist
+- If **YES** (the logic is present and correct) → **SKIP. No subtask for this file.**
+- If **NO / PARTIAL** (behavior missing or wrong) → one subtask to add/patch it.
+
+**This decision overrides spec.json.** Spec may list a file — if you read it and it already does the job, do NOT create a subtask for it regardless of what spec says.
+
+**If all backend files are already correct → zero backend subtasks. That is the right answer.**
+**If only one file needs a 3-line change → one subtask total. That is the right answer.**
+
+**Step 3 — Verify symbols in files you will modify.**
+For every function/element/API you plan to reference in `implementation_steps`:
+- Confirm the exact name exists in the file you just read
+- If NOT found → remove the reference or add a preceding subtask
+- Add confirmed names to `verify_methods`
 
 **Never invent:**
-- DOM element IDs not found in HTML (`#action-buttons`, `#start-planning` etc.)
-- Task state fields not in the dataclass (`task.isRestarted`, `task.restart_flag` etc.)
-- API methods not decorated with `@eel.expose` (`main.execute_phase` etc.)
+- DOM element IDs not found in HTML
+- Dataclass/model fields not in the state file
+- API methods not in the entry point
 - Function parameters not in the actual signature
 
-Also verify:
-- `files_to_modify` paths actually exist on disk (check `Existing project files` list above)
-- Don't re-read files already in `Read files from last call:`
+Also: `files_to_modify` paths must exist on disk (check `Existing project files` list above).
 
 ## PHASE STRUCTURE
-1. **Backend/Data Layer** — dataclasses, storage, @eel.expose API endpoints
-2. **Frontend/UI Layer** (depends on phase-1) — HTML elements, JS handlers, CSS
-3. **Wiring** (rarely needed — skip for most tasks) — ONLY if a new @eel.expose function
-   added in phase-1 needs to be called from phase-2 JS and was NOT already connected there.
-   Max 1–2 subtasks. NOT for tests, NOT for scenarios, NOT for documentation.
 
-**Phase-3 "Wiring" is NOT "Integration Testing"** — do NOT create test files, scenario files,
-performance benchmarks, or documentation under phase-3. Those are out of scope entirely.
+Phases are determined by the audit result — not by a fixed template.
 
-Order: backend → HTML → JS → CSS (handlers need DOM elements)
+**Common structures:**
+- Pure UI fix: 1 phase, 1–2 subtasks (only the files that need changing)
+- Full feature (new endpoint + UI): 2 phases — data/API layer first, then UI
+- Multi-service feature: 1 phase per service boundary, in dependency order
+- Backend-only: 1 phase with backend subtasks — no frontend phase needed
+- Frontend-only: 1 phase with frontend subtasks — no backend phase needed
+
+**If adding a new API function that JS must call:** add a wiring subtask (max 1–2). NOT for tests or docs.
+
+Order within a phase: data model → API/handlers → HTML elements → JS → CSS (handlers need DOM elements)
+
+**Never create phases for "Analysis", "Testing", "QA", "Validation", "Review", or "Documentation".**
 
 ## SUBTASK SIZING
 - Group related functions into one subtask (don't split by function)
@@ -138,7 +138,6 @@ Why good: exact find/replace, real variable names from read file, no invented AP
           "files_to_modify": ["core/state.py"],
           "patterns_from": ["core/state.py"],
           "completion_without_ollama": "core/state.py contains 'def restart_to_planning'",
-          "completion_with_ollama": "KanbanTask.restart_to_planning() resets phase correctly",
           "implementation_steps": [
             {
               "action": "Add restart_to_planning method to KanbanTask after update_status method",
@@ -164,7 +163,6 @@ Why good: exact find/replace, real variable names from read file, no invented AP
           "files_to_modify": ["web/js/app.js"],
           "patterns_from": ["web/js/app.js"],
           "completion_without_ollama": "web/js/app.js contains 'Start Planning'",
-          "completion_with_ollama": "Button shows 'Start Planning' for QA-phase tasks",
           "user_visible_impact": "User sees 'Start Planning' button instead of 'Continue' on QA-phase tasks",
           "visual_spec": "Button uses existing var(--accent) style, no new CSS needed",
           "implementation_steps": [
@@ -191,7 +189,7 @@ After writing implementation_plan.json, call `confirm_phase_done`.
 Every subtask that touches `.css` or `.html` MUST include `visual_spec`: a one-sentence layout/style description using `var(--*)` token names (e.g. `"var(--accent) button, var(--bg2) list items, var(--r6) radius"`).
 
 ## FORBIDDEN PATTERNS
-- Backend subtasks without frontend subtasks for user-facing features
+- Backend subtasks for logic already handled by existing code (audit it first)
 - `files_to_modify` containing a non-existent file
 - Multiple subtasks modifying the same element
 - JS subtask before the HTML subtask that creates the elements it needs

@@ -17,8 +17,8 @@ Execute the subtask. Read files first, make minimal targeted changes, verify wit
 2. **Implement**: follow `implementation_steps` in order.
    - `files_to_create` → `write_file` with complete working content (no stubs).
    - `files_to_modify` → `modify_file` with the exact old_text to replace.
-3. **Verify**: after the final change to each file, call `read_file` to confirm the change is present and correct.
-4. **Confirm**: call `confirm_task_done` with a precise summary of what was changed.
+3. **Verify**: after the final change to each file, call `read_file` ONCE to confirm the change is present and correct.
+4. **Confirm**: call `confirm_task_done` immediately after verification — do NOT re-read files again.
 
 ## Rules
 
@@ -26,7 +26,7 @@ Execute the subtask. Read files first, make minimal targeted changes, verify wit
 - NEVER add code not described in the subtask.
 - NEVER refactor, rename, or restructure existing code.
 - NEVER duplicate logic that already exists elsewhere — read first, reuse if found.
-- NEVER call `confirm_task_done` before the post-change read verification.
+- After the final change to each file, call `read_file` ONCE to confirm the change is present — then call `confirm_task_done`. Do NOT read the same file multiple times for verification.
 - Make SURGICAL changes only: every line must be justified by the subtask description.
 
 ## UI rules (only when files_to_modify includes .css or .html)

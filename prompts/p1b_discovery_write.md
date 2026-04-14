@@ -1,5 +1,21 @@
 # Discovery — WRITE PHASE (Step 1.1b)
 
+⚠️ **project_index.json — `"files"` must be a JSON OBJECT (dict), NOT an array.**
+
+**CORRECT:**
+```json
+{ "files": { "core/state.py": { "description": "...", "symbols": [], "language": "python" } } }
+```
+**WRONG — array format (scored_files.json format — do NOT use here):**
+```json
+{ "files": [ { "path": "core/state.py", "score": 0.9, "reason": "..." } ] }
+```
+**WRONG — services wrapper:**
+```json
+{ "services": { "files": { ... } } }
+```
+The root key is `"files"` only, and its value is an object where each key is a file path.
+
 All files have been read. Write `project_index.json` then `context.json` using `write_file`.
 
 ## RULES
@@ -61,3 +77,5 @@ Rules:
 - For every file in `to_modify`: include its imports and reverse imports in `to_reference`
 - Use EXACT field names above — wrong names cause validation failure
 - After writing BOTH files, call `confirm_phase_done` to finish
+- `files` in project_index.json must be at the ROOT level — NEVER wrap it under `services`, `backend`, or any other key
+- `files` must be NON-EMPTY — writing `"files": {}` will fail validation; populate every relevant path from the "VALID FILE PATHS ONLY" list before calling write_file

@@ -81,7 +81,23 @@ def _validate_project_index(path: str, project_path: str = "") -> tuple[bool, st
         return False, f"[FILE: {path}] Must be a JSON object"
     files = data.get("files")
     if not isinstance(files, dict) or not files:
-        return False, f"[FILE: {path}] Missing or empty 'files' object (must be dict, not array)"
+        if "services" in data:
+            return False, (
+                f"[FILE: {path}] WRONG STRUCTURE: you used a 'services' wrapper. "
+                f"Remove the 'services' key entirely. "
+                f"Use FLAT format: "
+                f'{{\"files\": {{\"core/state.py\": {{\"description\": \"...\", \"symbols\": [], \"language\": \"python\"}}}}}}'
+            )
+        if isinstance(files, list):
+            return False, (
+                f"[FILE: {path}] WRONG STRUCTURE: 'files' must be a JSON object (dict), NOT an array. "
+                f"You wrote files as an array — that is scored_files.json format, not project_index.json format. "
+                f"Use: {{\"files\": {{\"web/js/app.js\": {{\"description\": \"...\", \"symbols\": [], \"language\": \"javascript\"}}}}}}"
+            )
+        return False, (
+            f"[FILE: {path}] 'files' is missing or empty — "
+            f"populate it with actual file paths from the project"
+        )
     if project_path:
         invented = [p for p in files if not os.path.isfile(os.path.join(project_path, p))]
         if invented:
@@ -192,61 +208,6 @@ def _validate_scored_files(path: str, global_index_path: str = "") -> tuple[bool
                     f"Missing (first 5): {sample}"
                 )
 
-    return True, "OK"
-
-
-def _validate_spec_md(path: str) -> tuple[bool, str]:
-    """Validate spec.json - includes file path in error messages and checks for User Flow."""
-    if not os.path.isfile(path):
-        return False, f"[FILE: {path}] spec.json not found"
-    with open(path, "r", encoding="utf-8") as f:
-        content = f.read()
-    if len(content.strip()) < 200:
-        return False, f"[FILE: {path}] spec.json is too short (< 200 chars)"
-    
-    # Check for required headings (accept both H1 and H2)
-    required_headings = ["Overview", "Task Scope", "Acceptance Criteria"]
-    for heading in required_headings:
-        if f"## {heading}" not in content and f"# {heading}" not in content:
-            return False, (
-                f"[FILE: {path}] "
-                f"Missing section '{heading}'. "
-                f"Add '## {heading}' or '# {heading}' to the file."
-            )
-    
-    # Check for User Flow section if this is a user-facing feature
-    # User Flow is required if spec mentions frontend files (web/, html, js, css)
-    has_frontend = any(marker in content.lower() for marker in 
-                      ['web/', '.html', '.js', '.css', 'frontend', 'ui ', 'user interface', 'button', 'form'])
-    
-    if has_frontend:
-        if "## User Flow" not in content and "# User Flow" not in content:
-            return False, (
-                f"[FILE: {path}] "
-                f"Missing '## User Flow' section. "
-                f"This task involves frontend/UI changes and MUST include a User Flow section "
-                f"describing step-by-step how users interact with the feature. "
-                f"Use the User Flow template from the prompt."
-            )
-        
-        # Verify User Flow has actual steps (not just the heading)
-        user_flow_pattern = r"(?:##|#)\s*User Flow.*?(?=(?:##|#)|$)"
-        import re
-        user_flow_match = re.search(user_flow_pattern, content, re.DOTALL | re.IGNORECASE)
-        if user_flow_match:
-            user_flow_section = user_flow_match.group(0)
-            # Check for step markers
-            has_steps = ("**Step" in user_flow_section or 
-                        "Step 1" in user_flow_section or
-                        "User Action" in user_flow_section)
-            if not has_steps:
-                return False, (
-                    f"[FILE: {path}] "
-                    f"User Flow section exists but has no steps. "
-                    f"Add step-by-step breakdown using the template: "
-                    f"'**Step 1: [Action]**' with User Action, UI Element, Frontend/Backend Changes."
-                )
-    
     return True, "OK"
 
 
@@ -397,6 +358,7 @@ def _validate_impl_plan(path: str, project_path: str = "") -> tuple[bool, str]:
 
     all_subtasks = []
     errors = []
+    warnings = []
     for i, phase in enumerate(data["phases"]):
         if not isinstance(phase, dict):
             errors.append(f"phases[{i}] must be an object, got {type(phase).__name__}: {str(phase)[:60]}")
@@ -455,6 +417,16 @@ def _validate_impl_plan(path: str, project_path: str = "") -> tuple[bool, str]:
                     _normalized = True
                 else:
                     sub_errors.append("completion_without_ollama is empty and no files listed")
+            # Reject .tasks/ paths unconditionally — planning artifacts are not project files
+            for _flist_key in ("files_to_create", "files_to_modify"):
+                for _fp in s.get(_flist_key, []):
+                    if _fp and (".tasks/" in _fp or _fp.startswith(".tasks")):
+                        sub_errors.append(
+                            f"{_flist_key} '{_fp}' points inside .tasks/ — "
+                            f"these are planning artifacts, NOT project source files. "
+                            f"Use project-relative paths only (e.g. 'main.py', 'web/js/app.js'). "
+                            f"DELETE this subtask if it has no real project files to change."
+                        )
             if not (s.get("files_to_create") or s.get("files_to_modify")):
                 sub_errors.append(
                     "no files_to_create or files_to_modify — "
@@ -491,7 +463,6 @@ def _validate_impl_plan(path: str, project_path: str = "") -> tuple[bool, str]:
             else:
                 all_subtasks.append(s)
     # Check that files_to_modify actually exist in the project
-    warnings = []
     if project_path:
         for s in all_subtasks:
             for fpath in s.get("files_to_modify", []):
@@ -613,30 +584,6 @@ def _validate_impl_plan(path: str, project_path: str = "") -> tuple[bool, str]:
             warnings.append(
                 f"Subtask {s.get('id','?')} touches CSS/HTML but has no 'visual_spec'. "
                 f"Recommended: add visual_spec describing expected look (layout, spacing, var(--*) tokens)."
-            )
-        
-        # Warn if all subtasks are mixed together without phases
-        if len(data["phases"]) == 1:
-            errors.append(
-                f"Task has both frontend and backend files but only 1 phase. "
-                f"Consider organizing into phases: "
-                f"Phase 1 (Backend/Data) with {len(backend_subtasks)} subtasks, "
-                f"Phase 2 (Frontend/UI) with {len(frontend_subtasks)} subtasks. "
-                f"This helps maintain proper dependency order (backend before frontend)."
-            )
-    
-    # If only frontend files but no backend, warn about missing data layer
-    if has_frontend_files and not has_backend_files:
-        # Check if any frontend subtask mentions data/state/storage
-        data_keywords = ["data", "state", "storage", "save", "load", "persist"]
-        frontend_needs_backend = any(
-            any(keyword in s.get("description", "").lower() for keyword in data_keywords)
-            for s in frontend_subtasks
-        )
-        if frontend_needs_backend:
-            errors.append(
-                f"Frontend subtasks mention data/state but no backend subtasks found. "
-                f"Add backend subtasks for data models and storage before frontend implementation."
             )
 
     if errors:
@@ -2486,6 +2433,36 @@ Be concrete and specific. Return ONLY the JSON, no other text.
                 f"  Created {len(stubs_created)} stub file(s) for files_to_create "
                 f"(Coding phase will overwrite them with real content)",
                 "ok",
+            )
+
+        # ═══════════════════════════════════════════════════════════
+        # CLEANUP: Remove stale source files from previous Patch
+        # Iterations that are NOT part of the current plan.
+        # Orphan files cause scope-violation failures on every subtask.
+        # ═══════════════════════════════════════════════════════════
+        plan_files: set[str] = set(to_copy)
+        for subtask in self.task.subtasks:
+            for new_file in subtask.get("files_to_create", []):
+                if new_file:
+                    plan_files.add(new_file)
+
+        CODE_EXTENSIONS = {'.py', '.js', '.ts', '.jsx', '.tsx', '.html', '.css', '.md'}
+        removed_stale: list[str] = []
+        for dirpath, dirnames, filenames in os.walk(workdir):
+            dirnames[:] = [d for d in dirnames if not d.startswith('.')]
+            for fname in filenames:
+                abs_file = os.path.join(dirpath, fname)
+                rel_file = os.path.relpath(abs_file, workdir).replace('\\', '/')
+                _, ext = os.path.splitext(fname)
+                if ext.lower() in CODE_EXTENSIONS and rel_file not in plan_files:
+                    os.remove(abs_file)
+                    removed_stale.append(rel_file)
+                    self.log(f"  ✗ removed stale workdir/{rel_file} (not in plan)", "warn")
+
+        if removed_stale:
+            self.log(
+                f"  Cleaned {len(removed_stale)} stale file(s) from previous iteration(s)",
+                "warn",
             )
 
         return True   # missing files are warned but don't block coding

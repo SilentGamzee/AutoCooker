@@ -1,5 +1,8 @@
 # Planning Critic — Sub-phase B: Symbols & DOM Elements Exist
 
+⚠️ **OUTPUT ONLY:** `{"sub_phase": "symbols", "files_read": [...], "issues": [...], "fixes_applied": 0, "passed": true, "summary": "..."}`
+Do NOT wrap output in `task_id`, `file`, `title`, `task`, or any other key.
+
 ⚠️ **YOUR TASK IS VERIFICATION, NOT CODE GENERATION.**
 - DO NOT write code symbols, TODO markers, comment templates, logging helpers, or constant definitions.
 - DO NOT output fields named `"symbols"`, `"comments_template"`, `"log_markers"`, or similar.

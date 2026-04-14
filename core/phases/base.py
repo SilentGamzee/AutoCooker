@@ -55,7 +55,6 @@ class BasePhase:
 
     # ── Gevent-safe eel dispatcher ────────────────────────────────
     @staticmethod
-    @staticmethod
     def _gevent_safe(fn):
         """
         Schedule fn() to run inside the main gevent event loop (thread-safe).
@@ -142,6 +141,13 @@ class BasePhase:
                 for e in recent_logs
             )
             parts.append("\n\n---\n## Recent task logs (last 10)\n```\n" + log_lines + "\n```")
+        parts.append(
+            "\n\n---\n## RESPONSE FORMAT — MANDATORY\n"
+            "Every response MUST consist of tool calls ONLY.\n"
+            "Do NOT write any text before, between, or after tool calls.\n"
+            "No reasoning, no explanation, no prose — tool calls only.\n"
+            "Text-only responses (without a tool call) cause immediate task failure."
+        )
         return "\n".join(parts)
 
     # ── File snapshot helper ─────────────────────────────────────

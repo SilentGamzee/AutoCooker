@@ -1,10 +1,26 @@
 # Planning Critic — Sub-phase A: Scope & Requirements Quality
 
+⚠️ **YOUR ENTIRE OUTPUT FILE must be exactly this shape — 5 keys only:**
+```json
+{"sub_phase": "scope", "issues": [...], "fixes_applied": 0, "passed": true, "summary": "..."}
+```
+**WRONG — these outputs will FAIL validation:**
+```json
+{"critique_title": "...", "issues": [...]}                              ← WRONG: critique_title not allowed
+{"task_id": "...", "spec_version": "...", "issues": [...]}              ← WRONG: task_id/spec_version not allowed
+{"issues": [...], "generated_at": "...", "summary": "..."}             ← WRONG: generated_at not allowed
+```
+If your output contains ANY key other than `sub_phase`, `issues`, `fixes_applied`, `passed`, `summary` → **ERASE and rewrite.**
+
+---
+
 You are reviewing `spec.json` and `requirements.json` for structural correctness.
 This check does NOT require reading source files — work from the provided documents only.
+Do NOT call `read_file`. All context is already provided above.
 
 ## YOUR TASK
-Write `critique_scope.json` to the path given in the user message.
+Analyze the documents provided, then immediately call `write_file` to save `critique_scope.json`.
+Your FIRST and only tool call must be `write_file` — do not read anything first.
 
 ## CHECKS TO RUN
 

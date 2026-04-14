@@ -7,6 +7,7 @@ Produce `requirements.json` from the task description and project context.
 - Write PURE JSON — no `//` or `/* */` comments
 - If validation failed: call `read_file` first to see current state, then `write_file` with corrected content
 - Do NOT rewrite a file that already satisfies all required fields
+- Do NOT write underscore-prefixed keys (`_version`, `_task`, `_description`, `_criteria`, `_timestamp`, etc.) — use ONLY the exact field names: `task_description`, `workflow_type`, `user_requirements`
 
 ## WORKFLOW TYPE
 | Task pattern | Type |

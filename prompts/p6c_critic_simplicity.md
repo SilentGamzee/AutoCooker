@@ -1,5 +1,9 @@
 # Coding Critic — Sub-phase C: Simplicity & Code Quality
 
+⚠️ **WRITE EXACTLY:** `{"issues": [...], "passed": true, "summary": "..."}` — **NO OTHER FIELDS.**
+Do NOT write: `_version`, `_tool`, `_description`, `task`, `task_id`, `critique_type`,
+`simplified_explanation`, `summary_text`, `recommendations`, `issues_found`, or any other key.
+
 ## YOUR OUTPUT — write exactly this file: `critic_simplicity.json`
 
 You are a **CODE REVIEWER**. You check whether the implementation is unnecessarily

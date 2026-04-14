@@ -1,5 +1,20 @@
 # Planning Critic — Sub-phase C: Simplicity & Overengineering
 
+⚠️ **YOUR ENTIRE OUTPUT FILE must be exactly this shape — 6 keys only:**
+```json
+{"sub_phase": "simplicity", "files_read": [...], "issues": [...], "fixes_applied": 0, "passed": true, "summary": "..."}
+```
+**WRONG — these outputs will FAIL validation:**
+```json
+{"critique_title": "...", "assessment_summary": "...", "issues": [...]}              ← WRONG: critique_title not allowed
+{"issues": [...], "component_analysis": {...}, "complexity_benchmarks": {...}}       ← WRONG: extra keys
+{"sub_phase": "simplicity", "issues": [...], "recommendations": [...]}               ← WRONG: recommendations not allowed
+{"issues": [...], "conclusion": "..."}                                                ← WRONG: conclusion not allowed
+```
+If your output contains ANY key other than `sub_phase`, `files_read`, `issues`, `fixes_applied`, `passed`, `summary` → **ERASE and rewrite.**
+
+---
+
 You are checking whether the spec proposes a solution that is unnecessarily complex
 given what already exists in the codebase.
 
@@ -23,9 +38,10 @@ Write `critique_simplicity.json` to the path given in the user message.
    - Does the spec split trivial work across 4+ subtasks that could be 1–2?
    - Does the spec call for a new API endpoint when an existing one with an extra param suffices?
 
-5. If simpler approach found → flag MAJOR and describe the concrete alternative:
-   - Which file, which function, which lines to change
-   - Approximate line count of the simpler fix vs the proposed approach
+5. If simpler approach found → flag CRITICAL and rewrite spec.json to remove the over-engineering:
+   - Remove unnecessary patterns (backend changes when backend already handles the requirement)
+   - Remove unnecessary files from task_scope.will_do
+   - Describe the concrete alternative: which file, which function, approximate line count
 
 ## EXAMPLES
 
@@ -68,8 +84,10 @@ Count the files listed in `context.json → files_read` that will be modified (n
 If you have more candidates: keep only the most severe overengineering issues. Skip minor "could be simpler" observations if the core logic is sound.
 
 Rules:
-- `passed: true` — simplicity issues are MAJOR, never CRITICAL; they don't block but inform the planner
-- You MUST read at least one file before writing output
-- `simpler_approach` is REQUIRED for every overengineering issue — be specific (file + function + line count)
+- Over-engineering is CRITICAL severity — it blocks the plan and forces spec rewrite
+- `passed: false` if any over-engineering found; `passed: true` only if spec is already minimal
+- If over-engineering found → rewrite spec.json (remove unnecessary patterns/files), set `fixes_applied: 1`
+- You MUST read at least one source file before writing output
+- `simpler_approach` is REQUIRED for every issue — be specific (file + function + line count)
 - Write PURE JSON — no comments
 - Call `confirm_phase_done` after writing

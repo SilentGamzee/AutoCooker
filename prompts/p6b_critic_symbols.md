@@ -38,8 +38,8 @@ If issues found:
 
 Call `write_file` with path **`critic_symbols.json`** (no directory prefix, no dot prefix).
 
-DO NOT output: `symbol_type`, `symbols`, `_meta`, `description` at root, `task_id` at root,
-`metadata`, `markers`, `findings`, `critique_type`, or any field not listed above.
+DO NOT output: `sub_phase`, `symbol_type`, `symbols`, `_meta`, `description` at root, `task_id` at root,
+`metadata`, `markers`, `findings`, `critique_type`, or any field not listed above (`issues`, `passed`, `files_read`, `summary`).
 
 ---
 
@@ -79,18 +79,15 @@ From the diff (new lines only), extract:
 ## OUTPUT FORMAT
 ```json
 {
-  "sub_phase": "symbols",
-  "files_read": ["main.py", "web/index.html"],
   "issues": [
     {
       "severity": "critical",
-      "check": "cross_file_symbol",
       "description": "JS calls eel.execute_phase() but def execute_phase is not in main.py. Found @eel.expose functions: start_task, restart_task, abort_task, get_task.",
-      "location": "web/js/app.js",
-      "line": "main.execute_phase('planning', taskId, true);"
+      "location": "web/js/app.js"
     }
   ],
   "passed": true,
+  "files_read": ["main.py", "web/index.html"],
   "summary": "2 eel calls verified. No missing symbols."
 }
 ```

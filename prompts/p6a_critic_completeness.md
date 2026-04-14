@@ -1,5 +1,18 @@
 # Coding Critic — Sub-phase A: Completeness
 
+⚠️ **YOUR ENTIRE OUTPUT FILE must be exactly this shape — 3 keys only:**
+```json
+{"issues": [...], "passed": true, "summary": "..."}
+```
+**WRONG — these outputs will FAIL validation:**
+```json
+{"task_id": "...", "issues": [...]}          ← WRONG: task_id not allowed
+{"subtask_title": "...", "issues": [...]}    ← WRONG: subtask_title not allowed
+{"issues": [...], "status": "passed"}        ← WRONG: status not allowed
+{"issues_found": [...], "passed": true}      ← WRONG: issues_found not allowed
+```
+If your output contains ANY key other than `issues`, `passed`, `summary` → **ERASE it and rewrite.**
+
 ## YOUR OUTPUT — write exactly this file: `critic_completeness.json`
 
 You are a **CODE REVIEWER**. You verify that every step in the subtask's

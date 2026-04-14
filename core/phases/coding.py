@@ -83,11 +83,36 @@ class CodingPhase(BasePhase):
             if prior_status == "done":
                 still_ok, reason = self._verify_structural_completion(subtask_dict)
                 if still_ok:
-                    # Update UI even when skipping
-                    self.task.last_executed_subtask_id = sid
-                    self.push_task()
-                    self.log(f"  ✓ Task {sid} already complete (verified)", "ok")
-                    continue
+                    # NEW-2: check that files_to_create actually exist in workdir.
+                    # If the workdir is missing expected new files the subtask was
+                    # never truly executed (e.g. resumed after a failed/empty run).
+                    files_to_create = subtask_dict.get("files_to_create") or []
+                    if files_to_create:
+                        workdir = os.path.join(self.task.task_dir, WORKDIR_NAME)
+                        missing = [
+                            f for f in files_to_create
+                            if not os.path.isfile(os.path.join(workdir, f))
+                        ]
+                        if missing:
+                            self.log(
+                                f"  ↩ Task {sid} marked 'done' but workdir missing "
+                                f"files_to_create: {missing[:3]}. Re-executing.",
+                                "warn",
+                            )
+                            subtask_dict["status"] = "pending"
+                            subtask_dict["current_loop"] = 0
+                            # fall through to execution below
+                        else:
+                            self.task.last_executed_subtask_id = sid
+                            self.push_task()
+                            self.log(f"  ✓ Task {sid} already complete (verified)", "ok")
+                            continue
+                    else:
+                        # No new files expected — accept as done
+                        self.task.last_executed_subtask_id = sid
+                        self.push_task()
+                        self.log(f"  ✓ Task {sid} already complete (verified)", "ok")
+                        continue
                 else:
                     self.log(
                         f"  ↩ Task {sid} was 'done' but verification failed: {reason}. Re-executing.",
@@ -664,7 +689,13 @@ class CodingPhase(BasePhase):
                         with open(out, encoding="utf-8") as f:
                             d = _json.load(f)
                         if "issues" not in d:
-                            return False, f"{os.path.basename(out)}: missing 'issues' array"
+                            return False, f"{os.path.basename(out)}: missing 'issues' array — output must be {{\"issues\": [...], \"passed\": true, \"summary\": \"...\"}}"
+                        if not isinstance(d["issues"], list):
+                            return False, f"{os.path.basename(out)}: 'issues' must be a JSON array [], got {type(d['issues']).__name__} — wrap items in []"
+                        if "passed" not in d:
+                            return False, f"{os.path.basename(out)}: missing 'passed' boolean — add \"passed\": true or \"passed\": false"
+                        if not isinstance(d["passed"], bool):
+                            return False, f"{os.path.basename(out)}: 'passed' must be boolean true/false, got {type(d['passed']).__name__}"
                     except Exception as e:
                         return False, str(e)
                     return True, "OK"
