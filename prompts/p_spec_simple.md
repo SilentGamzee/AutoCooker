@@ -1,49 +1,38 @@
 # Spec Writer (Step 1)
 
-Write `spec.json` from the task description only.
+Write `spec.json` in **one tool call**.
 
-## RULES
-- Call at least one tool per response — text-only responses cause task failure
-- Write PURE JSON — no `//` or `/* */` comments, no markdown blocks
-- **Do NOT reference code, file names, functions, or implementation details**
-- Focus entirely on WHAT the user wants — not HOW it will be built
-- After writing spec.json, call `confirm_phase_done`
+## YOUR ONLY JOB
 
-## YOUR JOB
+The task description is in the user message. Call `write_file` immediately — no reading, no thinking out loud, no extra tool calls.
 
-You receive a task title and description. Write a spec.json that captures:
-- What needs to be done (from the user's perspective)
-- What requirements must be satisfied
-- What counts as "done" (acceptance criteria)
-- What is explicitly out of scope
+Fill in the JSON template provided in the message. Then call `confirm_phase_done`.
 
-The spec must be written as if explaining to a non-technical stakeholder.
-**No code, no file names, no function names, no technical implementation details.**
+## REQUIRED FORMAT — EXACTLY THESE THREE FIELDS
 
-## OUTPUT FORMAT
 ```json
 {
-  "overview": "2–4 sentences describing the feature or change from the user's perspective. What it does and why it's needed. (min 50 chars)",
+  "overview": "2–4 sentences about what this task achieves for the user. Min 50 chars. No code, no file names.",
   "requirements": [
-    "User can do X when condition Y",
-    "System must show Z when the user does W",
-    "All existing functionality continues to work"
+    "Plain English requirement 1",
+    "Plain English requirement 2"
   ],
   "acceptance_criteria": [
-    "AC-1: When the user does X, they see Y",
-    "AC-2: The feature works correctly under condition Z",
-    "AC-3: No existing behavior is broken"
-  ],
-  "out_of_scope": [
-    "Changes to unrelated parts of the system",
-    "Performance optimizations not related to the task"
+    "AC-1: Specific verifiable condition",
+    "AC-2: Another specific verifiable condition"
   ]
 }
 ```
 
-## VALIDATION CHECKLIST
-- `overview` ≥ 50 chars, no code snippets
-- `requirements` non-empty list of plain strings
-- `acceptance_criteria` non-empty list of plain strings
-- No file paths, no function names, no code anywhere in the output
-- `out_of_scope` is optional but recommended for clarity
+## RULES
+- `overview` — string, ≥ 50 characters, no code snippets, no file names
+- `requirements` — non-empty array of plain strings
+- `acceptance_criteria` — non-empty array of plain strings
+- **Do NOT add any other fields** (`id`, `title`, `description`, `status`, etc.)
+- Write PURE JSON — no `//` or `/* */` comments
+
+## SEQUENCE
+1. `write_file` with the filled-in JSON
+2. `confirm_phase_done`
+
+That's it. Two tool calls maximum.

@@ -1050,16 +1050,29 @@ class PlanningPhase(BasePhase):
         """Write spec.json from task description only — no code refs, no file names."""
         wd = self.task.project_path or self.state.working_dir
         spec_path = os.path.join(self.task.task_dir, "spec.json")
+        # Write-only tools: spec needs no file reads — task description is in the message
         executor = self._make_planning_executor(wd)
 
+        spec_rel = self._rel(spec_path)
         msg = (
             f"Task title: {self.task.title}\n"
             f"Task description: {self.task.description}\n\n"
-            f"Write spec.json to: {self._rel(spec_path)}\n\n"
-            "Create a detailed specification of what needs to be done.\n"
-            "Focus on WHAT to implement (features, behaviors, user experience).\n"
-            "Do NOT reference specific code, file names, or implementation details.\n"
-            "After writing spec.json call confirm_phase_done."
+            f"Call write_file IMMEDIATELY with path='{spec_rel}' and this JSON content "
+            f"(fill in the values from the task description above):\n\n"
+            "{\n"
+            '  "overview": "<2-4 sentences: what this task achieves for the user>",\n'
+            '  "requirements": [\n'
+            '    "<requirement 1>",\n'
+            '    "<requirement 2>"\n'
+            '  ],\n'
+            '  "acceptance_criteria": [\n'
+            '    "<AC-1: verifiable condition>",\n'
+            '    "<AC-2: another verifiable condition>"\n'
+            '  ]\n'
+            "}\n\n"
+            "REQUIRED fields: overview (string ≥50 chars), requirements (array), acceptance_criteria (array).\n"
+            "Do NOT add 'id', 'title', 'description', or any other fields — only these three.\n"
+            "After write_file succeeds, call confirm_phase_done."
         )
 
         def validate():
@@ -1067,10 +1080,10 @@ class PlanningPhase(BasePhase):
 
         return self.run_loop(
             "1 Spec", "p_spec_simple.md",
-            PLANNING_TOOLS, executor, msg, validate, model,
-            reconstruct_after=2,
-            max_outer_iterations=5,
-            max_tool_rounds=5,
+            ANALYSIS_TOOLS, executor, msg, validate, model,
+            reconstruct_after=1,
+            max_outer_iterations=4,
+            max_tool_rounds=3,
         )
 
     # ── New Step 2: Write Action Files ────────────────────────────
