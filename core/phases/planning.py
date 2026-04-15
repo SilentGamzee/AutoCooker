@@ -873,6 +873,27 @@ def _validate_impl_plan(path: str, project_path: str = "") -> tuple[bool, str]:
     return True, "OK"
 
 
+def _validate_simple_spec_json(path: str) -> tuple[bool, str]:
+    """Validate the simplified spec.json (no code refs — overview/requirements/acceptance_criteria)."""
+    ok, data, err = _read_json(path)
+    if not ok:
+        return False, f"[FILE: {path}] {err}"
+    if not isinstance(data, dict):
+        return False, f"[FILE: {path}] Must be a JSON object"
+    for field in ("overview", "requirements", "acceptance_criteria"):
+        if field not in data:
+            return False, f"[FILE: {path}] Missing required field: '{field}'"
+        if not data[field]:
+            return False, f"[FILE: {path}] Field '{field}' is empty"
+    if len(str(data.get("overview", ""))) < 50:
+        return False, f"[FILE: {path}] 'overview' is too short (< 50 chars)"
+    if not isinstance(data.get("requirements"), list) or not data["requirements"]:
+        return False, f"[FILE: {path}] 'requirements' must be a non-empty list of strings"
+    if not isinstance(data.get("acceptance_criteria"), list) or not data["acceptance_criteria"]:
+        return False, f"[FILE: {path}] 'acceptance_criteria' must be a non-empty list of strings"
+    return True, "OK"
+
+
 # ── Phase ─────────────────────────────────────────────────────────
 
 class PlanningPhase(BasePhase):
@@ -881,12 +902,11 @@ class PlanningPhase(BasePhase):
 
     def run(self) -> bool:
         """
-        Run the planning phase.
-        
-        ИЗМЕНЕНИЯ (Патч 1):
-        - Добавлен цикл критики с max_critique_iterations=3
-        - При обнаружении проблем возврат к шагам 2.x и 3
-        - ВСЕ шаги 2.1, 2.2, 2.3, 2.4 учитывают предыдущие результаты и критику
+        Simplified 3-step planning:
+          Step 1 — Spec:          task description → spec.json (no code refs)
+          Step 2 — Write Actions: spec.json + project files → actions/T001.json, T002.json, …
+          Step 3 — Critique:      review action files, pass or request changes (loops to step 2)
+        After passing critique: synthesize implementation_plan.json, load subtasks, prepare workdir.
         """
         self.log("═══ PLANNING PHASE START ═══")
         model = self.task.models.get("planning") or "llama3.1"
@@ -896,7 +916,7 @@ class PlanningPhase(BasePhase):
         self.state.cache.update_file_paths(wd)
         self.log(f"  Scanned {len(self.state.cache.file_paths)} project files", "info")
 
-        # ── Step 1.0: Build/update project index ──────────────────
+        # ── Background project index scan ─────────────────────────
         self._project_index = ProjectIndex(wd)
         self.log("─── Step 1.0: Project index pre-scan ───")
 
@@ -904,7 +924,6 @@ class PlanningPhase(BasePhase):
         _index_error: list = []
 
         def _run_index():
-            print("[DEBUG _run_index] thread started", flush=True)
             try:
                 self._project_index.scan_and_update(
                     ollama=self.ollama,
@@ -912,25 +931,18 @@ class PlanningPhase(BasePhase):
                     log_fn=self.log,
                     max_files_to_describe=10,
                 )
-                print("[DEBUG _run_index] scan_and_update completed OK", flush=True)
             except Exception as e:
                 import traceback as _tb
-                print(f"[DEBUG _run_index] EXCEPTION: {e}", flush=True)
                 _index_error.append(str(e))
                 self.log(f"  [WARN] Index scan error: {e}", "warn")
                 self.log(_tb.format_exc(), "warn")
 
         index_thread = _threading.Thread(target=_run_index, daemon=True)
         index_thread.start()
-        INDEX_TIMEOUT = 300
-        index_thread.join(timeout=INDEX_TIMEOUT)
+        index_thread.join(timeout=300)
 
         if index_thread.is_alive():
-            self.log(
-                f"  [WARN] Index scan exceeded {INDEX_TIMEOUT}s — "
-                "continuing without index. Ollama may be busy.",
-                "warn",
-            )
+            self.log("  [WARN] Index scan exceeded 300s — continuing without index.", "warn")
             self._project_index = None
         elif _index_error:
             self.log("  [WARN] Index scan failed — continuing without index", "warn")
@@ -938,195 +950,388 @@ class PlanningPhase(BasePhase):
         else:
             self.log("  Index scan complete", "info")
 
-        # Determine workflow
+        # ── Patch mode ────────────────────────────────────────────
         if self.task.corrections and self.task.subtasks:
-            # Patch mode - no critique cycle needed
-            self.log(f"  Patch mode: applying corrections to existing plan", "info")
-            steps = [
-                ("1.5 Patch Plan",    self._step5_patch_plan),
-                ("1.6 Load Subtasks", self._step6_load_subtasks),
-                ("1.7 Prepare Workdir", self._step7_prepare_workdir),
-            ]
-            
-            for name, fn in steps:
-                self.log(f"─── Step {name} ───")
-                ok = fn(model)
-                if not ok:
-                    self.log(f"[FAIL] Step {name} failed – aborting planning", "error")
-                    return False
-            
-            self.log("═══ PLANNING PHASE COMPLETE ═══")
-            return True
-        
-        # ═══════════════════════════════════════════════════════════
-        # НОВЫЙ КОД: Полный цикл планирования с итеративной критикой
-        # ═══════════════════════════════════════════════════════════
-        
-        # Шаг 0: Index Analysis
-        self.log("─── Step 1.0a Index Analysis ───")
-        if not self._step0_index_analysis(model):
-            self.log("  [FAIL] Index analysis exhausted all iterations — task moved to Human Review", "error")
+            return self._run_patch_mode(model)
+
+        # ── Step 1: Spec (one-time) ────────────────────────────────
+        self.log("─── Step 1: Spec ───")
+        if not self._new_step1_spec(model):
+            self.log("[FAIL] Step 1 Spec failed – aborting planning", "error")
             return False
 
-        # Шаг 1: Discovery (выполняется один раз)
-        self.log(f"─── Step 1.1 Discovery ───")
-        if not self._step1_discovery(model):
-            self.log(f"[FAIL] Step 1.1 Discovery failed – aborting planning", "error")
-            return False
-        
-        # Шаг 2: Requirements (выполняется один раз первоначально)
-        self.log(f"─── Step 1.2 Requirements ───")
-        if not self._step2_requirements(model):
-            self.log(f"[FAIL] Step 1.2 Requirements failed – aborting planning", "error")
-            return False
-        
-        # ═══════════════════════════════════════════════════════════
-        # Metadata extraction — выполняется ОДИН РАЗ до цикла критики
-        # (было: 4 шага × max_critique_iterations = до 40 complete()-вызовов)
-        # ═══════════════════════════════════════════════════════════
-        self.log("─── Step 1.2 Metadata extraction ───")
-        for step_name, step_fn in [
-            ("1.2.1 Extract Checklist", lambda m: self._step2_1_extract_checklist(m, 0)),
-            ("1.2.2 Extract User Flow",  lambda m: self._step2_2_extract_user_flow(m, 0)),
-        ]:
-            self.log(f"─── Step {step_name} ───")
-            if not step_fn(model):
-                self.log(f"[FAIL] Step {step_name} failed – aborting planning", "error")
+        # ── Steps 2+3: Write Actions → Critique (retry loop) ──────
+        critique_feedback = ""
+        max_iterations = 3
+
+        for iteration in range(max_iterations):
+            self.log(f"─── Step 2: Write Actions (iter {iteration+1}/{max_iterations}) ───")
+            if not self._new_step2_write_actions(model, critique_feedback):
+                self.log("[FAIL] Step 2 Write Actions failed – aborting planning", "error")
                 return False
 
-        # ═══════════════════════════════════════════════════════════
-        # ЦИКЛ КРИТИКИ: только Spec + Critique, без extraction steps
-        # ═══════════════════════════════════════════════════════════
+            self.log(f"─── Step 3: Critique (iter {iteration+1}/{max_iterations}) ───")
+            passed, issues = self._new_step3_critique(model)
 
-        max_critique_iterations = 3   # было 10: для большинства задач достаточно 2-3 итераций
-        min_critique_iterations = 1   # было 2: убрать принудительную вторую итерацию
-        critique_passed = False
+            if passed:
+                break
 
-        for iteration in range(max_critique_iterations):
-            self.log("=" * 60)
-            self.log(f"CRITIQUE ITERATION {iteration + 1}/{max_critique_iterations}")
-            self.log("=" * 60)
+            critique_feedback = self._format_action_critique(issues)
+            if iteration == max_iterations - 1:
+                self.log(
+                    f"  ⚠️ Max iterations reached with {len(issues)} unresolved issue(s) — proceeding",
+                    "warn",
+                )
 
-            # Шаг 3: Spec (создание/обновление спецификации)
-            self.log(f"─── Step 1.3 Spec ───")
-            if not self._step3_spec(model):
-                self.log(f"[FAIL] Step 1.3 Spec failed – aborting planning", "error")
-                return False
-            
-            # Шаг 4: Critique (критика с возвратом информации о проблемах)
-            self.log(f"─── Step 1.4 Critique ───")
-            critique_ok, critique_issues = self._step4_critique(model, iteration)
-            
-            if not critique_ok:
-                # Критический сбой - прерываем
-                self.log(f"[FAIL] Step 1.4 Critique failed critically – aborting planning", "error")
-                return False
-            
-            # Анализируем результаты критики
-            if not critique_issues or len(critique_issues) == 0:
-                # Критика не нашла проблем
-                if iteration < min_critique_iterations - 1:
-                    # ИЗМЕНЕНО: Слишком рано - продолжаем минимум до min_critique_iterations
-                    self.log(
-                        f"✓ Critique passed on iteration {iteration + 1}, "
-                        f"but continuing to iteration {min_critique_iterations} (minimum required) "
-                        f"to ensure thorough review.",
-                        "info"
-                    )
-                    # НЕ break - продолжаем цикл
-                else:
-                    # Достигли минимума и нет проблем - успех!
-                    self.log(
-                        f"✓ Critique passed after {iteration + 1} iteration(s) - no issues found",
-                        "ok"
-                    )
-                    critique_passed = True
-                    break
-            else:
-                # Проблемы найдены
-                self.log(f"⚠️ Critique found {len(critique_issues)} issue(s):", "warn")
-                for i, issue in enumerate(critique_issues[:5], 1):
-                    text = issue if isinstance(issue, str) else str(issue)
-                    self.log(f"  {i}. {text[:100]}{'...' if len(text) > 100 else ''}", "warn")
-                if len(critique_issues) > 5:
-                    self.log(f"  ... and {len(critique_issues) - 5} more issues", "warn")
-                
-                # ИЗМЕНЕНО: Проверяем достигли ли минимума попыток
-                if iteration < min_critique_iterations - 1:
-                    # Еще не достигли минимума - ОБЯЗАТЕЛЬНО продолжаем
-                    self.log(
-                        f"🔄 Critique found issues on iteration {iteration + 1}. "
-                        f"Must complete at least {min_critique_iterations} iterations. "
-                        f"Regenerating requirements and spec...",
-                        "warn"
-                    )
-                    # НЕ break - продолжаем цикл
-                elif iteration == max_critique_iterations - 1:
-                    # Последняя итерация — проверяем severity оставшихся проблем
-                    critical_remaining = [
-                        i for i in critique_issues
-                        if isinstance(i, dict) and i.get("severity") == "critical"
-                    ]
-                    if critical_remaining:
-                        self.log(
-                            f"✗ {len(critical_remaining)} CRITICAL issue(s) not resolved after "
-                            f"{max_critique_iterations} iteration(s) — blocking implementation.",
-                            "error",
-                        )
-                        for i, issue in enumerate(critical_remaining[:3], 1):
-                            desc = issue.get("description", str(issue))[:120]
-                            self.log(f"  CRITICAL {i}: {desc}", "error")
-                        return False
-                    # Только MAJOR/MINOR — предупреждаем, но продолжаем
-                    self.log(
-                        f"⚠️ Completed {iteration + 1} critique iteration(s). "
-                        f"{len(critique_issues)} non-critical issue(s) remain. Proceeding.",
-                        "warn",
-                    )
-                    critique_passed = True
-                    break
-                else:
-                    # Продолжать только при CRITICAL issues; MAJOR не требует повторения spec
-                    critical_issues = [i for i in critique_issues if isinstance(i, dict) and i.get("severity") == "critical"]
-                    major_issues = [i for i in critique_issues if isinstance(i, dict) and i.get("severity") in ("major", "MAJOR")]
-                    if not critical_issues:
-                        self.log(
-                            f"✓ No critical issues. {len(major_issues)} major issue(s) noted (will inform impl planner).",
-                            "ok"
-                        )
-                        critique_passed = True
-                        break
-                    else:
-                        self.log(
-                            f"🔄 {len(critical_issues)} critical issue(s) — regenerating spec "
-                            f"(iter {iteration + 2}/{max_critique_iterations})...",
-                            "info"
-                        )
-        
-        # Проверка результата цикла критики
-        if not critique_passed:
-            self.log("[FAIL] Critique cycle did not converge", "error")
-            return False
-        
-        # ═══════════════════════════════════════════════════════════
-        # Шаги после критики (выполняются один раз)
-        # ═══════════════════════════════════════════════════════════
-        
-        final_steps = [
-            ("1.5 Impl Plan",       self._step5_impl_plan),
+        # ── Load subtasks + Prepare workdir ───────────────────────
+        for name, fn in [
             ("1.6 Load Subtasks",   self._step6_load_subtasks),
             ("1.7 Prepare Workdir", self._step7_prepare_workdir),
-        ]
-        
-        for name, fn in final_steps:
+        ]:
             self.log(f"─── Step {name} ───")
-            ok = fn(model)
-            if not ok:
+            if not fn(model):
                 self.log(f"[FAIL] Step {name} failed – aborting planning", "error")
                 return False
-        
+
         self.log("═══ PLANNING PHASE COMPLETE ═══")
         return True
+
+    # ── Patch mode ────────────────────────────────────────────────
+    def _run_patch_mode(self, model: str) -> bool:
+        """Re-write actions with corrections context, then critique, then load/prepare."""
+        self.log("  Patch mode: re-planning with corrections", "info")
+
+        spec_path = os.path.join(self.task.task_dir, "spec.json")
+        spec_content = self._read_file_safe(spec_path)
+
+        subtask_summary = "\n".join(
+            f"  [{s.get('status','?').upper()}] {s['id']}: {s.get('title','')}"
+            for s in self.task.subtasks
+        )
+        corrections_ctx = (
+            f"CORRECTIONS TO APPLY:\n{self.task.corrections}\n\n"
+            f"Existing spec:\n{spec_content[:1000]}\n\n"
+            f"Existing subtask statuses:\n{subtask_summary}\n\n"
+            "RULES:\n"
+            "1. Keep all subtasks with status='done' EXACTLY as they are.\n"
+            "2. Only add/modify action files for what the corrections require.\n"
+            "3. Do NOT re-do work already marked done.\n"
+        )
+
+        issues: list = []
+        for iteration in range(3):
+            extra = self._format_action_critique(issues) if issues else ""
+            feedback = corrections_ctx + ("\n" + extra if extra else "")
+            corrections_ctx = ""  # only inject full context on first iteration
+
+            self.log(f"─── Patch Step 2: Write Actions (iter {iteration+1}/3) ───")
+            if not self._new_step2_write_actions(model, feedback):
+                return False
+
+            self.log(f"─── Patch Step 3: Critique (iter {iteration+1}/3) ───")
+            passed, issues = self._new_step3_critique(model)
+            if passed:
+                break
+
+        for name, fn in [
+            ("1.6 Load Subtasks",   self._step6_load_subtasks),
+            ("1.7 Prepare Workdir", self._step7_prepare_workdir),
+        ]:
+            self.log(f"─── Step {name} ───")
+            if not fn(model):
+                self.log(f"[FAIL] Step {name} failed", "error")
+                return False
+
+        self.log("═══ PLANNING PHASE COMPLETE (PATCH) ═══")
+        return True
+
+    # ── New Step 1: Spec ──────────────────────────────────────────
+    def _new_step1_spec(self, model: str) -> bool:
+        """Write spec.json from task description only — no code refs, no file names."""
+        wd = self.task.project_path or self.state.working_dir
+        spec_path = os.path.join(self.task.task_dir, "spec.json")
+        executor = self._make_planning_executor(wd)
+
+        msg = (
+            f"Task title: {self.task.title}\n"
+            f"Task description: {self.task.description}\n\n"
+            f"Write spec.json to: {self._rel(spec_path)}\n\n"
+            "Create a detailed specification of what needs to be done.\n"
+            "Focus on WHAT to implement (features, behaviors, user experience).\n"
+            "Do NOT reference specific code, file names, or implementation details.\n"
+            "After writing spec.json call confirm_phase_done."
+        )
+
+        def validate():
+            return _validate_simple_spec_json(spec_path)
+
+        return self.run_loop(
+            "1 Spec", "p_spec_simple.md",
+            PLANNING_TOOLS, executor, msg, validate, model,
+            reconstruct_after=2,
+            max_outer_iterations=5,
+            max_tool_rounds=5,
+        )
+
+    # ── New Step 2: Write Action Files ────────────────────────────
+    def _new_step2_write_actions(self, model: str, critique_feedback: str = "") -> bool:
+        """
+        Read spec.json + project files, write one action file per subtask.
+        Action files: .tasks/task_NNN/actions/T001.json, T002.json, …
+        Auto-removes orphaned action files from previous iterations.
+        """
+        wd = self.task.project_path or self.state.working_dir
+        actions_dir = os.path.join(self.task.task_dir, "actions")
+        os.makedirs(actions_dir, exist_ok=True)
+
+        spec_path = os.path.join(self.task.task_dir, "spec.json")
+        spec_content = self._read_file_safe(spec_path)
+
+        existing_files = "\n".join(
+            f"  {p}" for p in self.state.cache.file_paths[:80]
+            if not p.startswith(".tasks") and not p.startswith(".git")
+        )
+
+        # Track which action files are written in this run for cleanup
+        written_basenames: set[str] = set()
+
+        def _track_write(rel_path: str, content: str):
+            norm = rel_path.replace("\\", "/")
+            if "/actions/" in norm:
+                written_basenames.add(os.path.basename(norm))
+
+        executor = self._make_planning_executor(wd, on_file_written=_track_write)
+
+        rel_actions = self._rel(actions_dir)
+        critique_section = (
+            f"\nCRITIQUE FEEDBACK TO ADDRESS:\n{critique_feedback}\n\n"
+            if critique_feedback else ""
+        )
+
+        msg = (
+            f"Task: {self.task.title}\n"
+            f"Description: {self.task.description}\n\n"
+            f"SPECIFICATION:\n{spec_content}\n\n"
+            f"{critique_section}"
+            f"Project files available for files_to_modify:\n{existing_files}\n\n"
+            f"Write one action file per implementation subtask to: {rel_actions}/\n"
+            "Name files: T001.json, T002.json, T003.json, …\n"
+            "Each file is a single JSON subtask object with implementation_steps.\n"
+            "After writing ALL action files, call confirm_phase_done."
+        )
+
+        def validate():
+            return self._validate_action_files(actions_dir, wd)
+
+        ok = self.run_loop(
+            "2 Write Actions", "p_action_writer.md",
+            PLANNING_TOOLS, executor, msg, validate, model,
+            reconstruct_after=3,
+            max_outer_iterations=7,
+            max_tool_rounds=40,
+        )
+
+        if ok and written_basenames:
+            self._cleanup_orphaned_actions(actions_dir, written_basenames)
+
+        return ok
+
+    def _cleanup_orphaned_actions(self, actions_dir: str, written_basenames: set[str]):
+        """Remove action files not written in this iteration (plan shrank)."""
+        if not os.path.isdir(actions_dir):
+            return
+        removed = []
+        for fname in os.listdir(actions_dir):
+            if fname.endswith(".json") and fname not in written_basenames:
+                os.remove(os.path.join(actions_dir, fname))
+                removed.append(fname)
+                self.log(f"  ✗ removed orphaned action: {fname}", "warn")
+        if removed:
+            self.log(f"  Cleaned {len(removed)} orphaned action file(s)", "warn")
+
+    def _validate_action_files(self, actions_dir: str, project_path: str) -> tuple[bool, str]:
+        """Validate that action files exist and have required structure."""
+        if not os.path.isdir(actions_dir):
+            rel = os.path.relpath(actions_dir, project_path).replace("\\", "/")
+            return False, (
+                f"Actions directory not found. "
+                f"Write action files to: {rel}/ (e.g. T001.json, T002.json)"
+            )
+
+        action_files = sorted(f for f in os.listdir(actions_dir) if f.endswith(".json"))
+        if not action_files:
+            return False, (
+                "No action files found. "
+                "Write at least one action file (T001.json, T002.json, …)"
+            )
+
+        errors = []
+        for fname in action_files:
+            path = os.path.join(actions_dir, fname)
+            ok, data, err = _read_json(path)
+            if not ok:
+                errors.append(f"[FILE: {fname}] {err}")
+                continue
+            if not isinstance(data, dict):
+                errors.append(f"[FILE: {fname}] Must be a JSON object")
+                continue
+
+            for field in ("id", "title", "implementation_steps"):
+                if field not in data:
+                    errors.append(f"[FILE: {fname}] Missing required field: '{field}'")
+
+            steps = data.get("implementation_steps")
+            if not isinstance(steps, list) or len(steps) == 0:
+                errors.append(
+                    f"[FILE: {fname}] 'implementation_steps' must be a non-empty array"
+                )
+            else:
+                has_code = any(bool(s.get("code")) for s in steps if isinstance(s, dict))
+                if not has_code:
+                    errors.append(
+                        f"[FILE: {fname}] At least one step must have a non-empty 'code' field. "
+                        "Each step needs: action + code"
+                    )
+
+            for rel_path in data.get("files_to_modify", []):
+                if rel_path and not os.path.isfile(os.path.join(project_path, rel_path)):
+                    errors.append(
+                        f"[FILE: {fname}] files_to_modify contains non-existent file: "
+                        f"'{rel_path}'. Only use paths from the project files list."
+                    )
+
+        if errors:
+            return False, "\n".join(errors[:5])
+
+        return True, f"OK — {len(action_files)} action file(s) valid"
+
+    # ── New Step 3: Critique Action Files ─────────────────────────
+    def _new_step3_critique(self, model: str) -> tuple[bool, list[dict]]:
+        """LLM reviews all action files and submits a PASS/FAIL verdict."""
+        wd = self.task.project_path or self.state.working_dir
+        actions_dir = os.path.join(self.task.task_dir, "actions")
+        spec_path = os.path.join(self.task.task_dir, "spec.json")
+
+        spec_content = self._read_file_safe(spec_path)
+
+        actions_content = ""
+        if os.path.isdir(actions_dir):
+            for fname in sorted(f for f in os.listdir(actions_dir) if f.endswith(".json")):
+                path = os.path.join(actions_dir, fname)
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        actions_content += f"=== {fname} ===\n{f.read()}\n\n"
+                except Exception:
+                    pass
+
+        existing_files = "\n".join(
+            f"  {p}" for p in self.state.cache.file_paths[:60]
+            if not p.startswith(".tasks") and not p.startswith(".git")
+        )
+
+        executor = self._make_planning_executor(wd)
+
+        msg = (
+            f"Task: {self.task.title}\n\n"
+            f"SPECIFICATION:\n{spec_content}\n\n"
+            f"ACTION FILES:\n{actions_content}\n"
+            f"PROJECT FILES (valid for files_to_modify):\n{existing_files}\n\n"
+            "Review all action files and submit a verdict with submit_critic_verdict."
+        )
+
+        from core.tools import CRITIC_VERDICT_TOOL, READ_FILE, READ_FILES_BATCH, READ_FILE_RANGE, LIST_DIRECTORY
+        critique_tools = [READ_FILE, READ_FILES_BATCH, READ_FILE_RANGE, LIST_DIRECTORY, CRITIC_VERDICT_TOOL]
+
+        def validate():
+            if executor.critic_verdict is not None:
+                return True, "Verdict submitted"
+            return False, "No verdict submitted — call submit_critic_verdict to submit your verdict"
+
+        self.run_loop(
+            "3 Critique", "p_action_critic.md",
+            critique_tools, executor, msg, validate, model,
+            max_outer_iterations=3,
+            max_tool_rounds=10,
+            reconstruct_after=2,
+        )
+
+        verdict = executor.critic_verdict
+        issues = executor.critic_verdict_issues or []
+        summary = executor.critic_verdict_summary or ""
+
+        if verdict == "PASS":
+            self.log(f"  ✓ Critique PASSED: {summary}", "ok")
+            return True, []
+        elif verdict == "FAIL":
+            self.log(f"  ✗ Critique FAILED ({len(issues)} issue(s)): {summary}", "warn")
+            for i, issue in enumerate(issues[:5], 1):
+                desc = issue.get("description", str(issue))[:100]
+                sev = issue.get("severity", "?")
+                self.log(f"    {i}. [{sev}] {desc}", "warn")
+            return False, issues
+        else:
+            self.log("  [WARN] No critique verdict submitted — treating as PASS", "warn")
+            return True, []
+
+    def _format_action_critique(self, issues: list[dict]) -> str:
+        """Format critique issues as text for the next action writer iteration."""
+        if not issues:
+            return ""
+        lines = ["Critique issues to fix:"]
+        for i, issue in enumerate(issues, 1):
+            sev = issue.get("severity", "unknown")
+            desc = issue.get("description", str(issue))
+            fname = issue.get("file", "")
+            lines.append(
+                f"  {i}. [{sev}] {fname + ': ' if fname else ''}{desc}"
+            )
+        return "\n".join(lines)
+
+    def _synthesize_impl_plan(self) -> bool:
+        """Create implementation_plan.json from action files (for load_subtasks compatibility)."""
+        actions_dir = os.path.join(self.task.task_dir, "actions")
+        plan_path = os.path.join(self.task.task_dir, "implementation_plan.json")
+
+        if not os.path.isdir(actions_dir):
+            self.log("  No actions directory — cannot synthesize impl plan", "error")
+            return False
+
+        action_files = sorted(f for f in os.listdir(actions_dir) if f.endswith(".json"))
+        if not action_files:
+            self.log("  No action files found — cannot synthesize impl plan", "error")
+            return False
+
+        subtasks = []
+        for fname in action_files:
+            path = os.path.join(actions_dir, fname)
+            ok, data, err = _read_json(path)
+            if ok and isinstance(data, dict):
+                data.setdefault("status", "pending")
+                subtasks.append(data)
+            else:
+                self.log(f"  [WARN] Skipping unreadable action file {fname}: {err}", "warn")
+
+        plan = {
+            "feature": self.task.title,
+            "phases": [
+                {
+                    "id": "phase-1",
+                    "title": "Implementation",
+                    "subtasks": subtasks,
+                }
+            ],
+        }
+
+        try:
+            with open(plan_path, "w", encoding="utf-8") as f:
+                json.dump(plan, f, indent=2, ensure_ascii=False)
+            self.log(
+                f"  ✓ Synthesized implementation_plan.json ({len(subtasks)} subtask(s))", "ok"
+            )
+            return True
+        except Exception as e:
+            self.log(f"  Error writing implementation_plan.json: {e}", "error")
+            return False
     def _step1_discovery(self, model: str) -> bool:
         """
         Two-phase discovery:
@@ -2822,34 +3027,50 @@ Be concrete and specific. Return ONLY the JSON, no other text.
 
     # ── 1.6 Load subtasks ─────────────────────────────────────────
     def _step6_load_subtasks(self, _model: str) -> bool:
-        """Convert implementation_plan.json → task.subtasks."""
-        plan_path = os.path.join(self.task.task_dir, "implementation_plan.json")
-        ok, data, err = _read_json(plan_path)
-        if not ok:
-            self.log(f"  Cannot load plan: {err}", "error")
+        """Load subtasks from actions/T*.json files into task.subtasks."""
+        actions_dir = os.path.join(self.task.task_dir, "actions")
+
+        if not os.path.isdir(actions_dir):
+            self.log(f"  Actions directory not found: {actions_dir}", "error")
+            return False
+
+        action_files = sorted(f for f in os.listdir(actions_dir) if f.endswith(".json"))
+        if not action_files:
+            self.log("  No action files found in actions/", "error")
             return False
 
         subtasks = []
-        for phase in data.get("phases", []):
-            for s in phase.get("subtasks", []):
-                subtasks.append({
-                    "id": s["id"],
-                    "title": s["title"],
-                    "description": s.get("description", ""),
-                    "completion_with_ollama":    s.get("completion_with_ollama", ""),
-                    "completion_without_ollama": s.get("completion_without_ollama", ""),
-                    "files_to_create": s.get("files_to_create", []),
-                    "files_to_modify": s.get("files_to_modify", []),
-                    "patterns_from":   s.get("patterns_from", []),
-                    "implementation_steps": s.get("implementation_steps", []),
-                    "visual_spec": s.get("visual_spec", ""),
-                    # Preserve status from JSON (patch mode keeps "done" subtasks intact)
-                    "status": s.get("status", "pending"),
-                })
+        for fname in action_files:
+            path = os.path.join(actions_dir, fname)
+            ok, s, err = _read_json(path)
+            if not ok or not isinstance(s, dict):
+                self.log(f"  [WARN] Skipping unreadable action file {fname}: {err}", "warn")
+                continue
+
+            subtasks.append({
+                "id":                        s.get("id", fname.replace(".json", "")),
+                "title":                     s.get("title", fname),
+                "description":               s.get("description", ""),
+                "completion_with_ollama":    s.get("completion_with_ollama", ""),
+                "completion_without_ollama": s.get("completion_without_ollama", ""),
+                "files_to_create":           s.get("files_to_create", []),
+                "files_to_modify":           s.get("files_to_modify", []),
+                "patterns_from":             s.get("patterns_from", []),
+                "implementation_steps":      s.get("implementation_steps", []),
+                "visual_spec":               s.get("visual_spec", ""),
+                # Preserve status (patch mode may have "done" subtasks)
+                "status":                    s.get("status", "pending"),
+                # Absolute path to action file — used to sync status back on save
+                "action_file":               path,
+            })
+
+        if not subtasks:
+            self.log("  No valid subtasks loaded from action files", "error")
+            return False
 
         self.task.subtasks = subtasks
         self.state.save_subtasks_for_task(self.task)
-        self.log(f"  Loaded {len(subtasks)} subtasks from implementation_plan.json", "ok")
+        self.log(f"  Loaded {len(subtasks)} subtask(s) from actions/", "ok")
 
         task_dict = self.task.to_dict_ui()
         self._gevent_safe(lambda: eel.task_updated(task_dict))

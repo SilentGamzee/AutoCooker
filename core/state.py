@@ -522,6 +522,27 @@ class AppState:
         path = os.path.join(task.task_dir, "subtasks.json")
         with open(path, "w", encoding="utf-8") as f:
             json.dump(task.subtasks, f, ensure_ascii=False, indent=2)
+
+        # Sync runtime status fields back to individual action files
+        _SYNC_FIELDS = ("status", "current_loop", "done_summary", "failure_reason")
+        for subtask in task.subtasks:
+            action_file = subtask.get("action_file")
+            if not action_file or not os.path.isfile(action_file):
+                continue
+            try:
+                with open(action_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                changed = False
+                for field in _SYNC_FIELDS:
+                    if field in subtask and data.get(field) != subtask[field]:
+                        data[field] = subtask[field]
+                        changed = True
+                if changed:
+                    with open(action_file, "w", encoding="utf-8") as f:
+                        json.dump(data, f, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
+
         self._save_kanban()
 
     # ── Log helpers ─────────────────────────────────────────────
