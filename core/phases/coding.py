@@ -243,7 +243,6 @@ class CodingPhase(BasePhase):
 
         files_to_create = subtask_dict.get("files_to_create") or []
         files_to_modify = subtask_dict.get("files_to_modify") or []
-        completion_cond = subtask_dict.get("completion_without_ollama", "").strip()
         patterns_from   = subtask_dict.get("patterns_from") or []
 
         # Tell build_system() which files are relevant to this subtask (SIMP-6)
@@ -288,6 +287,32 @@ class CodingPhase(BasePhase):
         executor.modify_only_files = {
             self._to_rel_workdir(workdir, f) for f in files_to_modify
         }
+
+        # ── Mechanical apply: find/replace steps without LLM ─────────
+        # If ALL steps have find+replace anchors and all apply cleanly → skip LLM entirely.
+        # Only fall through to LLM for steps that couldn't be resolved mechanically
+        # (no find anchor, or find text not present in file).
+        if not critic_feedback:  # Only on first attempt — retries always use LLM
+            mech_result = self._apply_mechanical_steps(subtask_dict, workdir, on_write_made)
+            if mech_result["all_done"]:
+                self.log(
+                    f"  ✓ All {mech_result['applied']} step(s) applied mechanically — skipping LLM",
+                    "ok",
+                )
+                # Mark confirmed so validate_fn passes
+                confirmed["done"] = True
+                confirmed["summary"] = f"Mechanically applied {mech_result['applied']} step(s)"
+                subtask_dict["done_summary"] = confirmed["summary"][:200]
+                return True
+            elif mech_result["applied"] > 0:
+                self.log(
+                    f"  ✓ {mech_result['applied']} step(s) applied mechanically, "
+                    f"{mech_result['pending']} need LLM",
+                    "info",
+                )
+                # Tell LLM which steps were already applied so it skips them
+                subtask_dict = dict(subtask_dict)
+                subtask_dict["_mechanically_applied"] = mech_result["applied_actions"]
 
         # Pre-read files_to_modify so their content is in the prompt
         modify_previews = ""
@@ -417,6 +442,15 @@ class CodingPhase(BasePhase):
             # In retry mode: show current file state BEFORE implementation_steps so the model
             # sees what is already implemented and makes targeted fixes, not full re-implementations.
             + (current_workdir_state if critic_feedback and current_workdir_state else "")
+            + (
+                (
+                    "=== STEPS ALREADY APPLIED AUTOMATICALLY ===\n"
+                    + "\n".join(f"  ✓ {a}" for a in subtask_dict.get("_mechanically_applied", []))
+                    + "\nDo NOT re-apply these — they are already in the file.\n"
+                    "Only implement the REMAINING steps listed below.\n"
+                    "==========================================\n\n"
+                ) if subtask_dict.get("_mechanically_applied") else ""
+            )
             + _format_implementation_steps(subtask_dict.get('implementation_steps', []))
             + f"Files to CREATE from scratch:\n"
             + ("\n".join(f"  - {f}" for f in files_to_create) if files_to_create else "  (none)")
@@ -430,9 +464,7 @@ class CodingPhase(BasePhase):
             # In first iteration: show current_workdir_state here (its original position).
             # In retry: already shown above before impl_steps.
             + (current_workdir_state if not critic_feedback else "")
-            + f"\n\nCompletion condition:\n  {completion_cond}\n\n"
-            f"Quality condition:\n  {subtask_dict.get('completion_with_ollama', '')}\n\n"
-            "RULES:\n"
+            + "\nRULES:\n"
             + ("⛔ RETRY MODE: The files above already contain changes from a previous iteration.\n"
                "  Do NOT add a second version of any function that already exists in the current\n"
                "  file state (shown above). Fix it IN PLACE using modify_file.\n"
@@ -476,31 +508,14 @@ class CodingPhase(BasePhase):
                 if not os.path.isfile(full):
                     return False, f"File not found in task workdir: {f}"
 
-            # Check 3: structural completion condition — check workdir first, then project
-            # (moved before write check so we can verify "already done" cases)
-            if completion_cond:
-                check_dir = workdir if os.path.isdir(workdir) else wd
-                cond_ok, cond_msg = self._check_completion_condition(
-                    completion_cond, check_dir
-                )
-                if not cond_ok:
-                    return False, f"Structural condition not met: {cond_msg}"
-
-            # Check 4: at least one write happened (unless task was already complete)
+            # Check 3: at least one write happened
             expected_changes = len(files_to_create) + len(files_to_modify)
             if expected_changes > 0 and len(writes_made) == 0:
-                # If no writes were made but the structural condition passed,
-                # the task was already complete — this is valid
-                if completion_cond:
-                    # Structural condition already verified above
-                    return True, "OK: task already completed (verified by completion condition)"
-                else:
-                    # No completion condition to verify, and no writes — this is an error
-                    return (
-                        False,
-                        "confirm_task_done was called but no files were written. "
-                        "The task requires actual file changes.",
-                    )
+                return (
+                    False,
+                    "confirm_task_done was called but no files were written. "
+                    "The task requires actual file changes.",
+                )
 
             return True, "OK"
 
@@ -510,6 +525,122 @@ class CodingPhase(BasePhase):
             max_outer_iterations=3,   # было 10: модель за 3 retry должна справиться или это проблема плана
             max_tool_rounds=20,       # было 40 (default): уменьшить накопление лишних вызовов
         )
+
+    # ── Mechanical step application ───────────────────────────────
+    def _apply_mechanical_steps(
+        self,
+        subtask_dict: dict,
+        workdir: str,
+        on_write: callable,
+    ) -> dict:
+        """Try to mechanically apply find→replace steps from implementation_steps.
+
+        For each step that has a non-empty 'find' and 'replace' (or 'code') field:
+          - Locate the target file from files_to_modify
+          - Apply str.replace(find, replace, 1) directly
+          - Write the result back to workdir
+
+        Returns a dict with:
+          all_done       — True if every step was applied (LLM not needed)
+          applied        — count of steps applied
+          pending        — count of steps still needing LLM
+          applied_actions — list of human-readable descriptions of what was applied
+        """
+        steps = subtask_dict.get("implementation_steps") or []
+        files_to_modify = subtask_dict.get("files_to_modify") or []
+        files_to_create = subtask_dict.get("files_to_create") or []
+
+        # Can only mechanically handle modify steps (not create-from-scratch)
+        if files_to_create and not files_to_modify:
+            return {"all_done": False, "applied": 0, "pending": len(steps), "applied_actions": []}
+
+        applied = 0
+        pending = 0
+        applied_actions: list[str] = []
+
+        # Cache of file contents — read once, write once per file
+        file_cache: dict[str, str] = {}
+        file_modified: set[str] = set()
+
+        def _load(rel: str) -> str | None:
+            if rel in file_cache:
+                return file_cache[rel]
+            abs_p = os.path.join(workdir, rel)
+            if not os.path.isfile(abs_p):
+                return None
+            try:
+                with open(abs_p, "r", encoding="utf-8", errors="replace") as f:
+                    content = f.read()
+                file_cache[rel] = content
+                return content
+            except Exception:
+                return None
+
+        for step in steps:
+            if not isinstance(step, dict):
+                pending += 1
+                continue
+
+            find_text = step.get("find", "")
+            replace_text = step.get("replace", step.get("code", ""))
+            action = step.get("action", "")
+
+            # Skip steps without a find anchor — need LLM judgment
+            if not find_text or not find_text.strip():
+                pending += 1
+                continue
+
+            # Try each modify file until we find the text
+            matched_file = None
+            for rel in files_to_modify:
+                content = _load(rel)
+                if content is None:
+                    continue
+                if find_text in content:
+                    matched_file = rel
+                    # Duplicate guard: if replace already present elsewhere, skip
+                    rest = content.replace(find_text, "", 1)
+                    if replace_text and replace_text.strip() and replace_text.strip() in rest:
+                        self.log(
+                            f"  [mech] Skipping step (replace already present in {rel}): {action[:60]}",
+                            "info",
+                        )
+                        applied += 1  # Count as applied — no change needed
+                        applied_actions.append(f"{action[:80]} [already present in {rel}]")
+                        break
+                    file_cache[rel] = content.replace(find_text, replace_text, 1)
+                    file_modified.add(rel)
+                    applied += 1
+                    applied_actions.append(f"{action[:80]} → {rel}")
+                    self.log(f"  [mech] Applied: {action[:60]} → {rel}", "info")
+                    break
+
+            if matched_file is None:
+                # find text not in any file — LLM must handle this step
+                pending += 1
+                self.log(
+                    f"  [mech] Cannot apply (find not matched): {action[:60]}",
+                    "info",
+                )
+
+        # Write modified files back to workdir
+        for rel in file_modified:
+            abs_p = os.path.join(workdir, rel)
+            try:
+                with open(abs_p, "w", encoding="utf-8") as f:
+                    f.write(file_cache[rel])
+                on_write(rel, file_cache[rel])
+                self.log(f"  [mech] Wrote {rel}", "info")
+            except Exception as e:
+                self.log(f"  [WARN] Failed to write {rel}: {e}", "warn")
+
+        all_done = (pending == 0) and (applied > 0 or not steps)
+        return {
+            "all_done": all_done,
+            "applied": applied,
+            "pending": pending,
+            "applied_actions": applied_actions,
+        }
 
     # ── Critic ────────────────────────────────────────────────────
     def _run_critic(
