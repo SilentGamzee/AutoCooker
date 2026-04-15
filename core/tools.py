@@ -697,11 +697,33 @@ class ToolExecutor:
         if validation != "OK":
             return validation
 
+        if not old_text or not old_text.strip():
+            return (
+                "ERROR: old_text must not be empty. "
+                "Provide the exact existing code block to replace. "
+                "Use read_file to get the current content, then copy the target lines verbatim as old_text."
+            )
+
         try:
             with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
                 current = f.read()
             if old_text not in current:
-                return f"ERROR: old_text not found in {path_raw}"
+                # Count lines to give a helpful hint
+                lines_in_old = old_text.count("\n") + 1
+                return (
+                    f"ERROR: old_text not found in {path_raw}. "
+                    f"The {lines_in_old}-line block you provided does not match the file. "
+                    "Call read_file to get the current content, copy the target lines VERBATIM "
+                    "(including exact whitespace/indentation), then retry modify_file."
+                )
+            # Guard against accidental duplicate definitions: if new_text already exists
+            # in the file at a location other than old_text, warn the caller.
+            if new_text and new_text.strip() and new_text.strip() in current.replace(old_text, "", 1):
+                return (
+                    f"ERROR: new_text already exists in {path_raw} (would create a duplicate). "
+                    "The code you want to add is already present in the file. "
+                    "Call read_file to verify the current state before making changes."
+                )
             updated = current.replace(old_text, new_text, 1)
             os.makedirs(os.path.dirname(abs_path), exist_ok=True)
             with open(abs_path, "w", encoding="utf-8") as f:

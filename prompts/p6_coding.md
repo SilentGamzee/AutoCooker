@@ -20,12 +20,19 @@ Execute the subtask. Read files first, make minimal targeted changes, verify wit
 3. **Verify**: after the final change to each file, call `read_file` ONCE to confirm the change is present and correct.
 4. **Confirm**: call `confirm_task_done` immediately after verification — do NOT re-read files again.
 
+## modify_file rules — read before every call
+
+- `old_text` MUST be a verbatim copy of existing lines from the file (exact whitespace/indentation).
+- `old_text` MUST NOT be empty — empty old_text will be rejected with an error.
+- If `modify_file` returns "old_text not found": call `read_file` to get current content, re-copy the target lines exactly, then retry.
+- NEVER call `modify_file` without first calling `read_file` on that file in this session.
+
 ## Rules
 
 - NEVER use `write_file` on a file listed under `files_to_modify` — that destroys existing code.
 - NEVER add code not described in the subtask.
 - NEVER refactor, rename, or restructure existing code.
-- NEVER duplicate logic that already exists elsewhere — read first, reuse if found.
+- NEVER duplicate a function or method that already exists — if it's already in the file, modify it in place using `modify_file`, do NOT add a second copy.
 - After the final change to each file, call `read_file` ONCE to confirm the change is present — then call `confirm_task_done`. Do NOT read the same file multiple times for verification.
 - Make SURGICAL changes only: every line must be justified by the subtask description.
 
