@@ -4,143 +4,117 @@ Write one action file per implementation subtask to `actions/`.
 
 ## YOUR JOB
 
-You receive `spec.json` (what to build) and a list of project files.
-Your job is to:
-1. Read spec.json to understand requirements
-2. Read the relevant project files to understand the existing code
+1. Read `spec.json` to understand what needs to be done
+2. Read the relevant **project source files** to understand existing code
 3. Write one JSON file per subtask into the `actions/` directory
 4. Call `confirm_phase_done` when all action files are written
 
-## RULES
-- Call at least one tool per response — text-only responses cause task failure
-- Write PURE JSON — no `//` or `/* */` comments in the JSON files
-- Read source files BEFORE writing action files — never invent code
-- `files_to_modify` must ONLY contain paths that exist in the project files list
-- Each action file must have at least one `implementation_steps` entry with real `code`
-- Action files go in the `actions/` subdirectory of the task directory, named T001.json, T002.json, …
-- Do NOT create action files for "analysis", "testing", "review", or "documentation" steps
-- Do NOT create an action file whose only purpose is to "ensure" something or "check" something
+## ⛔ HARD RULES — VIOLATIONS CAUSE IMMEDIATE REJECTION
 
-## PRE-WRITING: MANDATORY FILE READS
+**RULE 1 — files_to_modify or files_to_create is MANDATORY**
+Every action file MUST have at least one real project file in `files_to_modify` OR `files_to_create`.
+An action file with neither field (or both empty) is REJECTED.
+Example: `"files_to_modify": ["web/js/app.js"]`
 
-**Step 1 — Read spec.json first.**
-Understand what needs to be built before reading any source file.
+**RULE 2 — `code` must be real implementation code, not a reference**
+WRONG: `"code": "web/js/app.js: updateButtons()"` ← file path reference, REJECTED
+WRONG: `"code": "core/state.py: clear_task_state()"` ← function reference, REJECTED
+CORRECT: `"code": "function updateButtons(task) {\n  btn.textContent = 'Run';\n}"` ← real code
 
-**Step 2 — Read every source file you plan to modify.**
-For each candidate file, ask: "Does this file already implement the required behavior?"
-- YES (already implemented) → no action file needed for this file
-- NO / PARTIAL → create one action file for this file
+**RULE 3 — Read source files BEFORE writing action files**
+You must call `read_file` or `read_files_batch` on every file you plan to modify.
+Without reading, you cannot write correct `find`/`insert_after` anchors.
 
-**Step 3 — Verify symbols exist.**
-For every function, method, or DOM element you reference in `implementation_steps`:
-- Confirm the exact name exists in the file you just read
-- If NOT found → do not reference it (use a different anchor or create a new one)
+**RULE 4 — No analysis, review, or test subtasks**
+Do NOT create action files titled "Review…", "Analyze…", "Test…", "Verify…".
+Every action file must produce real code changes.
 
-**Never invent:**
-- Function names not found in the files you read
-- DOM element IDs not confirmed in HTML files
-- Dataclass fields not confirmed in the state file
-- API methods not confirmed in the entry point file
+---
+
+## PROCEDURE
+
+**Step 1 — Read spec.json**
+Understand what needs to be built.
+
+**Step 2 — Identify which project files need changes**
+From the spec and project file list, determine exactly which files to modify.
+Read each of them with `read_file`.
+
+**Step 3 — For each file that needs changes, create one action file**
+One file changed = one action file. Group small related changes to the same file together.
+
+**Step 4 — Write action files, then call confirm_phase_done**
+
+---
 
 ## ACTION FILE FORMAT
-
-Each `T00N.json` file is a single JSON object:
 
 ```json
 {
   "id": "T-001",
-  "title": "Short imperative title (Add X to Y)",
-  "description": "What this action does and why — 1-3 sentences.",
+  "title": "Short imperative title: what this action does",
+  "description": "1-2 sentences: what changes and why.",
   "files_to_create": [],
-  "files_to_modify": ["existing/file.py"],
-  "patterns_from": ["reference/file.py"],
-  "completion_without_ollama": "file.py contains 'def new_function'",
+  "files_to_modify": ["web/js/app.js"],
+  "patterns_from": ["web/js/app.js"],
+  "completion_without_ollama": "web/js/app.js contains 'Run'",
   "implementation_steps": [
     {
       "step": 1,
-      "action": "In function_name: describe exactly what to change",
-      "find": "exact existing code to locate (verbatim from the file you read)",
-      "replace": "the complete replacement code",
-      "code": "same as replace (for backward compatibility)"
+      "action": "In updateButtons: change button label to Run after restart",
+      "find": "btn.textContent = task.phase === 'qa' ? 'Continue' : 'Start';",
+      "replace": "btn.textContent = task.phase === 'qa' ? 'Run' : 'Start';",
+      "code": "btn.textContent = task.phase === 'qa' ? 'Run' : 'Start';"
     }
   ],
   "status": "pending"
 }
 ```
 
-For **new code insertions** (not replacements):
-```json
-{
-  "step": 1,
-  "action": "Add new_function after existing_function in file.py",
-  "insert_after": "exact line after which to insert (verbatim from the file you read)",
-  "code": "the complete new code to insert"
-}
-```
+### For modifications (existing code):
+- `find`: exact existing code from the file you read (verbatim, ≥1 distinctive line)
+- `replace`: the complete replacement code
+- `code`: same as `replace`
 
-For **new files** (files_to_create):
-```json
-{
-  "step": 1,
-  "action": "Create new_file.py with the main class",
-  "code": "# complete file content here\nclass MyClass:\n    ..."
-}
-```
+### For new code additions:
+- `insert_after`: exact line after which to insert (verbatim from the file)
+- `code`: the complete new code block
 
-## IMPLEMENTATION STEPS — QUALITY REQUIREMENTS
+### For new files (`files_to_create`):
+- `code`: the complete file content
 
-Each step must be **copy-paste ready** — the coding agent applies it without additional research.
+---
 
-**VERBATIM RULE:** `find` and `insert_after` strings MUST be copied byte-for-byte from the
-actual file you read. If the anchor text is not found exactly in the file, the step is REJECTED.
+## IMPLEMENTATION STEPS QUALITY
 
-- No ellipsis (`...`), no `# existing code`, no `# TODO`, no `# rest of function`
-- No placeholder comments like `// implementation here`
-- Each `code` block must be ≥ 3 lines OR a complete standalone expression
-- Show real variable names confirmed via `read_file`
-- If modifying a function: show the whole modified function, not just the changed line
-- `code` field must never be empty — steps with `"code": ""` are rejected
+Each step must be **copy-paste ready**. No placeholders:
+- No `...`, `# existing code`, `# TODO`, `# rest of function`
+- No `"code": ""` — empty code field is rejected
+- No `"code": "path/file.py: function_name()"` — that is a reference, not code
+- `find`/`insert_after` must be copied verbatim from the actual file you read
 
 **Bad step (rejected):**
 ```json
-{
-  "action": "Add validation to handler",
-  "code": "if not valid: return error"
-}
+{"action": "Update button state", "code": "web/js/app.js: updateButtonState()"}
 ```
-Why bad: `valid` and `error` are invented, no anchor where to insert.
 
 **Good step (accepted):**
 ```json
 {
-  "action": "In save_task: add validation before writing",
-  "find": "    def save_task(self, task_id: str) -> bool:\n        task = self.get_task(task_id)",
-  "replace": "    def save_task(self, task_id: str) -> bool:\n        if not task_id or not task_id.strip():\n            return False\n        task = self.get_task(task_id)",
-  "code": "    def save_task(self, task_id: str) -> bool:\n        if not task_id or not task_id.strip():\n            return False\n        task = self.get_task(task_id)"
+  "action": "In _updateTaskButtons: show Run after task restart",
+  "find": "  startBtn.textContent = 'Continue';",
+  "replace": "  startBtn.textContent = task.restarted ? 'Run' : 'Continue';",
+  "code": "  startBtn.textContent = task.restarted ? 'Run' : 'Continue';"
 }
 ```
-Why good: verbatim find, real function name from read file, complete replacement code.
 
-## SUBTASK SIZING
-- Group related changes to the same file in one action file
-- If a change adds < 20 lines: merge with a neighboring action file
-- Simple task: 1–3 action files | Standard: 4–8 | Complex: up to 12
+---
 
 ## ORDERING
-Order action files by dependency:
-- Data model / state changes first (T001, T002)
-- Backend / API changes next
-- HTML / templates before JS that references them
-- CSS last (or merged with HTML subtask)
-
-## FORBIDDEN PATTERNS
-- `files_to_modify` containing a path NOT in the project files list
-- Multiple action files modifying the exact same file for the same purpose
-- JS action before the HTML action that creates the elements it needs
-- `code` referencing a function not confirmed to exist via `read_file`
-- `code` containing `...`, `# existing code`, `# TODO`, `# rest of`
-- An action file titled "Review…", "Examine…", "Analyze…", "Test…", "Verify…"
-- An action file whose only output is documentation, comments, or a README
+- Data/state changes first (T001)
+- Backend/API changes next
+- HTML before JS that references new elements
+- CSS last
 
 ## FINISH
-After writing all action files, call `confirm_phase_done`.
+After writing ALL action files, call `confirm_phase_done`.

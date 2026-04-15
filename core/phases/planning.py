@@ -1193,21 +1193,45 @@ class PlanningPhase(BasePhase):
                 if field not in data:
                     errors.append(f"[FILE: {fname}] Missing required field: '{field}'")
 
+            # Must target at least one file to be executable by the coding phase
+            creates = [p for p in data.get("files_to_create", []) if p]
+            modifies = [p for p in data.get("files_to_modify", []) if p]
+            if not creates and not modifies:
+                errors.append(
+                    f"[FILE: {fname}] MISSING files_to_create or files_to_modify. "
+                    "Every action file MUST specify which project file(s) it changes. "
+                    "Example: \"files_to_modify\": [\"web/js/app.js\"] — use real paths "
+                    "from the project files list. Without this the coding phase cannot execute the task."
+                )
+
             steps = data.get("implementation_steps")
             if not isinstance(steps, list) or len(steps) == 0:
                 errors.append(
                     f"[FILE: {fname}] 'implementation_steps' must be a non-empty array"
                 )
             else:
-                has_code = any(bool(s.get("code")) for s in steps if isinstance(s, dict))
-                if not has_code:
+                # code must be real implementation (≥20 chars, not just "path: func()")
+                real_code = [
+                    s for s in steps
+                    if isinstance(s, dict)
+                    and len(str(s.get("code", ""))) >= 20
+                    and ":" not in str(s.get("code", "")).split("\n")[0].strip()[:30]
+                ]
+                if not real_code:
+                    sample = next(
+                        (str(s.get("code", ""))[:80] for s in steps if isinstance(s, dict)),
+                        ""
+                    )
                     errors.append(
-                        f"[FILE: {fname}] At least one step must have a non-empty 'code' field. "
-                        "Each step needs: action + code"
+                        f"[FILE: {fname}] 'code' field contains only pseudo-code or references, "
+                        f"not real implementation. Got: \"{sample}\". "
+                        "The 'code' field must contain actual source code (function bodies, "
+                        "assignments, etc.) that can be copied into the project file — "
+                        "not 'path/file.py: function_name()' references."
                     )
 
-            for rel_path in data.get("files_to_modify", []):
-                if rel_path and not os.path.isfile(os.path.join(project_path, rel_path)):
+            for rel_path in modifies:
+                if not os.path.isfile(os.path.join(project_path, rel_path)):
                     errors.append(
                         f"[FILE: {fname}] files_to_modify contains non-existent file: "
                         f"'{rel_path}'. Only use paths from the project files list."

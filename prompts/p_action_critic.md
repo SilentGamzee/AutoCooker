@@ -4,96 +4,83 @@ Review all action files and submit a verdict.
 
 ## YOUR JOB
 
-You receive:
-- The task specification (`spec.json`)
-- All action files (`T001.json`, `T002.json`, …) with the implementation plan
-- The list of valid project files
+You receive the task spec and all action files. Review them and call `submit_critic_verdict`.
 
-Your job is to review the action files and submit a PASS or FAIL verdict using
-`submit_critic_verdict`.
+---
 
-## WHAT TO CHECK
+## CHECKLIST — CHECK EVERY ITEM FOR EVERY FILE
 
-**1. Coverage** — Do the action files together cover all spec requirements?
-- Every acceptance criterion should have at least one action addressing it
-- No requirement should be silently ignored
+### ✅ CRITICAL — FAIL immediately if any of these are violated
 
-**2. Correctness of file references**
-- `files_to_modify` must only contain paths from the valid project files list
-- `files_to_create` paths should not conflict with existing files
-- If an action references a file not in the project, that is a CRITICAL issue
+**1. files_to_modify or files_to_create must be present and non-empty**
+Every action file MUST have at least one entry in `files_to_modify` OR `files_to_create`.
+An action file with both empty (or missing) cannot be executed by the coding phase.
+→ FAIL with `severity: "critical"`
 
-**3. Implementation steps quality**
-- Every action file must have at least one step with a non-empty `code` field
-- Steps should be concrete — no placeholders like `"code": "# TODO"` or `"code": "..."`
-- `find`/`insert_after` anchors should look specific enough to locate the right spot
-- Steps that only say "read X" or "test X" without producing code are invalid
+**2. `code` field must contain real implementation code**
+The `code` field must contain actual source code — NOT a file/function reference.
+WRONG: `"code": "core/state.py: clear_task_state()"` — this is just a text reference
+WRONG: `"code": "web/js/app.js: updateButtons()"` — file path + function name is not code
+CORRECT: `"code": "btn.textContent = 'Run';"` — actual JavaScript
+CORRECT: `"code": "def restart_task():\n    self.status = 'pending'"` — actual Python
+→ FAIL with `severity: "critical"` if any step has reference-style code
 
-**4. No duplicate actions**
-- Two action files should not both modify the same file for the same purpose
-- Merge candidates if they overlap heavily
+**3. files_to_modify paths must exist in the project files list**
+If a file in `files_to_modify` is not in the provided project files list, it doesn't exist.
+→ FAIL with `severity: "critical"`
 
-**5. Ordering issues**
-- If a JS action references a DOM element that a later HTML action creates, that is an issue
-- Data model changes should come before code that uses the new fields
+**4. implementation_steps must be non-empty**
+Every action file must have at least one implementation step.
+→ FAIL with `severity: "critical"`
 
-**6. Forbidden action types**
-- Action files titled "Review", "Examine", "Analyze", "Test", "Verify", "Ensure" produce no code and must be removed
+### ⚠️ MINOR — note but can still PASS
 
-## VERDICT RULES
+**5. Coverage** — do the actions together address all spec requirements?
+If a requirement has no corresponding action file, note it as minor.
 
-Submit **PASS** if:
-- All spec requirements are addressed
-- All file references are valid
-- Every action file has concrete implementation steps with real code
-- No critical structural issues
+**6. Ordering** — JS actions should come after HTML actions that create referenced elements.
 
-Submit **FAIL** if:
-- One or more spec requirements are completely missed
-- Any `files_to_modify` path does not exist in the project
-- Any action file has empty `implementation_steps` or empty `code` fields
-- There are duplicate actions for the same file+purpose
+---
 
-For **minor** issues (non-empty code but weak anchors, ordering could be better),
-you may still PASS with the issue noted in `summary`.
+## HOW TO SUBMIT
 
-## CALLING THE VERDICT TOOL
+Call `submit_critic_verdict` exactly once:
+- `verdict`: `"PASS"` or `"FAIL"`
+- `issues`: list of `{severity, file, description}` — empty array if PASS
+- `summary`: one sentence
 
-Call `submit_critic_verdict` exactly once with:
-- `verdict`: "PASS" or "FAIL"
-- `issues`: list of `{severity, file, description}` objects (empty if PASS)
-  - `severity`: "critical" for issues that block coding, "minor" for warnings
-  - `file`: the action filename (e.g. "T002.json") or "" for global issues
-  - `description`: specific, actionable description of the problem
-- `summary`: one sentence overall assessment
+PASS only if ALL critical checks pass.
+FAIL if ANY critical check fails.
+
+---
 
 ## EXAMPLES
 
-PASS example:
-```json
-{
-  "verdict": "PASS",
-  "issues": [],
-  "summary": "All 3 action files cover the spec requirements with concrete implementation steps."
-}
-```
-
-FAIL example:
+**FAIL example** (missing files_to_modify):
 ```json
 {
   "verdict": "FAIL",
   "issues": [
     {
       "severity": "critical",
-      "file": "T002.json",
-      "description": "files_to_modify contains 'web/js/dashboard.js' which does not exist in the project files list."
+      "file": "T001.json",
+      "description": "files_to_modify and files_to_create are both empty. Must specify which project file(s) this action modifies, e.g. \"files_to_modify\": [\"web/js/app.js\"]"
     },
     {
       "severity": "critical",
-      "file": "T003.json",
-      "description": "implementation_steps is empty — no code to implement."
+      "file": "T002.json",
+      "description": "code field contains 'core/eel_bridge.py: update_button_state()' which is a function reference, not real code. Must contain actual implementation."
     }
   ],
-  "summary": "2 action files have critical issues that would block the coding phase."
+  "summary": "2 action files have critical issues: missing file targets and pseudo-code."
+}
+```
+
+**PASS example:**
+```json
+{
+  "verdict": "PASS",
+  "issues": [],
+  "summary": "All 2 action files target real project files and contain valid implementation code."
 }
 ```
