@@ -17,13 +17,14 @@ Every action file MUST have at least one entry in `files_to_modify` OR `files_to
 An action file with both empty (or missing) cannot be executed by the coding phase.
 → FAIL with `severity: "critical"`
 
-**2. `code` field must contain real implementation code**
-The `code` field must contain actual source code — NOT a file/function reference.
-WRONG: `"code": "core/state.py: clear_task_state()"` — this is just a text reference
-WRONG: `"code": "web/js/app.js: updateButtons()"` — file path + function name is not code
-CORRECT: `"code": "btn.textContent = 'Run';"` — actual JavaScript
-CORRECT: `"code": "def restart_task():\n    self.status = 'pending'"` — actual Python
-→ FAIL with `severity: "critical"` if any step has reference-style code
+**2. `code` field must be a dict `{file, line, content}` with real code**
+Every step's `code` must be a JSON object — NOT a plain string.
+WRONG: `"code": "btn.textContent = 'Run';"` — plain string, rejected
+WRONG: `"code": "core/state.py: clear_task_state()"` — reference string, rejected
+CORRECT: `"code": {"file": "web/js/app.js", "line": 346, "content": "btn.textContent = 'Run';"}` — dict with file + line + content
+Required fields: `file` (string, relative path), `line` (integer), `content` (string, ≥10 chars of real code)
+`content` must not be a path/function reference like `"core/state.py: func()"`.
+→ FAIL with `severity: "critical"` if any step has `code` as a plain string or missing required dict fields
 
 **3. files_to_modify paths must exist in the project files list**
 If a file in `files_to_modify` is not in the provided project files list, it doesn't exist.

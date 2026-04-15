@@ -18,6 +18,22 @@ _PLACEHOLDER_STEP_PREFIXES = (
     "validate ", "review ", "examine ", "analyze ", "investigate ",
 )
 
+def _extract_code_content(code_val) -> tuple[str, str, int]:
+    """Extract (content, file, line) from a code field that may be a dict or plain string.
+
+    Supports both the new dict format {"file": ..., "line": ..., "content": ...}
+    and the legacy plain-string format for backward compatibility.
+    Returns (content_str, file_str, line_int).
+    """
+    if isinstance(code_val, dict):
+        return (
+            str(code_val.get("content", "")).strip(),
+            str(code_val.get("file", "")),
+            int(code_val.get("line", 0) or 0),
+        )
+    return str(code_val).strip(), "", 0
+
+
 def _format_implementation_steps(steps: list) -> str:
     """Format implementation_steps list into a readable section for the coding agent.
 
@@ -33,20 +49,27 @@ def _format_implementation_steps(steps: list) -> str:
         if not isinstance(step, dict):
             continue
         action = step.get("action", "").strip()
-        code = step.get("code", "").strip()
+        code_val = step.get("code", "")
+        code_content, code_file, code_line = _extract_code_content(code_val)
         verify = step.get("verify_methods", [])
         # Drop placeholder steps: empty code + action that describes reading/testing
-        if not code:
+        if not code_content:
             action_lower = action.lower()
             if any(action_lower.startswith(pfx) for pfx in _PLACEHOLDER_STEP_PREFIXES):
                 continue  # skip "Read current X" / "Test modified X" placeholders
         step_num += 1
         if action:
             lines.append(f"  Step {step_num}: {action}")
+        if code_file:
+            loc = f"{code_file}:{code_line}" if code_line else code_file
+            lines.append(f"    Target: {loc}")
         if verify:
             lines.append(f"    Verify exist before use: {', '.join(verify)}")
-        if code:
-            lines.append(f"    ```\n    {code}\n    ```")
+        find_text = step.get("find", "")
+        if find_text:
+            lines.append(f"    Find:    {find_text[:120]}")
+        if code_content:
+            lines.append(f"    Replace: ```\n    {code_content}\n    ```")
     lines.append("")
     return "\n".join(lines) + "\n"
 
@@ -581,47 +604,82 @@ class CodingPhase(BasePhase):
                 pending += 1
                 continue
 
-            find_text = step.get("find", "")
-            replace_text = step.get("replace", step.get("code", ""))
             action = step.get("action", "")
+            find_text = step.get("find", "")
+            insert_after = step.get("insert_after", "")
 
-            # Skip steps without a find anchor — need LLM judgment
-            if not find_text or not find_text.strip():
-                pending += 1
+            # Extract code — supports new dict format and legacy string
+            code_val = step.get("code", "")
+            replace_text, code_file, _code_line = _extract_code_content(code_val)
+
+            # Determine candidate files: prefer code.file, fall back to files_to_modify list
+            if code_file and code_file in files_to_modify:
+                candidate_files = [code_file]
+            elif code_file:
+                # code.file not in files_to_modify — still try it (may be valid)
+                candidate_files = [code_file] if os.path.isfile(os.path.join(workdir, code_file)) else files_to_modify
+            else:
+                candidate_files = files_to_modify
+
+            # Case A: find + replace
+            if find_text and find_text.strip():
+                matched_file = None
+                for rel in candidate_files:
+                    content = _load(rel)
+                    if content is None:
+                        continue
+                    if find_text in content:
+                        matched_file = rel
+                        # Duplicate guard: if replace already present elsewhere, skip
+                        rest = content.replace(find_text, "", 1)
+                        if replace_text and replace_text.strip() and replace_text.strip() in rest:
+                            self.log(
+                                f"  [mech] Skipping (replace already present in {rel}): {action[:60]}",
+                                "info",
+                            )
+                            applied += 1
+                            applied_actions.append(f"{action[:80]} [already present in {rel}]")
+                        else:
+                            file_cache[rel] = content.replace(find_text, replace_text, 1)
+                            file_modified.add(rel)
+                            applied += 1
+                            applied_actions.append(f"{action[:80]} → {rel}")
+                            self.log(f"  [mech] Applied find→replace: {action[:60]} → {rel}", "info")
+                        break
+                if matched_file is None:
+                    pending += 1
+                    self.log(f"  [mech] find not matched — needs LLM: {action[:60]}", "info")
                 continue
 
-            # Try each modify file until we find the text
-            matched_file = None
-            for rel in files_to_modify:
-                content = _load(rel)
-                if content is None:
-                    continue
-                if find_text in content:
-                    matched_file = rel
-                    # Duplicate guard: if replace already present elsewhere, skip
-                    rest = content.replace(find_text, "", 1)
-                    if replace_text and replace_text.strip() and replace_text.strip() in rest:
-                        self.log(
-                            f"  [mech] Skipping step (replace already present in {rel}): {action[:60]}",
-                            "info",
-                        )
-                        applied += 1  # Count as applied — no change needed
-                        applied_actions.append(f"{action[:80]} [already present in {rel}]")
+            # Case B: insert_after
+            if insert_after and insert_after.strip():
+                matched_file = None
+                for rel in candidate_files:
+                    content = _load(rel)
+                    if content is None:
+                        continue
+                    if insert_after in content:
+                        matched_file = rel
+                        # Insert replace_text after the insert_after line
+                        idx = content.index(insert_after) + len(insert_after)
+                        # Move to end of that line
+                        nl = content.find("\n", idx)
+                        insert_pos = nl + 1 if nl != -1 else len(content)
+                        updated = content[:insert_pos] + replace_text + "\n" + content[insert_pos:]
+                        file_cache[rel] = updated
+                        file_modified.add(rel)
+                        applied += 1
+                        applied_actions.append(f"{action[:80]} [insert_after] → {rel}")
+                        self.log(f"  [mech] Applied insert_after: {action[:60]} → {rel}", "info")
                         break
-                    file_cache[rel] = content.replace(find_text, replace_text, 1)
-                    file_modified.add(rel)
-                    applied += 1
-                    applied_actions.append(f"{action[:80]} → {rel}")
-                    self.log(f"  [mech] Applied: {action[:60]} → {rel}", "info")
-                    break
+                if matched_file is None:
+                    pending += 1
+                    self.log(f"  [mech] insert_after not matched — needs LLM: {action[:60]}", "info")
+                continue
 
-            if matched_file is None:
-                # find text not in any file — LLM must handle this step
-                pending += 1
-                self.log(
-                    f"  [mech] Cannot apply (find not matched): {action[:60]}",
-                    "info",
-                )
+            # No anchor at all — LLM must handle
+            pending += 1
+            self.log(f"  [mech] No find/insert_after anchor — needs LLM: {action[:60]}", "info")
 
         # Write modified files back to workdir
         for rel in file_modified:

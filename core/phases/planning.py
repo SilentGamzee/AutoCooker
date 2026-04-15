@@ -1175,12 +1175,16 @@ class PlanningPhase(BasePhase):
                 continue
             try:
                 with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
-                    lines = f.readlines()
-                if len(lines) > max_lines:
-                    content = "".join(lines[:max_lines]) + f"\n... ({len(lines) - max_lines} more lines)"
-                else:
-                    content = "".join(lines)
-                sections.append(f"=== {rel_path} ===\n{content}\n")
+                    raw_lines = f.readlines()
+                total = len(raw_lines)
+                shown = raw_lines[:max_lines]
+                # Format with line numbers so the LLM can use exact line refs in code.line
+                numbered = "".join(
+                    f"{i + 1:4d}: {ln}" for i, ln in enumerate(shown)
+                )
+                if total > max_lines:
+                    numbered += f"\n     ... ({total - max_lines} more lines — call read_file('{rel_path}') for full content)\n"
+                sections.append(f"=== {rel_path} (total {total} lines) ===\n{numbered}\n")
             except Exception:
                 continue
 
@@ -1188,7 +1192,7 @@ class PlanningPhase(BasePhase):
             return ""
 
         return (
-            "KEY SOURCE FILES (use exact code from these when writing find/replace anchors):\n"
+            "KEY SOURCE FILES (line numbers shown — use them for code.line in each step):\n"
             + "\n".join(sections)
             + "\n"
         )
@@ -1295,25 +1299,62 @@ class PlanningPhase(BasePhase):
                     f"[FILE: {fname}] 'implementation_steps' must be a non-empty array"
                 )
             else:
-                # code must be real implementation (≥20 chars, not just "path: func()")
-                real_code = [
-                    s for s in steps
-                    if isinstance(s, dict)
-                    and len(str(s.get("code", ""))) >= 20
-                    and ":" not in str(s.get("code", "")).split("\n")[0].strip()[:30]
-                ]
-                if not real_code:
-                    sample = next(
-                        (str(s.get("code", ""))[:80] for s in steps if isinstance(s, dict)),
-                        ""
+                for step_idx, step in enumerate(steps):
+                    if not isinstance(step, dict):
+                        continue
+                    code_val = step.get("code")
+                    if code_val is None:
+                        errors.append(
+                            f"[FILE: {fname}] step {step_idx + 1}: missing 'code' field. "
+                            "Every step must have a 'code' dict with file, line, content."
+                        )
+                        continue
+                    # code must be a dict (not a plain string)
+                    if not isinstance(code_val, dict):
+                        errors.append(
+                            f"[FILE: {fname}] step {step_idx + 1}: 'code' must be a JSON object "
+                            f"{{\"file\": \"...\", \"line\": N, \"content\": \"...\"}}, "
+                            f"got {type(code_val).__name__}: {str(code_val)[:60]!r}. "
+                            "WRONG: \"code\": \"some string\". "
+                            "CORRECT: \"code\": {\"file\": \"web/js/app.js\", \"line\": 42, \"content\": \"...\"}"
+                        )
+                        continue
+                    # Validate required dict fields
+                    code_file = code_val.get("file", "")
+                    code_line = code_val.get("line")
+                    code_content = code_val.get("content", "")
+                    if not code_file:
+                        errors.append(
+                            f"[FILE: {fname}] step {step_idx + 1}: code.file is missing or empty. "
+                            "Must be the relative path of the file being changed."
+                        )
+                    if code_line is None:
+                        errors.append(
+                            f"[FILE: {fname}] step {step_idx + 1}: code.line is missing. "
+                            "Must be the line number in the current file where this change goes."
+                        )
+                    if not code_content or not str(code_content).strip():
+                        errors.append(
+                            f"[FILE: {fname}] step {step_idx + 1}: code.content is empty. "
+                            "Must contain the actual code to insert or replace."
+                        )
+                    elif len(str(code_content).strip()) < 5:
+                        errors.append(
+                            f"[FILE: {fname}] step {step_idx + 1}: code.content is too short "
+                            f"({len(str(code_content).strip())} chars). Must be real implementation code."
+                        )
+                    # Reject reference-style content: "path/file.py: function_name()"
+                    _first_line = str(code_content).split("\n")[0].strip()
+                    _ref_pattern = (
+                        _first_line.endswith(")") and ": " in _first_line
+                        and "/" in _first_line.split(":")[0]
                     )
-                    errors.append(
-                        f"[FILE: {fname}] 'code' field contains only pseudo-code or references, "
-                        f"not real implementation. Got: \"{sample}\". "
-                        "The 'code' field must contain actual source code (function bodies, "
-                        "assignments, etc.) that can be copied into the project file — "
-                        "not 'path/file.py: function_name()' references."
-                    )
+                    if _ref_pattern:
+                        errors.append(
+                            f"[FILE: {fname}] step {step_idx + 1}: code.content looks like a "
+                            f"file/function reference: {_first_line[:80]!r}. "
+                            "Must be actual source code, not 'path/file.py: func()' references."
+                        )
 
             for rel_path in modifies:
                 if not os.path.isfile(os.path.join(project_path, rel_path)):
