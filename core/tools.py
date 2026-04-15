@@ -211,9 +211,10 @@ PLANNING_WRITE_FILE = {
         "name": "write_file",
         "description": (
             "Write a planning artifact file. "
-            "ONLY use this to write files inside the task planning directory "
-            "(project_index.json, context.json, requirements.json, spec.json, "
-            "critique_report.json, implementation_plan.json). "
+            "ONLY use this to write files inside the task planning directory. "
+            "Allowed targets: spec.json, requirements.json, context.json, "
+            "or action files inside the actions/ subdirectory "
+            "(e.g. .tasks/task_001/actions/T001.json, T002.json, …). "
             "DO NOT write to any project source files — that is strictly forbidden "
             "during the planning phase. Source code changes are made only in the coding phase."
         ),
@@ -224,7 +225,8 @@ PLANNING_WRITE_FILE = {
                     "type": "string",
                     "description": (
                         "Relative path from the working directory root. "
-                        "Must point to a file inside the task directory (e.g. .tasks/task_001/spec.json). "
+                        "For spec/requirements: .tasks/task_NNN/spec.json. "
+                        "For action files: .tasks/task_NNN/actions/T001.json, T002.json, … "
                         "Never use paths that point to project source files."
                     ),
                 },

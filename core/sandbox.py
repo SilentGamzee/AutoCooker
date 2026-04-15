@@ -130,7 +130,14 @@ class Sandbox:
         # Разрешаем только разрешенные файлы планирования
         filename = os.path.basename(target_abs)
         file_ext = os.path.splitext(filename)[1]
-        
+        parent_dir = os.path.dirname(target_abs)
+        actions_dir = os.path.join(self.task_dir, "actions")
+
+        # ── Разрешаем actions/T*.json — файлы-действия (action files) ──
+        # Путь вида task_dir/actions/T001.json, T002.json, … разрешён всегда.
+        if parent_dir == actions_dir and file_ext == '.json':
+            return True, "OK"
+
         # Проверяем расширение
         if file_ext not in PLANNING_ALLOWED_EXTENSIONS:
             return False, (
@@ -138,18 +145,18 @@ class Sandbox:
                 f"File '{filename}' has extension '{file_ext}'. "
                 f"Planning artifacts must be .json or .md files inside {self.task_dir.replace(os.sep, '/')}/"
             )
-        
+
         # Проверяем имя файла (должно быть в списке разрешенных)
         if filename not in PLANNING_ALLOWED_FILES:
             allowed_list = ', '.join(sorted(PLANNING_ALLOWED_FILES))
             return False, (
                 f"Write blocked: '{filename}' is not a valid planning artifact file. "
                 f"During planning phase you can only write these files: {allowed_list}. "
-                f"All files must be inside {self.task_dir.replace(os.sep, '/')}/"
+                f"To write action files, use the actions/ subdirectory: "
+                f"{actions_dir.replace(os.sep, '/')}/T001.json, T002.json, …"
             )
-        
+
         # Проверяем что файл находится прямо в task_dir, а не в подпапке
-        parent_dir = os.path.dirname(target_abs)
         if parent_dir != self.task_dir:
             return False, (
                 f"Write blocked: planning artifacts must be directly inside task directory, "
