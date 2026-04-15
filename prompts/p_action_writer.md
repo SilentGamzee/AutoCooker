@@ -21,9 +21,10 @@ WRONG: `"code": "web/js/app.js: updateButtons()"` ← file path reference, REJEC
 WRONG: `"code": "core/state.py: clear_task_state()"` ← function reference, REJECTED
 CORRECT: `"code": "function updateButtons(task) {\n  btn.textContent = 'Run';\n}"` ← real code
 
-**RULE 3 — Read source files BEFORE writing action files**
-You must call `read_file` or `read_files_batch` on every file you plan to modify.
-Without reading, you cannot write correct `find`/`insert_after` anchors.
+**RULE 3 — The message already contains KEY SOURCE FILES**
+Use the source file contents provided in the message to write accurate `find`/`replace` anchors.
+If you need additional files not already provided, call `read_file` to get them.
+Copy `find` verbatim from the actual source — never invent code that isn't there.
 
 **RULE 4 — No analysis, review, or test subtasks**
 Do NOT create action files titled "Review…", "Analyze…", "Test…", "Verify…".
@@ -37,8 +38,8 @@ Every action file must produce real code changes.
 Understand what needs to be built.
 
 **Step 2 — Identify which project files need changes**
-From the spec and project file list, determine exactly which files to modify.
-Read each of them with `read_file`.
+Key source files are already provided above in the message. Use them directly.
+If you need a file not yet provided, call `read_file` to fetch it.
 
 **Step 3 — For each file that needs changes, create one action file**
 One file changed = one action file. Group small related changes to the same file together.
@@ -57,7 +58,6 @@ One file changed = one action file. Group small related changes to the same file
   "files_to_create": [],
   "files_to_modify": ["web/js/app.js"],
   "patterns_from": ["web/js/app.js"],
-  "completion_without_ollama": "web/js/app.js contains 'Run'",
   "implementation_steps": [
     {
       "step": 1,

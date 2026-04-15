@@ -1092,6 +1092,8 @@ class PlanningPhase(BasePhase):
         Read spec.json + project files, write one action file per subtask.
         Action files: .tasks/task_NNN/actions/T001.json, T002.json, …
         Auto-removes orphaned action files from previous iterations.
+        Pre-loads top relevant source file contents so the LLM has real code
+        to reference without needing to call read_file first.
         """
         wd = self.task.project_path or self.state.working_dir
         actions_dir = os.path.join(self.task.task_dir, "actions")
@@ -1104,6 +1106,9 @@ class PlanningPhase(BasePhase):
             f"  {p}" for p in self.state.cache.file_paths[:80]
             if not p.startswith(".tasks") and not p.startswith(".git")
         )
+
+        # Pre-load top relevant file contents so LLM can write accurate code
+        file_contents_section = self._load_top_file_contents(wd, top_n=5, max_lines=300)
 
         # Track which action files are written in this run for cleanup
         written_basenames: set[str] = set()
@@ -1126,6 +1131,7 @@ class PlanningPhase(BasePhase):
             f"Description: {self.task.description}\n\n"
             f"SPECIFICATION:\n{spec_content}\n\n"
             f"{critique_section}"
+            f"{file_contents_section}"
             f"Project files available for files_to_modify:\n{existing_files}\n\n"
             f"Write one action file per implementation subtask to: {rel_actions}/\n"
             "Name files: T001.json, T002.json, T003.json, …\n"
@@ -1147,7 +1153,45 @@ class PlanningPhase(BasePhase):
         if ok and written_basenames:
             self._cleanup_orphaned_actions(actions_dir, written_basenames)
 
+        if ok:
+            self._renumber_action_files(actions_dir)
+
         return ok
+
+    def _load_top_file_contents(self, project_path: str, top_n: int = 5, max_lines: int = 300) -> str:
+        """Load contents of top-scored project files for inline context injection.
+
+        Returns a formatted string block with file contents, or empty string if
+        scored_files.json is not available.
+        """
+        top_paths = self._priority_files(top_n=top_n)
+        if not top_paths:
+            return ""
+
+        sections = []
+        for rel_path in top_paths:
+            abs_path = os.path.join(project_path, rel_path)
+            if not os.path.isfile(abs_path):
+                continue
+            try:
+                with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
+                    lines = f.readlines()
+                if len(lines) > max_lines:
+                    content = "".join(lines[:max_lines]) + f"\n... ({len(lines) - max_lines} more lines)"
+                else:
+                    content = "".join(lines)
+                sections.append(f"=== {rel_path} ===\n{content}\n")
+            except Exception:
+                continue
+
+        if not sections:
+            return ""
+
+        return (
+            "KEY SOURCE FILES (use exact code from these when writing find/replace anchors):\n"
+            + "\n".join(sections)
+            + "\n"
+        )
 
     def _cleanup_orphaned_actions(self, actions_dir: str, written_basenames: set[str]):
         """Remove action files not written in this iteration (plan shrank)."""
@@ -1161,6 +1205,47 @@ class PlanningPhase(BasePhase):
                 self.log(f"  ✗ removed orphaned action: {fname}", "warn")
         if removed:
             self.log(f"  Cleaned {len(removed)} orphaned action file(s)", "warn")
+
+    def _renumber_action_files(self, actions_dir: str):
+        """Rename action files to be strictly sequential: T001.json, T002.json, …
+
+        Fixes gaps (e.g. T001, T002, T004 → T001, T002, T003) and updates the
+        'id' field inside each JSON to match the new filename.
+        """
+        if not os.path.isdir(actions_dir):
+            return
+        files = sorted(f for f in os.listdir(actions_dir) if f.endswith(".json"))
+        renamed = []
+        for new_idx, fname in enumerate(files, start=1):
+            new_name = f"T{new_idx:03d}.json"
+            if fname == new_name:
+                # Still update the id field inside to match
+                path = os.path.join(actions_dir, fname)
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    expected_id = f"T-{new_idx:03d}"
+                    if data.get("id") != expected_id:
+                        data["id"] = expected_id
+                        with open(path, "w", encoding="utf-8") as f:
+                            json.dump(data, f, indent=2, ensure_ascii=False)
+                except Exception:
+                    pass
+                continue
+            old_path = os.path.join(actions_dir, fname)
+            new_path = os.path.join(actions_dir, new_name)
+            try:
+                with open(old_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                data["id"] = f"T-{new_idx:03d}"
+                with open(new_path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2, ensure_ascii=False)
+                os.remove(old_path)
+                renamed.append(f"{fname} → {new_name}")
+            except Exception as e:
+                self.log(f"  [WARN] Failed to renumber {fname}: {e}", "warn")
+        if renamed:
+            self.log(f"  Renumbered action files: {', '.join(renamed)}", "info")
 
     def _validate_action_files(self, actions_dir: str, project_path: str) -> tuple[bool, str]:
         """Validate that action files exist and have required structure."""
@@ -3085,20 +3170,18 @@ Be concrete and specific. Return ONLY the JSON, no other text.
                 continue
 
             subtasks.append({
-                "id":                        s.get("id", fname.replace(".json", "")),
-                "title":                     s.get("title", fname),
-                "description":               s.get("description", ""),
-                "completion_with_ollama":    s.get("completion_with_ollama", ""),
-                "completion_without_ollama": s.get("completion_without_ollama", ""),
-                "files_to_create":           s.get("files_to_create", []),
-                "files_to_modify":           s.get("files_to_modify", []),
-                "patterns_from":             s.get("patterns_from", []),
-                "implementation_steps":      s.get("implementation_steps", []),
-                "visual_spec":               s.get("visual_spec", ""),
+                "id":                   s.get("id", fname.replace(".json", "")),
+                "title":                s.get("title", fname),
+                "description":          s.get("description", ""),
+                "files_to_create":      s.get("files_to_create", []),
+                "files_to_modify":      s.get("files_to_modify", []),
+                "patterns_from":        s.get("patterns_from", []),
+                "implementation_steps": s.get("implementation_steps", []),
+                "visual_spec":          s.get("visual_spec", ""),
                 # Preserve status (patch mode may have "done" subtasks)
-                "status":                    s.get("status", "pending"),
+                "status":               s.get("status", "pending"),
                 # Absolute path to action file — used to sync status back on save
-                "action_file":               path,
+                "action_file":          path,
             })
 
         if not subtasks:
