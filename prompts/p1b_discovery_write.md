@@ -68,9 +68,23 @@ Rules:
     "eel_pattern": "@eel.expose in main.py exposes Python to JS as eel.methodName()()"
   },
   "design_tokens": "var(--bg), var(--accent), var(--r6) — copy from CSS DESIGN TOKENS above",
-  "files_read": ["core/state.py", "web/js/app.js"]
+  "files_read": ["core/state.py", "web/js/app.js"],
+  "existing_symbols": {
+    "core/state.py": ["KanbanTask", "AppState", "can_resume", "resume_from_phase", "phase_status"],
+    "web/js/app.js": ["_updateTaskButtons", "runActiveTask", "continueActiveTask", "restartActiveTask", "btn-continue", "btn-restart"]
+  }
 }
 ```
+
+### existing_symbols — REQUIRED when `to_modify` is non-empty
+For every file in `to_modify`, list the top-level symbols you already observed:
+- @dataclass field names (e.g. `can_resume`, `phase_status`, `resume_from_phase`)
+- top-level functions / methods / classes (e.g. `_updateTaskButtons`, `restart_task`)
+- DOM ids referenced in the file (e.g. `btn-continue`, `btn-restart`)
+
+**Do NOT guess** — list only symbols you saw via `read_file`. This prevents the planner
+from proposing "Add can_resume flag" when the flag already exists. The validator reads
+this field and rejects impl_plan subtasks titled "Add X" when X is in the list.
 
 ## CRITICAL
 - `to_reference` must have ≥ entries as `to_modify`

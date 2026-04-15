@@ -8,6 +8,9 @@ Produce `requirements.json` from the task description and project context.
 - If validation failed: call `read_file` first to see current state, then `write_file` with corrected content
 - Do NOT rewrite a file that already satisfies all required fields
 - Do NOT write underscore-prefixed keys (`_version`, `_task`, `_description`, `_criteria`, `_timestamp`, etc.) — use ONLY the exact field names: `task_description`, `workflow_type`, `user_requirements`
+- `user_requirements` must be **plain strings** — NOT objects with `id`/`priority`/`acceptance_criteria`
+- `user_requirements` must contain ONLY what the user explicitly stated — do NOT invent requirements about guards, validation, logging, index updates, or error handling unless the user asked for them
+- For `simple` tasks: maximum 3 requirements
 
 ## WORKFLOW TYPE
 | Task pattern | Type |
@@ -26,7 +29,15 @@ Produce `requirements.json` from the task description and project context.
 }
 ```
 
-- `user_requirements`: concrete list of what the user/system must do (not how to verify it)
+**WRONG — these formats will be rejected:**
+```json
+{"user_requirements": [{"id": "UR-001", "description": "...", "priority": "high"}]}
+```
+```json
+{"user_requirements": [...], "requirements": [{"id": "REQ-001", "acceptance_criteria": [...]}]}
+```
+
+- `user_requirements`: plain strings only — what the user literally said they want, nothing more
 
 ## REQUIRED FIELDS
 `task_description`, `workflow_type`, `user_requirements`

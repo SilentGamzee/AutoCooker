@@ -73,6 +73,14 @@ Each pattern must be an object with `file` and `description` required:
 ```
 Always `read_file` before writing a pattern — `current_code` must be real, not invented.
 
+⚠️ **`patterns` MUST be an array of OBJECTS**, never strings. Freeform pseudocode
+(`"def restart_task(task_id): get_task(task_id)"`) is REJECTED by the validator —
+the planner implements such pseudocode literally, hallucinating any invented
+function names (`get_task`, `log_event`, `update_phase_status` as a free function).
+Only `{file, description, symbol, current_code, proposed_change}` objects referencing
+files you actually read. No `def`/`function`/`class` statements at the root of a
+pattern string.
+
 ## VALIDATION CHECKLIST
 - `overview` ≥ 50 chars
 - `user_flow.steps` non-empty, each step has `step` (number) and `action_name` (string)

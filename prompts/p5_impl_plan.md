@@ -90,6 +90,18 @@ Each step must be **copy-paste ready** — the coding agent must be able to appl
 - `insert_after`: the exact line/block after which to insert (verbatim from the file)
 - `code`: the complete new code to insert
 
+⚠️ **VERBATIM RULE (enforced by validator):** `find` and `insert_after` strings MUST be
+copied **byte-for-byte** from the actual file you read via `read_file`. The validator
+opens each file in `files_to_modify` and searches for your anchor text. If it is not
+found (even with whitespace normalization), the subtask is REJECTED.
+
+This means:
+- NO paraphrasing ("find the line where hasStarted is computed")
+- NO jQuery (`$('#continue-btn')`) if the file uses vanilla DOM (`document.getElementById`)
+- NO `require('eel')` if the file uses global `eel`
+- NO invented method names — if you write `find: "def _reset_subtasks"`, that method must exist
+- Copy at least one distinctive line from the file — short/generic anchors won't match
+
 **Code quality rules:**
 - No ellipsis (`...`), no `# existing code`, no `# TODO`, no `# rest of function`
 - No placeholder comments like `// implementation here`

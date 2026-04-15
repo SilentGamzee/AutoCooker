@@ -128,6 +128,15 @@ def _validate_requirements(path: str) -> tuple[bool, str]:
     user_requirements = data.get("user_requirements")
     if not isinstance(user_requirements, list) or len(user_requirements) == 0:
         return False, f"[FILE: {path}] user_requirements must be a non-empty list"
+    # user_requirements must be plain strings, not objects
+    non_strings = [i for i, r in enumerate(user_requirements) if not isinstance(r, str)]
+    if non_strings:
+        return False, (
+            f"[FILE: {path}] user_requirements items must be plain strings, not objects. "
+            f"Items at indices {non_strings[:3]} are {type(user_requirements[non_strings[0]]).__name__}. "
+            f"WRONG: [{{\"id\": \"UR-001\", \"description\": \"...\"}}] "
+            f"CORRECT: [\"User requirement as a plain string\"]"
+        )
     return True, "OK"
 
 
@@ -282,7 +291,10 @@ def _validate_spec_json(path: str) -> tuple[bool, str]:
     else:
         return False, f"[FILE: {path}] 'user_flow' must be an object or array"
 
-    # Validate patterns — objects with file+description required (strings tolerated for compat)
+    # Validate patterns — must be objects {file, description} referencing REAL files.
+    # NEW-40: reject freeform pseudocode strings that seed hallucinations.
+    # task_021 wrote patterns like "def restart_task(task_id): get_task(task_id)"
+    # — the planner then implemented get_task() (a nonexistent function) literally.
     patterns = spec.get("patterns")
     if patterns is not None:
         if not isinstance(patterns, list):
@@ -292,8 +304,29 @@ def _validate_spec_json(path: str) -> tuple[bool, str]:
                 for req_field in ("file", "description"):
                     if req_field not in pat:
                         return False, f"[FILE: {path}] patterns[{i}] missing required field: '{req_field}'"
-            elif not isinstance(pat, str):
-                return False, f"[FILE: {path}] patterns[{i}] must be a string or object"
+            elif isinstance(pat, str):
+                # Detect pseudocode: def / function / class / return / if ... :
+                _pat_s = pat.strip()
+                _pseudocode_markers = (
+                    _pat_s.startswith("def ")
+                    or _pat_s.startswith("function ")
+                    or _pat_s.startswith("class ")
+                    or _pat_s.startswith("async def ")
+                    or _pat_s.startswith("// ")
+                    or _pat_s.startswith("# ")
+                    or ("return " in _pat_s and "{" in _pat_s)
+                    or ("=> " in _pat_s and "{" in _pat_s)
+                )
+                if _pseudocode_markers:
+                    return False, (
+                        f"[FILE: {path}] patterns[{i}] is freeform pseudocode: "
+                        f"{_pat_s[:80]!r}. Patterns must be objects "
+                        f"{{file, description}} referencing a REAL file in the project. "
+                        f"Do NOT write code snippets here — the planner will implement "
+                        f"them literally, hallucinating any invented function names."
+                    )
+            else:
+                return False, f"[FILE: {path}] patterns[{i}] must be a dict {{file, description}}"
 
     return True, "OK"
 
@@ -303,6 +336,56 @@ def _validate_impl_plan(path: str, project_path: str = "") -> tuple[bool, str]:
     ok, data, err = _read_json(path)
     if not ok:
         return False, f"[FILE: {path}] {err}"
+
+    # NEW-32: load spec.json from the same directory to enforce task_scope.will_not_do.
+    # Forbidden file extensions are derived from the keywords in will_not_do entries.
+    _forbidden_exts: set = set()
+    _forbidden_reasons: list = []
+    try:
+        _spec_path_same_dir = os.path.join(os.path.dirname(path), "spec.json")
+        if os.path.isfile(_spec_path_same_dir):
+            import json as _json_spec
+            with open(_spec_path_same_dir, encoding="utf-8") as _sf:
+                _spec = _json_spec.load(_sf)
+            # NEW-38: accept both 'will_not_do' (preferred) and 'excluded' (legacy)
+            # as task_scope synonyms — models emit both variants. Also scan root-level
+            # 'wont_do' for completeness.
+            _ts = _spec.get("task_scope", {}) or {}
+            _will_not = (
+                list(_ts.get("will_not_do", []) or [])
+                + list(_ts.get("excluded", []) or [])
+                + list(_ts.get("wont_do", []) or [])
+            )
+            _FORBID_KW_MAP = [
+                (("css", "styling", "style changes"), (".css",)),
+                (("html", "markup", "structural"),    (".html", ".htm")),
+            ]
+            for _entry in _will_not:
+                _e_lower = str(_entry).lower()
+                for _keywords, _exts in _FORBID_KW_MAP:
+                    if any(k in _e_lower for k in _keywords):
+                        _forbidden_exts.update(_exts)
+                        _forbidden_reasons.append(_entry)
+                        break
+    except Exception:
+        pass
+
+    # NEW-33: load context.json → existing_symbols to catch "Add X" subtasks
+    # when X already exists in the target file.
+    _existing_symbols: dict = {}
+    try:
+        _ctx_path_same_dir = os.path.join(os.path.dirname(path), "context.json")
+        if os.path.isfile(_ctx_path_same_dir):
+            import json as _json_ctx
+            with open(_ctx_path_same_dir, encoding="utf-8") as _cf:
+                _ctx = _json_ctx.load(_cf)
+            _es = _ctx.get("existing_symbols") or {}
+            if isinstance(_es, dict):
+                for _fp, _syms in _es.items():
+                    if isinstance(_syms, list):
+                        _existing_symbols[_fp] = {str(x).strip() for x in _syms if x}
+    except Exception:
+        pass
 
     # Normalize: rename 'code_snippet' → 'code' in all implementation_steps.
     # Models sometimes generate 'code_snippet' despite prompt instructions.
@@ -458,6 +541,86 @@ def _validate_impl_plan(path: str, project_path: str = "") -> tuple[bool, str]:
                             f"empty 'code' — remove placeholder steps like 'Read current X' and "
                             f"'Test modified X'. Every step must contain actual code to implement."
                         )
+
+                    # NEW-30: verify 'find' and 'insert_after' anchors actually appear
+                    # in the target files. Catches hallucinated code (e.g. jQuery in
+                    # a vanilla-JS file, invented method names, require('eel')).
+                    if project_path:
+                        _files_to_mod = s.get("files_to_modify", []) or []
+                        _file_contents_cache: dict = {}
+                        for _step_idx, _st in enumerate(steps):
+                            if not isinstance(_st, dict):
+                                continue
+                            _anchor = _st.get("find") or _st.get("insert_after") or ""
+                            if not _anchor or not _anchor.strip():
+                                continue
+                            # Only check anchors long enough to be meaningful
+                            if len(_anchor.strip()) < 15:
+                                continue
+                            _anchor_norm = " ".join(_anchor.split())
+                            _found = False
+                            _checked_any = False
+                            for _fp in _files_to_mod:
+                                if not _fp:
+                                    continue
+                                _full = os.path.join(project_path, _fp)
+                                if not os.path.isfile(_full):
+                                    continue
+                                _checked_any = True
+                                if _fp not in _file_contents_cache:
+                                    try:
+                                        with open(_full, encoding="utf-8") as _fh:
+                                            _file_contents_cache[_fp] = " ".join(_fh.read().split())
+                                    except Exception:
+                                        _file_contents_cache[_fp] = ""
+                                if _anchor_norm in _file_contents_cache[_fp]:
+                                    _found = True
+                                    break
+                            if _checked_any and not _found:
+                                _anchor_key = "find" if _st.get("find") else "insert_after"
+                                sub_errors.append(
+                                    f"implementation_steps[{_step_idx}].{_anchor_key} "
+                                    f"not found verbatim in any files_to_modify "
+                                    f"({_files_to_mod}). Anchor must be copied exactly from "
+                                    f"the actual file content — invented/paraphrased text is "
+                                    f"rejected. First 100 chars: {_anchor.strip()[:100]!r}"
+                                )
+            # NEW-39: detect framework hallucinations. This codebase uses Eel
+            # (@eel.expose on the Python side, eel.methodName() on the JS side).
+            # Models frequently hallucinate Flask/Bottle routes, jsonify, and raw
+            # fetch('/api/...') calls. Scan each step's code for these patterns.
+            _FRAMEWORK_ANTIPATTERNS = [
+                (r"@\s*(?:app|bp|blueprint)\s*\.\s*route\b",
+                 "@app.route / @bp.route (Flask/Bottle) — this project uses Eel: use @eel.expose"),
+                (r"@\s*route\s*\(",
+                 "@route(...) (Bottle) — this project uses Eel: use @eel.expose"),
+                (r"\bjsonify\s*\(",
+                 "jsonify(...) (Flask) — Eel @eel.expose functions return dicts directly"),
+                (r"\bfrom\s+flask\b|\bimport\s+flask\b",
+                 "flask import — this project uses Eel, not Flask"),
+                (r"\bfrom\s+bottle\b|\bimport\s+bottle\b",
+                 "bottle import — this project uses Eel"),
+                (r"\brequire\s*\(\s*['\"]eel['\"]\s*\)",
+                 "require('eel') — frontend uses global `eel`, not CommonJS require"),
+                (r"fetch\s*\(\s*['\"][^'\"]*\/api\/",
+                 "fetch('/api/...') — frontend talks to backend via eel.methodName(), not HTTP"),
+            ]
+            import re as _re_fw
+            for _step_idx, _st in enumerate(steps if isinstance(steps, list) else []):
+                if not isinstance(_st, dict):
+                    continue
+                _code = _st.get("code", "") or ""
+                if not _code.strip():
+                    continue
+                for _pat, _why in _FRAMEWORK_ANTIPATTERNS:
+                    if _re_fw.search(_pat, _code):
+                        sub_errors.append(
+                            f"implementation_steps[{_step_idx}].code contains "
+                            f"{_why}. Rewrite using the project's actual stack "
+                            f"(Eel @eel.expose on Python side, `eel.fnName()` on JS side)."
+                        )
+                        break
+
             if sub_errors:
                 errors.append(f"Subtask {s.get('id','?')}: {', '.join(sub_errors)}")
             else:
@@ -483,6 +646,112 @@ def _validate_impl_plan(path: str, project_path: str = "") -> tuple[bool, str]:
                             f"Subtask {s.get('id','?')}: files_to_modify '{fpath}' "
                             f"does not exist in the project (this is OK if file will be created earlier)"
                         )
+
+    # NEW-31 + NEW-41: detect duplicate subtasks across phases.
+    # Phase 1: exact match (same title + same file set) — original NEW-31.
+    # Phase 2: functional overlap — same single target file + ≥60% title word
+    #          Jaccard similarity. Catches task_021's T-001/T-002 both modifying
+    #          core/state.py with overlapping logging scope.
+    _STOPWORDS = {
+        "the", "a", "an", "and", "or", "of", "to", "for", "in", "on", "with",
+        "from", "by", "at", "as", "is", "be", "add", "new", "update", "modify",
+        "fix", "implement", "create", "handle", "ensure", "support",
+    }
+    def _title_words(t: str) -> set:
+        import re as _rew
+        return {
+            w for w in _rew.findall(r"[A-Za-z_][A-Za-z0-9_]+", t.lower())
+            if len(w) > 2 and w not in _STOPWORDS
+        }
+    _seen_sigs: dict = {}   # exact signature → first-seen subtask id
+    _by_file: dict = {}     # single file → list of (id, title, words)
+    for s in all_subtasks:
+        _d_title = s.get("title", "").strip().lower()
+        if not _d_title:
+            continue
+        _d_files = tuple(sorted(
+            (s.get("files_to_modify", []) or []) + (s.get("files_to_create", []) or [])
+        ))
+        _sig = f"{_d_title}|{_d_files}"
+        if _sig in _seen_sigs:
+            errors.append(
+                f"Subtask {s.get('id','?')}: duplicate of {_seen_sigs[_sig]} "
+                f"(identical title and files). Remove one copy or merge them into a single "
+                f"subtask. Title: {s.get('title','')[:60]!r}"
+            )
+            continue
+        _seen_sigs[_sig] = s.get("id", "?")
+        # NEW-41: functional overlap — only when subtask targets exactly one file
+        if len(_d_files) == 1:
+            _fp_key = _d_files[0]
+            _words = _title_words(_d_title)
+            if _words:
+                for _prev_id, _prev_title, _prev_words in _by_file.get(_fp_key, []):
+                    _inter = _words & _prev_words
+                    _union = _words | _prev_words
+                    if _union and len(_inter) / len(_union) >= 0.6:
+                        errors.append(
+                            f"Subtask {s.get('id','?')}: functional overlap with {_prev_id} "
+                            f"(both modify {_fp_key}, title similarity "
+                            f"{len(_inter)}/{len(_union)}). Merge them into a single "
+                            f"subtask. Titles: {s.get('title','')[:50]!r} vs {_prev_title[:50]!r}"
+                        )
+                        break
+                _by_file.setdefault(_fp_key, []).append(
+                    (s.get("id", "?"), s.get("title", ""), _words)
+                )
+
+    # NEW-32: enforce spec.task_scope.will_not_do — reject subtasks touching
+    # forbidden file extensions.
+    if _forbidden_exts:
+        for s in all_subtasks:
+            _sfiles = (s.get("files_to_modify", []) or []) + (s.get("files_to_create", []) or [])
+            _violating = [f for f in _sfiles if any(f.endswith(e) for e in _forbidden_exts)]
+            if _violating:
+                errors.append(
+                    f"Subtask {s.get('id','?')}: touches {_violating} which violates "
+                    f"spec.task_scope.will_not_do: {_forbidden_reasons}. "
+                    f"Remove this subtask — it is explicitly out of scope."
+                )
+
+    # NEW-33 + NEW-41: reject "Add X" / "Implement X" / "Create X" subtasks when X
+    # already exists in the target file. Uses context.json → existing_symbols
+    # populated by discovery phase. Expanded prefix list catches task_021's
+    # T-003 "Implement restart_task()" when main.py already defines restart_task.
+    if _existing_symbols:
+        import re as _re_ns
+        _ADD_PREFIXES = (
+            "add ", "create ", "introduce ", "implement ", "implement new ",
+            "define ", "write ",
+        )
+        for s in all_subtasks:
+            _t = s.get("title", "").strip().lower()
+            if not any(_t.startswith(p) for p in _ADD_PREFIXES):
+                continue
+            # Extract identifier-like tokens from the title
+            _cands = _re_ns.findall(r"[`']?([A-Za-z_][A-Za-z0-9_]{2,})[`']?", s.get("title", ""))
+            _files = s.get("files_to_modify", []) or []
+            _hit = None
+            for _cand in _cands:
+                # Skip common English words
+                if _cand.lower() in {"add", "create", "introduce", "implement", "new",
+                                      "the", "for", "and", "with", "flag", "field",
+                                      "method", "function", "class", "from"}:
+                    continue
+                for _fp in _files:
+                    if _cand in _existing_symbols.get(_fp, set()):
+                        _hit = (_cand, _fp)
+                        break
+                if _hit:
+                    break
+            if _hit:
+                errors.append(
+                    f"Subtask {s.get('id','?')}: title says 'add {_hit[0]}' but "
+                    f"{_hit[0]!r} already exists in {_hit[1]} "
+                    f"(per context.json → existing_symbols). "
+                    f"Either remove this subtask or retitle to 'Modify'/'Extend'/'Reset' "
+                    f"to reflect that you are changing existing behavior."
+                )
 
     # Reject verify-only subtasks that have no files to write.
     # These are planning drift — they describe checking, not building.
@@ -1036,6 +1305,127 @@ class PlanningPhase(BasePhase):
             ok2, m2 = validate_json_file(context_path)
             if not ok2:
                 return False, f"context.json: {m2}"
+            # NEW-37: enforce context.json has the actual fields the downstream
+            # planner consumes. Previously this validator only checked JSON parses,
+            # so discovery could write a context.json full of CSS tokens and zero
+            # task-relevant structure — NEW-33 existing_symbols check was inert.
+            try:
+                import json as _json_ctx_v
+                with open(context_path, encoding="utf-8") as _cvf:
+                    _ctx_v = _json_ctx_v.load(_cvf)
+                if not isinstance(_ctx_v, dict):
+                    return False, "context.json: root must be a JSON object"
+                _trf = _ctx_v.get("task_relevant_files")
+                if not isinstance(_trf, dict):
+                    return False, (
+                        "context.json: missing required key 'task_relevant_files' "
+                        "(must be an object with to_modify/to_reference/to_create arrays). "
+                        "CSS tokens are NOT a substitute — list the actual source files "
+                        "the planner should touch."
+                    )
+                _to_mod = _trf.get("to_modify") or []
+                _to_ref = _trf.get("to_reference") or []
+                if not isinstance(_to_mod, list):
+                    return False, "context.json: task_relevant_files.to_modify must be an array"
+                if not isinstance(_to_ref, list):
+                    return False, "context.json: task_relevant_files.to_reference must be an array"
+                if len(_to_mod) == 0:
+                    return False, (
+                        "context.json: task_relevant_files.to_modify is empty. "
+                        "Every task touches at least one source file — list the files "
+                        "you will modify with {path, reason}."
+                    )
+                # existing_symbols is MANDATORY when to_modify is non-empty so that
+                # NEW-33 can block "Add X" subtasks for symbols that already exist.
+                # NEW-38: auto-populate from global project index if LLM forgot to write it.
+                _es = _ctx_v.get("existing_symbols")
+
+                def _norm_path(p):
+                    if isinstance(p, str):
+                        return p.replace("\\", "/").strip()
+                    if isinstance(p, dict):
+                        return str(p.get("path", "")).replace("\\", "/").strip()
+                    return ""
+
+                _mod_paths = {_norm_path(p) for p in _to_mod if _norm_path(p)}
+
+                if not isinstance(_es, dict) or not _es:
+                    # Try to auto-fill from global project index before failing
+                    _global_idx_path = os.path.join(
+                        os.path.dirname(os.path.dirname(context_path)), "project_index.json"
+                    )
+                    _auto_es = {}
+                    try:
+                        import json as _json_idx
+                        with open(_global_idx_path, encoding="utf-8") as _gf:
+                            _global_idx = _json_idx.load(_gf)
+                        for _mp in _mod_paths:
+                            _syms = []
+                            if _mp in _global_idx and isinstance(_global_idx[_mp], dict):
+                                _syms = _global_idx[_mp].get("symbols") or []
+                            if _syms:
+                                _auto_es[_mp] = _syms
+                    except Exception:
+                        pass
+                    if _auto_es:
+                        # Patch context.json in-place with auto-extracted symbols
+                        _ctx_v["existing_symbols"] = _auto_es
+                        import json as _json_patch
+                        with open(context_path, "w", encoding="utf-8") as _pf:
+                            _json_patch.dump(_ctx_v, _pf, ensure_ascii=False, indent=2)
+                        _es = _auto_es
+                    else:
+                        return False, (
+                            "context.json: missing required key 'existing_symbols' "
+                            "(object keyed by file path → list of symbol names already "
+                            "present in that file). This is REQUIRED when to_modify is "
+                            "non-empty — the planner uses it to avoid proposing 'Add X' "
+                            "when X already exists. Read each to_modify file and list its "
+                            "top-level functions, classes, dataclass fields, and DOM ids."
+                        )
+                _es_keys   = {_norm_path(k) for k in _es.keys()}
+                _missing = _mod_paths - _es_keys
+                if _missing:
+                    # Try to fill missing entries from global project index
+                    _global_idx_path2 = os.path.join(
+                        os.path.dirname(os.path.dirname(context_path)), "project_index.json"
+                    )
+                    try:
+                        import json as _json_idx2
+                        with open(_global_idx_path2, encoding="utf-8") as _gf2:
+                            _global_idx2 = _json_idx2.load(_gf2)
+                        _patched = False
+                        for _mp in _missing:
+                            _syms2 = []
+                            if _mp in _global_idx2 and isinstance(_global_idx2[_mp], dict):
+                                _syms2 = _global_idx2[_mp].get("symbols") or []
+                            if _syms2:
+                                _es[_mp] = _syms2
+                                _patched = True
+                        if _patched:
+                            _ctx_v["existing_symbols"] = _es
+                            import json as _json_patch2
+                            with open(context_path, "w", encoding="utf-8") as _pf2:
+                                _json_patch2.dump(_ctx_v, _pf2, ensure_ascii=False, indent=2)
+                            _missing -= set(_es.keys())
+                    except Exception:
+                        pass
+                if _missing:
+                    return False, (
+                        f"context.json: existing_symbols is missing entries for "
+                        f"to_modify files: {sorted(_missing)}. Every file in "
+                        f"task_relevant_files.to_modify must have a corresponding "
+                        f"existing_symbols[path] list of symbols you read via read_file."
+                    )
+                for _k, _v in _es.items():
+                    if not isinstance(_v, list) or len(_v) == 0:
+                        return False, (
+                            f"context.json: existing_symbols[{_k!r}] must be a "
+                            f"non-empty list of symbol names. Empty lists are not "
+                            f"allowed — read the file and list its actual symbols."
+                        )
+            except Exception as _e:
+                return False, f"context.json: schema check failed: {_e}"
             return True, "OK"
 
         # ── Reset TTL for all Phase A files before entering Phase B ──
@@ -1053,10 +1443,10 @@ class PlanningPhase(BasePhase):
             write_msg,
             validate,
             model,
-            max_outer_iterations=5,
+            max_outer_iterations=6,
             file_ttl=12,
             shared_last_read_files=shared_read_files,
-            reconstruct_after=3,
+            reconstruct_after=None,  # NEW-38: RECONSTRUCT rules are impl_plan-specific, confuse model here
             min_rounds_before_confirm=2,
         )
     # ── 1.2 Requirements ──────────────────────────────────────────
@@ -2023,16 +2413,16 @@ Be concrete and specific. Return ONLY the JSON, no other text.
         ctx_content  = self._read_file_safe(context_path)
 
         sub_phases = [
-            ("1.4a Critique: Scope",      "p4a_critique_scope.md",      "critique_scope.json"),
-            ("1.4b Critique: Symbols",    "p4b_critique_symbols.md",    "critique_symbols.json"),
-            ("1.4c Critique: Simplicity", "p4c_critique_simplicity.md", "critique_simplicity.json"),
+            ("1.4a Critique: Scope",      "p4a_critique_scope.md",      "critique_scope.json",      "scope"),
+            ("1.4b Critique: Symbols",    "p4b_critique_symbols.md",    "critique_symbols.json",    "symbols"),
+            ("1.4c Critique: Simplicity", "p4c_critique_simplicity.md", "critique_simplicity.json", "simplicity"),
         ]
 
         all_issues: list = []
         any_fixes = False
         shared_reads: dict = {}   # shared file-read cache across sub-phases (SIMP-5)
 
-        for step_name, prompt_file, output_filename in sub_phases:
+        for step_name, prompt_file, output_filename, expected_sub_phase in sub_phases:
             self.log(f"  ─── {step_name} ───", "info")
             output_path = os.path.join(self.task.task_dir, output_filename)
             executor    = self._make_planning_executor(wd)
@@ -2046,7 +2436,7 @@ Be concrete and specific. Return ONLY the JSON, no other text.
                 f"If you fix issues in spec.json, rewrite it at: {self._rel(spec_path)}\n"
             )
 
-            def _make_validator(out_path=output_path, sp=spec_path):
+            def _make_validator(out_path=output_path, sp=spec_path, expected=expected_sub_phase):
                 def validate():
                     ok, err = validate_json_file(out_path)
                     if not ok:
@@ -2067,6 +2457,132 @@ Be concrete and specific. Return ONLY the JSON, no other text.
                                 f"Output must be a flat JSON object with 'issues' at the root level, "
                                 f"not wrapped inside another key. Keys found: {list(d.keys())[:5]}"
                             )
+
+                        # NEW-35: auto-normalize known-fixable fields before strict whitelist.
+                        # This saves 1-2 retry rounds for fields the validator already knows
+                        # the correct value for.
+                        _mutated = False
+                        # 1. sub_phase: we know the exact expected value — override any variant.
+                        if d.get("sub_phase") != expected:
+                            d["sub_phase"] = expected
+                            _mutated = True
+                        # 2. passed: default to True if missing or non-bool
+                        if not isinstance(d.get("passed"), bool):
+                            d["passed"] = True
+                            _mutated = True
+                        # 3. fixes_applied: default to 0 if missing or non-int
+                        if not isinstance(d.get("fixes_applied"), int):
+                            d["fixes_applied"] = 0
+                            _mutated = True
+                        # 4. summary: synthesize from issue count if missing
+                        if not isinstance(d.get("summary"), str) or not d["summary"].strip():
+                            _n = len(d.get("issues", []))
+                            d["summary"] = f"{expected} critique: {_n} issue(s) found."
+                            _mutated = True
+                        # 5. files_read: if missing, try to populate from common English-named
+                        # keys the model may have used instead ("read_files", "inspected_files")
+                        if "files_read" not in d:
+                            for _alt_key in ("read_files", "inspected_files", "files_inspected", "reviewed_files"):
+                                if isinstance(d.get(_alt_key), list):
+                                    d["files_read"] = d.pop(_alt_key)
+                                    _mutated = True
+                                    break
+
+                        # NEW-29: enforce exact key whitelist — reject hallucinated schemas
+                        # like {critique_type, critique_summary, recommendations, ...}.
+                        ALLOWED = {"sub_phase", "files_read", "issues", "fixes_applied", "passed", "summary"}
+                        REQUIRED = {"sub_phase", "issues", "passed"}
+
+                        # NEW-35: auto-strip known-safe narrative keys (pure description with no
+                        # validation impact). Prevents retry loops on keys like critique_summary /
+                        # validation_notes that models habitually add.
+                        _STRIPPABLE = {
+                            "critique_summary", "critique_title", "critique_type",
+                            "validation_notes", "recommendations", "notes", "conclusion",
+                            "timestamp", "task_id", "spec_version", "generated_at",
+                            "scope_summary", "assessment_summary", "component_analysis",
+                            "complexity_benchmarks", "sub_phases", "overall_goal",
+                        }
+                        for _sk in list(d.keys()):
+                            if _sk in _STRIPPABLE and _sk not in ALLOWED:
+                                d.pop(_sk, None)
+                                _mutated = True
+
+                        # Persist normalization so downstream readers see the clean file.
+                        if _mutated:
+                            try:
+                                with open(out_path, "w", encoding="utf-8") as _fw:
+                                    _json.dump(d, _fw, indent=2, ensure_ascii=False)
+                            except Exception:
+                                pass
+
+                        extra = set(d.keys()) - ALLOWED
+                        if extra:
+                            return False, (
+                                f"{os.path.basename(out_path)}: unknown top-level keys {sorted(extra)}. "
+                                f"Output must contain ONLY {sorted(ALLOWED)}. "
+                                f"Remove {sorted(extra)} and rewrite. "
+                                f"Common WRONG keys: critique_title, critique_type, critique_summary, "
+                                f"recommendations, scope_summary, assessment_summary, component_analysis, "
+                                f"task_id, timestamp — none of these are allowed."
+                            )
+                        missing = REQUIRED - set(d.keys())
+                        if missing:
+                            return False, (
+                                f"{os.path.basename(out_path)}: missing required keys {sorted(missing)}. "
+                                f"Required: {sorted(REQUIRED)}."
+                            )
+                        if not isinstance(d.get("issues"), list):
+                            return False, (
+                                f"{os.path.basename(out_path)}: 'issues' must be a list, "
+                                f"got {type(d.get('issues')).__name__}."
+                            )
+
+                        # NEW-34: require that critic actually read ≥2 real project files.
+                        # Prevents stub reviews like "passed: true, files_read: []" that
+                        # rubber-stamp hallucinated plans without analysis.
+                        files_read_list = d.get("files_read", [])
+                        if not isinstance(files_read_list, list):
+                            return False, (
+                                f"{os.path.basename(out_path)}: 'files_read' must be an array "
+                                f"of project-relative file paths."
+                            )
+                        # NEW-36: exclude .tasks/ artifacts (spec.json, requirements.json,
+                        # context.json, project_index.json) — these are planning outputs, not
+                        # source code. A critic reading only .tasks/*.json hasn't inspected the
+                        # codebase and cannot detect hallucinated method names, missing fields,
+                        # or wrong frameworks. Require actual project source files.
+                        _SOURCE_EXTS = (
+                            ".py", ".js", ".jsx", ".ts", ".tsx", ".html", ".htm",
+                            ".css", ".scss", ".md", ".json", ".yaml", ".yml",
+                        )
+                        real_reads = [
+                            f for f in files_read_list
+                            if isinstance(f, str) and f.strip()
+                            and not f.startswith("N/A") and "/" in f
+                            and not f.startswith(".tasks/")
+                            and ".tasks/" not in f.replace("\\", "/")
+                            and f.lower().endswith(_SOURCE_EXTS)
+                            # Exclude the planning artifacts even if path is rewritten
+                            and os.path.basename(f) not in {
+                                "spec.json", "requirements.json", "context.json",
+                                "project_index.json", "scored_files.json",
+                                "critique_scope.json", "critique_symbols.json",
+                                "critique_simplicity.json", "critique_report.json",
+                                "implementation_plan.json",
+                            }
+                        ]
+                        if len(real_reads) < 2:
+                            return False, (
+                                f"{os.path.basename(out_path)}: files_read must contain ≥2 real "
+                                f"PROJECT SOURCE files (e.g. main.py, core/state.py, web/js/app.js) "
+                                f"that you read via read_file. "
+                                f".tasks/ planning artifacts (spec.json, requirements.json, context.json, "
+                                f"project_index.json) do NOT count — a critic must inspect the actual "
+                                f"codebase to detect hallucinations. "
+                                f"Got: {files_read_list!r}. "
+                                f"Read at least the files listed in context.json → to_modify and retry."
+                            )
                     except Exception as e:
                         return False, f"{os.path.basename(out_path)}: {e}"
                     return _validate_spec_json(sp)
@@ -2075,7 +2591,7 @@ Be concrete and specific. Return ONLY the JSON, no other text.
             ok = self.run_loop(
                 step_name, prompt_file,
                 PLANNING_TOOLS, executor, msg, _make_validator(),
-                model, max_outer_iterations=3,
+                model, max_outer_iterations=5,
                 shared_last_read_files=shared_reads,
             )
 

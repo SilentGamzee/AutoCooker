@@ -7,7 +7,7 @@ def get_dumb_task_workdir_diff(state:AppState, task_id: str) -> dict:
     if not task or not task.task_dir:
         return {"ok": False, "error": "Task not found"}
 
-    from core.sandbox import WORKDIR_NAME
+    from core.sandbox import WORKDIR_NAME, PLANNING_ALLOWED_FILES
     workdir = os.path.join(task.task_dir, WORKDIR_NAME)
     project = task.project_path or state.working_dir
 
@@ -25,6 +25,9 @@ def get_dumb_task_workdir_diff(state:AppState, task_id: str) -> dict:
         dirs[:] = [d for d in dirs if not any(pat in d for pat in _SKIP)]
         for fname in files:
             if any(pat in fname for pat in _SKIP):
+                continue
+            # Skip AutoCooker system/artifact files (planning + coding critic outputs)
+            if fname in PLANNING_ALLOWED_FILES:
                 continue
             wfile = os.path.join(dirpath, fname)
             rel   = os.path.relpath(wfile, workdir).replace("\\", "/")
