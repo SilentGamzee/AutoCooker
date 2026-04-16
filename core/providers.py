@@ -178,6 +178,21 @@ class ProvidersManager:
                     return p.is_active
         return None
 
+    def update(self, provider_id: str, name: str = None, base_url: str = None, api_key: str = None) -> Optional[ProviderConfig]:
+        """Update mutable fields of a provider. Pass None to leave a field unchanged."""
+        with self._lock:
+            for p in self._providers:
+                if p.id == provider_id:
+                    if name is not None:
+                        p.name = name
+                    if base_url is not None:
+                        p.base_url = base_url.rstrip("/")
+                    if api_key is not None:
+                        p.api_key = api_key
+                    self._save()
+                    return p
+        return None
+
     def set_active(self, provider_id: str, active: bool) -> bool:
         with self._lock:
             for p in self._providers:
@@ -199,6 +214,8 @@ class ProvidersManager:
 
     def fetch_models_for(self, provider: ProviderConfig) -> list[str]:
         """Fetch model list from a single provider."""
+        if provider.type == "gemini":
+            return self._fetch_gemini_models(provider)
         url = f"{self._api_base(provider)}/models"
         headers = {}
         if provider.api_key:
@@ -207,6 +224,41 @@ class ProvidersManager:
             r = requests.get(url, headers=headers, timeout=5)
             r.raise_for_status()
             return [m["id"] for m in r.json().get("data", [])]
+        except Exception as e:
+            print(f"[ProvidersManager] fetch_models {provider.name}: {e}", flush=True)
+            return []
+
+    def _fetch_gemini_models(self, provider: ProviderConfig) -> list[str]:
+        """
+        Fetch model list via the native Gemini REST API.
+
+        The OpenAI-compat /models endpoint returns 400 for Gemini.
+        The native endpoint is GET /v1beta/models?key=API_KEY and returns
+        models whose name is like "models/gemini-2.0-flash". We filter to
+        those that support generateContent (i.e. chat-capable) and strip
+        the "models/" prefix so the id matches what chat/completions expects.
+        """
+        if not provider.api_key:
+            print(f"[ProvidersManager] fetch_models {provider.name}: no API key set", flush=True)
+            return []
+        # Base host: strip the /v1beta/openai path, use just the host root
+        from urllib.parse import urlparse
+        parsed = urlparse(provider.base_url)
+        host_root = f"{parsed.scheme}://{parsed.netloc}"
+        url = f"{host_root}/v1beta/models"
+        try:
+            r = requests.get(url, params={"key": provider.api_key}, timeout=8)
+            r.raise_for_status()
+            models = []
+            for m in r.json().get("models", []):
+                methods = m.get("supportedGenerationMethods", [])
+                if "generateContent" not in methods:
+                    continue
+                name = m.get("name", "")          # "models/gemini-2.0-flash"
+                model_id = name.split("/", 1)[-1]  # "gemini-2.0-flash"
+                if model_id:
+                    models.append(model_id)
+            return models
         except Exception as e:
             print(f"[ProvidersManager] fetch_models {provider.name}: {e}", flush=True)
             return []
@@ -236,20 +288,35 @@ class ProvidersManager:
                 return p
         return None
 
+    # Cloud provider types that should use a shorter read timeout
+    _CLOUD_TYPES = {"omniroute", "gemini"}
+
+    def _read_timeout_for(self, provider: ProviderConfig) -> int:
+        """120s for cloud APIs, 600s for local providers."""
+        return 120 if provider.type in self._CLOUD_TYPES else 600
+
+    def _make_client(self, provider: ProviderConfig) -> "OllamaClient":
+        from core.ollama_client import OllamaClient
+        return OllamaClient(
+            base_url=provider.base_url,
+            api_key=provider.api_key,
+            read_timeout=self._read_timeout_for(provider),
+            auth_style="urllib" if provider.type == "gemini" else "bearer",
+        )
+
     def make_client_for_model(self, model_id: str) -> "OllamaClient":
         """
         Return an OllamaClient configured for the provider that has model_id.
         Falls back to the first active provider if model cannot be found.
         """
-        from core.ollama_client import OllamaClient  # local import to avoid circular
         for p in self.get_active():
             if model_id in self.fetch_models_for(p):
-                return OllamaClient(base_url=p.base_url, api_key=p.api_key)
+                return self._make_client(p)
         # Fallback: first active provider
         active = self.get_active()
         if active:
-            p = active[0]
-            return OllamaClient(base_url=p.base_url, api_key=p.api_key)
+            return self._make_client(active[0])
+        from core.ollama_client import OllamaClient
         return OllamaClient()  # default LM Studio
 
     def check_models_available(self, model_ids: list[str]) -> dict:

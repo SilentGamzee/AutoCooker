@@ -1198,33 +1198,109 @@ async function renderProviderList() {
     listEl.innerHTML = '<div class="prov-empty">No providers configured</div>';
     return;
   }
+  const typeLabels = { lmstudio: 'LM Studio', omniroute: 'OmniRoute', gemini: 'Gemini' };
   listEl.innerHTML = providers.map(p => {
     const activeClass = p.is_active ? 'prov-active' : 'prov-inactive';
     const activeLabel = p.is_active ? 'Active' : 'Inactive';
-    const typeLabels  = { lmstudio: 'LM Studio', omniroute: 'OmniRoute', gemini: 'Gemini' };
     const typeLabel   = typeLabels[p.type] || p.type;
     const keyInfo = p.api_key_masked
       ? `<span class="prov-key-badge">${esc(p.api_key_masked)}</span>`
       : '';
+    const needsKey = (p.type === 'omniroute' || p.type === 'gemini');
     return `
-      <div class="prov-item ${activeClass}" data-id="${esc(p.id)}">
-        <div class="prov-item-left">
-          <div class="prov-item-name">${esc(p.name)}</div>
-          <div class="prov-item-meta">
-            <span class="prov-type-badge">${esc(typeLabel)}</span>
-            <span class="prov-url">${esc(p.base_url)}</span>
-            ${keyInfo}
+      <div class="prov-item ${activeClass}" data-id="${esc(p.id)}" id="prov-item-${esc(p.id)}">
+        <div class="prov-item-view">
+          <div class="prov-item-left">
+            <div class="prov-item-name">${esc(p.name)}</div>
+            <div class="prov-item-meta">
+              <span class="prov-type-badge">${esc(typeLabel)}</span>
+              <span class="prov-url">${esc(p.base_url)}</span>
+              ${keyInfo}
+            </div>
+          </div>
+          <div class="prov-item-actions">
+            <span class="prov-status-dot ${activeClass}" title="${activeLabel}"></span>
+            <button class="prov-edit-btn" onclick="openProviderEdit('${esc(p.id)}')" title="Edit">✎</button>
+            <button class="prov-toggle-btn" onclick="toggleProvider('${esc(p.id)}')" title="${p.is_active ? 'Deactivate' : 'Activate'}">
+              ${p.is_active ? 'Deactivate' : 'Activate'}
+            </button>
+            <button class="prov-remove-btn" onclick="removeProvider('${esc(p.id)}')" title="Remove">✕</button>
           </div>
         </div>
-        <div class="prov-item-actions">
-          <span class="prov-status-dot ${activeClass}" title="${activeLabel}"></span>
-          <button class="prov-toggle-btn" onclick="toggleProvider('${esc(p.id)}')" title="${p.is_active ? 'Deactivate' : 'Activate'}">
-            ${p.is_active ? 'Deactivate' : 'Activate'}
-          </button>
-          <button class="prov-remove-btn" onclick="removeProvider('${esc(p.id)}')" title="Remove">✕</button>
+        <div class="prov-item-edit hidden" id="prov-edit-${esc(p.id)}">
+          <div class="prov-edit-row">
+            <div class="prov-form-field prov-form-field--grow">
+              <label class="field-label">Name</label>
+              <input type="text" class="inp prov-edit-name" value="${esc(p.name)}" />
+            </div>
+          </div>
+          <div class="prov-edit-row">
+            <div class="prov-form-field prov-form-field--grow">
+              <label class="field-label">Base URL</label>
+              <input type="text" class="inp prov-edit-url" value="${esc(p.base_url)}" />
+            </div>
+          </div>
+          ${needsKey ? `
+          <div class="prov-edit-row">
+            <div class="prov-form-field prov-form-field--grow">
+              <label class="field-label">API Key <span class="prov-key-hint">(leave blank to keep current)</span></label>
+              <input type="password" class="inp prov-edit-key" placeholder="sk-… (unchanged)" autocomplete="off" />
+            </div>
+          </div>` : ''}
+          <div class="prov-form-error hidden prov-edit-error"></div>
+          <div class="prov-edit-actions">
+            <button class="btn-ghost btn-sm" onclick="cancelProviderEdit('${esc(p.id)}')">Cancel</button>
+            <button class="btn-primary btn-sm" onclick="saveProviderEdit('${esc(p.id)}')">Save</button>
+          </div>
         </div>
       </div>`;
   }).join('');
+}
+
+function openProviderEdit(id) {
+  const item = document.getElementById('prov-item-' + id);
+  if (!item) return;
+  item.querySelector('.prov-item-view').classList.add('hidden');
+  item.querySelector('.prov-item-edit').classList.remove('hidden');
+}
+
+function cancelProviderEdit(id) {
+  const item = document.getElementById('prov-item-' + id);
+  if (!item) return;
+  item.querySelector('.prov-item-view').classList.remove('hidden');
+  item.querySelector('.prov-item-edit').classList.add('hidden');
+}
+
+async function saveProviderEdit(id) {
+  const item = document.getElementById('prov-item-' + id);
+  if (!item) return;
+  const errEl = item.querySelector('.prov-edit-error');
+  errEl.classList.add('hidden');
+
+  const cfg = {
+    name:     item.querySelector('.prov-edit-name').value.trim(),
+    base_url: item.querySelector('.prov-edit-url').value.trim(),
+  };
+  const keyInput = item.querySelector('.prov-edit-key');
+  if (keyInput) {
+    const newKey = keyInput.value.trim();
+    if (newKey) cfg.api_key = newKey;  // only send if user typed something
+  }
+
+  let res;
+  try {
+    res = await eel.update_provider(id, cfg)();
+  } catch (e) {
+    errEl.textContent = 'Error: ' + e;
+    errEl.classList.remove('hidden');
+    return;
+  }
+  if (!res || !res.ok) {
+    errEl.textContent = (res && res.error) || 'Unknown error';
+    errEl.classList.remove('hidden');
+    return;
+  }
+  await _refreshAfterProviderChange();
 }
 
 const PROVIDER_DEFAULTS = {

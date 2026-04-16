@@ -228,6 +228,29 @@ def remove_provider(provider_id: str) -> dict:
 
 
 @eel.expose
+def update_provider(provider_id: str, cfg: dict) -> dict:
+    """Update name, base_url, and/or api_key of an existing provider."""
+    name    = (cfg.get("name") or "").strip() or None
+    url     = (cfg.get("base_url") or "").strip() or None
+    key_raw = cfg.get("api_key")  # None means "don't change"; "" means "clear"
+    api_key = key_raw.strip() if isinstance(key_raw, str) else None
+
+    p = PROVIDERS.get_by_id(provider_id)
+    if not p:
+        return {"ok": False, "error": "Provider not found"}
+    if p.type in ("omniroute", "gemini"):
+        # After update, the effective key is api_key if provided, else the existing one
+        effective_key = api_key if api_key is not None else p.api_key
+        if not effective_key:
+            return {"ok": False, "error": f"API key is required for {p.type.capitalize()}"}
+
+    updated = PROVIDERS.update(provider_id, name=name, base_url=url, api_key=api_key)
+    if not updated:
+        return {"ok": False, "error": "Provider not found"}
+    return {"ok": True, "provider": updated.to_dict_ui()}
+
+
+@eel.expose
 def toggle_provider(provider_id: str) -> dict:
     new_state = PROVIDERS.toggle_active(provider_id)
     if new_state is None:

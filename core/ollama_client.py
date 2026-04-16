@@ -38,13 +38,82 @@ def shutdown_all_clients() -> None:
 
 
 class OllamaClient:
-    def __init__(self, base_url: str = "http://localhost:1234", api_key: str = ""):
+    def __init__(self, base_url: str = "http://localhost:1234", api_key: str = "",
+                 read_timeout: int = 600, auth_style: str = "bearer"):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
+        self.read_timeout = read_timeout  # seconds; 600 for local, 120 for cloud APIs
+        # "bearer" → Authorization: Bearer KEY (LM Studio, OmniRoute)
+        # "goog"   → x-goog-api-key: KEY (Gemini — avoids conflict with OAuth Bearer)
+        self.auth_style = auth_style
         # Persistent session — closed on abort() to cancel in-flight requests
-        self._session = requests.Session()
-        self._session.trust_env = False   # ignore system HTTP_PROXY
+        self._session = self._new_session()
         self._session_lock = threading.Lock()
+
+    @staticmethod
+    def _new_session() -> requests.Session:
+        s = requests.Session()
+        s.trust_env = False   # ignore HTTP_PROXY / HTTPS_PROXY env vars
+        s.auth = None         # no netrc / session-level auth
+        s.headers.pop("Authorization", None)
+        # Block Google Application Default Credentials from injecting a second
+        # Bearer token. google-auth-requests patches sessions when
+        # GOOGLE_APPLICATION_CREDENTIALS or gcloud ADC are configured.
+        # Setting the env var to empty string disables ADC discovery.
+        import os as _os
+        _os.environ.setdefault("GOOGLE_APPLICATION_CREDENTIALS", "")
+        return s
+
+    class _UrllibResponse:
+        """Thin wrapper around urllib response that mimics requests.Response."""
+        def __init__(self, status_code: int, body: bytes, headers: dict):
+            self.status_code = status_code
+            self._body = body
+            self.headers = headers
+            self.ok = 200 <= status_code < 300
+
+        def json(self):
+            import json as _json
+            return _json.loads(self._body)
+
+        @property
+        def text(self):
+            return self._body.decode("utf-8", errors="replace")
+
+        def raise_for_status(self):
+            if not self.ok:
+                # Create a minimal mock so e.response.status_code works in callers
+                err = requests.exceptions.HTTPError(f"{self.status_code} Client Error")
+                err.response = self  # type: ignore[attr-defined]
+                raise err
+
+    def _urllib_post(self, url: str, json_payload: dict, headers: dict, timeout) -> "_UrllibResponse":
+        """
+        POST via stdlib urllib — bypasses google-auth's monkey-patching of requests.
+        Used for Gemini to prevent google-generativeai from injecting a second Bearer token.
+        """
+        import json as _json
+        import urllib.request as _ur
+        import urllib.error as _ue
+        import ssl as _ssl
+
+        body = _json.dumps(json_payload).encode("utf-8")
+        req_headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            **headers,
+        }
+        req = _ur.Request(url, data=body, headers=req_headers, method="POST")
+        ctx = _ssl.create_default_context()  # verify SSL properly
+
+        read_t = timeout[1] if isinstance(timeout, tuple) else timeout
+        try:
+            with _ur.urlopen(req, context=ctx, timeout=read_t) as resp:
+                resp_body = resp.read()
+                return self._UrllibResponse(resp.status, resp_body, dict(resp.headers))
+        except _ue.HTTPError as e:
+            resp_body = e.read()
+            return self._UrllibResponse(e.code, resp_body, dict(e.headers))
 
     # ── Session management ────────────────────────────────────────
 
@@ -59,8 +128,7 @@ class OllamaClient:
                 self._session.close()
             except Exception:
                 pass
-            self._session = requests.Session()
-            self._session.trust_env = False
+            self._session = self._new_session()
 
     def _sess(self) -> requests.Session:
         with self._session_lock:
@@ -88,10 +156,10 @@ class OllamaClient:
         return f"{self._api_base()}/models"
 
     def _auth_headers(self) -> dict:
-        """Return Authorization header if api_key is set."""
-        if self.api_key:
-            return {"Authorization": f"Bearer {self.api_key}"}
-        return {}
+        """Return auth header for this provider."""
+        if not self.api_key:
+            return {}
+        return {"Authorization": f"Bearer {self.api_key}"}
 
     def _post(self, url: str, json_payload: dict, timeout) -> requests.Response:
         """
@@ -110,21 +178,35 @@ class OllamaClient:
         Timeout: read timeout is capped at MAX_READ_TIMEOUT so that OS threads
         unblock within a reasonable time when the process needs to exit.
         """
-        # Cap the read timeout — prevents OS threads blocking for 6000s at shutdown
-        MAX_READ_TIMEOUT = 600  # 10 minutes; original was 6000s (100 min)
+        # Cap the read timeout using per-instance limit (shorter for cloud providers)
+        max_read = self.read_timeout
         if isinstance(timeout, tuple):
             connect_t, read_t = timeout
-            timeout = (connect_t, min(float(read_t), MAX_READ_TIMEOUT))
+            timeout = (connect_t, min(float(read_t), max_read))
         elif timeout is not None:
-            timeout = min(float(timeout), MAX_READ_TIMEOUT)
+            timeout = min(float(timeout), max_read)
 
         auth_headers = self._auth_headers()
 
         def _do_post():
             try:
-                print(f"[THREAD] Starting HTTP POST to {url[:50]}... (timeout={timeout}s)", flush=True)
-                result = self._sess().post(url, json=json_payload, headers=auth_headers, timeout=timeout)
+                print(f"[THREAD] POST {url[:80]}", flush=True)
+                if self.auth_style == "urllib":
+                    # google-auth patches requests globally on machines with google-generativeai
+                    # installed, injecting a second Bearer token. Using urllib bypasses this.
+                    result = self._urllib_post(url, json_payload, auth_headers, timeout)
+                else:
+                    sess = self._sess()
+                    req = requests.Request("POST", url, json=json_payload, headers=auth_headers)
+                    prepped = sess.prepare_request(req)
+                    result = sess.send(prepped, timeout=timeout)
                 print(f"[THREAD] HTTP POST completed: status={result.status_code}", flush=True)
+                if not result.ok:
+                    try:
+                        err_body = result.json()
+                    except Exception:
+                        err_body = result.text[:500]
+                    print(f"[Ollama] HTTP {result.status_code} body: {err_body}", flush=True)
                 return result
             except Exception as e:
                 print(f"[THREAD] HTTP POST failed: {type(e).__name__}: {e}", flush=True)
@@ -516,7 +598,8 @@ class OllamaClient:
                 payload["tools"] = tools
 
             if log_fn:
-                log_fn(f"[Ollama] Sending request (round {_round + 1})…")
+                _ctx_chars = sum(len(str(m.get("content") or "")) for m in final_messages)
+                log_fn(f"[Ollama] Sending request (round {_round + 1}, context ~{_ctx_chars:,} chars)…")
 
             try:
                 resp = self._post(
@@ -524,12 +607,6 @@ class OllamaClient:
                     payload,
                     (10, 6000),
                 )
-                if not resp.ok:
-                    try:
-                        err_body = resp.json()
-                    except Exception:
-                        err_body = resp.text[:500]
-                    print(f"[Ollama] HTTP {resp.status_code} body: {err_body}", flush=True)
                 resp.raise_for_status()
             except requests.exceptions.HTTPError as e:
                 if e.response.status_code == 500:
@@ -547,6 +624,16 @@ class OllamaClient:
                     print(f"\n[Ollama] {error_msg}", flush=True)
                     raise RuntimeError(f"Ollama 500 error - {error_msg}") from e
                 raise RuntimeError(f"Ollama HTTP {e.response.status_code} error: {e}") from e
+            except requests.exceptions.ReadTimeout as e:
+                msg = (
+                    f"Request timed out after {self.read_timeout}s waiting for the model to respond. "
+                    "For cloud providers (Gemini, OmniRoute) this usually means the API is overloaded "
+                    "or the context is too large. Try again or use a different model."
+                )
+                print(f"\n[Ollama] {msg}", flush=True)
+                if log_fn:
+                    log_fn(f"[ERROR] {msg}", "error")
+                raise RuntimeError(msg) from e
             except requests.exceptions.ConnectionError as e:
                 if is_aborted and is_aborted():
                     raise RuntimeError("__ABORTED__")

@@ -1948,14 +1948,22 @@ html, body {
 
 .prov-item {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
+  flex-direction: column;
+  gap: 0;
   background: var(--bg3);
   border: 1px solid var(--border);
   border-radius: var(--r6);
-  padding: 10px 12px;
+  padding: 0;
+  overflow: hidden;
   transition: border-color 0.15s;
+}
+
+.prov-item-view {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px;
 }
 
 .prov-item.prov-active  { border-left: 3px solid var(--green); }
@@ -2047,6 +2055,48 @@ html, body {
   color: var(--red);
   border-color: rgba(239,68,68,0.3);
   background: rgba(239,68,68,0.08);
+}
+
+.prov-edit-btn {
+  font-size: 13px;
+  padding: 3px 7px;
+  border-radius: var(--r3);
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--text3);
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.prov-edit-btn:hover { color: var(--accent); border-color: rgba(59,130,246,0.3); }
+
+.prov-item-edit {
+  border-top: 1px solid var(--border);
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: var(--bg2);
+}
+
+.prov-edit-row {
+  display: flex;
+  gap: 10px;
+}
+
+.prov-edit-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 2px;
+}
+
+.prov-edit-error {
+  padding: 6px 10px;
+  border-radius: var(--r6);
+  background: rgba(239,68,68,0.1);
+  border: 1px solid rgba(239,68,68,0.3);
+  color: var(--red);
+  font-size: 11px;
 }
 
 /* ── Add provider form ────────────────────────────── */
