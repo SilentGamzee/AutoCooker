@@ -21,6 +21,7 @@ import eel
 
 from core.state import AppState, KanbanTask, COLUMNS, TaskAbortedError
 from core.ollama_client import OllamaClient, shutdown_all_clients
+from core import providers as _providers_mod
 from core.eel_bridge import call as _eel_bridge_call, setup as _eel_bridge_setup
 from core.phases.planning import PlanningPhase
 from core.phases.coding import CodingPhase
@@ -82,8 +83,10 @@ SETTINGS_PATH = os.path.join(BASE_DIR, "app_settings.json")
 
 eel.init(WEB_DIR)
 
-STATE  = AppState()
-OLLAMA = OllamaClient()
+STATE     = AppState()
+PROVIDERS = _providers_mod.init(BASE_DIR)
+# OLLAMA is kept for abort() — phases use per-provider clients via BasePhase
+OLLAMA    = OllamaClient()
 
 # Pipeline guard — prevents concurrent runs without holding a lock
 # during the entire pipeline execution (which blocked eel's event loop).
@@ -168,7 +171,68 @@ def _format_qa_as_corrections(
 
 @eel.expose
 def get_ollama_models() -> list[str]:
-    return OLLAMA.list_models()
+    """Return flat list of all models from active providers (legacy compat)."""
+    return PROVIDERS.get_all_active_models_flat()
+
+
+# ─── Provider management API ──────────────────────────────────────
+
+@eel.expose
+def get_providers() -> list[dict]:
+    """Return all configured providers (api_key masked for UI)."""
+    return [p.to_dict_ui() for p in PROVIDERS.get_all()]
+
+
+@eel.expose
+def get_models_by_provider() -> dict:
+    """
+    Return {provider_id: {name, type, models: [str]}} for all active providers.
+    Used by the new task modal to display grouped model selects.
+    """
+    result = {}
+    for p in PROVIDERS.get_all():
+        models = PROVIDERS.fetch_models_for(p) if p.is_active else []
+        result[p.id] = {
+            "id": p.id,
+            "name": p.name,
+            "type": p.type,
+            "is_active": p.is_active,
+            "models": models,
+        }
+    return result
+
+
+@eel.expose
+def add_provider(cfg: dict) -> dict:
+    """Add a new provider. cfg: {type, name, base_url, api_key}"""
+    type_ = cfg.get("type", "lmstudio")
+    name  = (cfg.get("name") or "").strip()
+    url   = (cfg.get("base_url") or "").strip()
+    key   = (cfg.get("api_key") or "").strip()
+
+    if not name:
+        return {"ok": False, "error": "Provider name is required"}
+    if not url:
+        return {"ok": False, "error": "Base URL is required"}
+    if type_ in ("omniroute", "gemini") and not key:
+        return {"ok": False, "error": f"API key is required for {type_.capitalize()}"}
+
+    p = PROVIDERS.add(type_=type_, name=name, base_url=url, api_key=key)
+    return {"ok": True, "provider": p.to_dict_ui()}
+
+
+@eel.expose
+def remove_provider(provider_id: str) -> dict:
+    ok = PROVIDERS.remove(provider_id)
+    return {"ok": ok, "error": "" if ok else "Provider not found"}
+
+
+@eel.expose
+def toggle_provider(provider_id: str) -> dict:
+    new_state = PROVIDERS.toggle_active(provider_id)
+    if new_state is None:
+        return {"ok": False, "error": "Provider not found"}
+    return {"ok": True, "is_active": new_state}
 
 
 @eel.expose
@@ -235,6 +299,33 @@ def add_task(cfg: dict) -> dict:
         max_iterations=int(cfg.get("max_iterations", 3)),
     )
     STATE.add_task(task)
+    STATE._save_kanban()
+    _push_board()
+    return {"ok": True, "task": task.to_dict()}
+
+
+@eel.expose
+def update_task(task_id: str, cfg: dict) -> dict:
+    """Update editable fields of an existing task."""
+    task = STATE.get_task(task_id)
+    if not task:
+        return {"ok": False, "error": "Task not found"}
+    title = (cfg.get("title") or "").strip()
+    if not title:
+        return {"ok": False, "error": "Title is required"}
+    task.title = title
+    task.description = (cfg.get("description") or "").strip()
+    task.project_path = cfg.get("project_path") or STATE.working_dir
+    task.git_branch = cfg.get("git_branch", "main") or "main"
+    task.models = {
+        "planning": cfg.get("planning_model", task.models.get("planning", "")),
+        "coding":   cfg.get("coding_model",   task.models.get("coding", "")),
+        "qa":       cfg.get("qa_model",        task.models.get("qa", "")),
+    }
+    task.phases_selected = cfg.get("phases", task.phases_selected)
+    task.updated_at = time.strftime("%Y-%m-%dT%H:%M:%S")
+    STATE._save_kanban()
+    _push_task(task)
     _push_board()
     return {"ok": True, "task": task.to_dict()}
 

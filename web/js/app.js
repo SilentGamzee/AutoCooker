@@ -4,9 +4,14 @@
 'use strict';
 
 // ─── App State ──────────────────────────────────────────────────
-let activeTaskId = null;      // currently open in modal
-let activeRunId  = null;      // currently running task id
-let cachedModels = [];
+let activeTaskId  = null;      // currently open in modal
+let activeRunId   = null;      // currently running task id
+let cachedModels  = [];
+// Provider state: {id: {id, name, type, is_active, models: []}}
+let cachedModelsByProvider = {};
+// Edit mode: null = create new task, string = task id being edited
+let _editingTaskId    = null;
+let _currentTaskCache = null;   // last task opened in detail modal
 
 // ─── Eel callbacks ──────────────────────────────────────────────
 
@@ -21,6 +26,7 @@ function task_updated(task) {
   renderCard(task);
   // If modal open for this task, refresh it
   if (activeTaskId === task.id) {
+    _currentTaskCache = task;
     populateModal(task);
   }
 }
@@ -41,9 +47,12 @@ function task_step_changed(taskId, phase, step) {
 
 // ─── Initialization ─────────────────────────────────────────────
 async function init() {
-  // Load models
-  cachedModels = await eel.get_ollama_models()();
-  populateModelSelects(cachedModels);
+  // Load models grouped by provider
+  cachedModelsByProvider = await eel.get_models_by_provider()();
+  populateModelSelects(cachedModelsByProvider);
+
+  // Also keep flat list for legacy use
+  cachedModels = Object.values(cachedModelsByProvider).flatMap(p => p.models);
 
   // Load initial board
   const board = await eel.get_board()();
@@ -129,10 +138,47 @@ function renderCard(task) {
   });
 }
 
+/**
+ * Compute provider error message for a task using cached model data.
+ * Returns empty string if all models are from active providers.
+ */
+function getProviderError(task) {
+  const models = [
+    task.models?.planning,
+    task.models?.coding,
+    task.models?.qa,
+  ].filter(Boolean);
+  if (!models.length) return '';
+
+  const allProviders = Object.values(cachedModelsByProvider);
+  const activeModels = new Set(
+    allProviders.filter(p => p.is_active).flatMap(p => p.models)
+  );
+
+  const errors = [];
+  const seen = new Set();
+  for (const m of models) {
+    if (seen.has(m)) continue;
+    seen.add(m);
+    if (!activeModels.has(m)) {
+      const owner = allProviders.find(p => p.models.includes(m));
+      if (owner && !owner.is_active) {
+        errors.push(`Model '${m}' — provider '${owner.name}' is inactive`);
+      } else {
+        errors.push(`Model '${m}' not available from any active provider`);
+      }
+    }
+  }
+  return errors.join(' · ');
+}
+
 function buildCard(task) {
+  const provErr = getProviderError(task);
+
   const card = document.createElement('div');
   card.className = 'task-card' +
     (task.has_errors ? ' has-errors' : '') +
+    (provErr ? ' provider-error' : '') +
     (activeRunId === task.id ? ' running' : '');
   card.dataset.id = task.id;
   card.onclick = () => openTaskModal(task.id);
@@ -166,10 +212,15 @@ function buildCard(task) {
   // Timestamp
   const ts = relativeTime(task.updated_at || task.created_at);
 
+  const provErrHTML = provErr
+    ? `<div class="task-card-provider-err" title="${esc(provErr)}">⚠ Модель недоступна у активных провайдеров</div>`
+    : '';
+
   card.innerHTML = `
     <div class="task-card-title">${esc(task.title)}</div>
     ${task.description ? `<div class="task-card-desc">${esc(task.description)}</div>` : ''}
     ${tagHTML ? `<div class="task-card-tags">${tagHTML}</div>` : ''}
+    ${provErrHTML}
     ${progressHTML}
     <div class="task-card-dots">${pipeHTML}</div>
     <div class="task-card-footer">
@@ -204,20 +255,127 @@ function getTaskFromDOM(taskId) {
 
 // ─── New Task Modal ──────────────────────────────────────────────
 function showNewTaskModal() {
+  _editingTaskId = null;
+  document.getElementById('new-modal-title').textContent  = 'New Task';
+  document.getElementById('new-modal-submit').textContent = 'Create Task';
+  // Clear form
+  document.getElementById('new-title').value  = '';
+  document.getElementById('new-desc').value   = '';
+  document.getElementById('new-dir').value    = '';
+  document.getElementById('new-branch').value = 'main';
+  // Reset phase checkboxes
+  document.querySelectorAll('.phase-chk input').forEach(cb => { cb.checked = true; });
+  document.getElementById('new-task-provider-warn').classList.add('hidden');
   document.getElementById('overlay-new').classList.add('open');
   document.getElementById('new-title').focus();
 }
 
 function closeNewTaskModal() {
   document.getElementById('overlay-new').classList.remove('open');
+  _editingTaskId = null;
 }
 
-async function createTask() {
+function enterEditMode() {
+  if (!activeTaskId) return;
+  document.getElementById('modal-task').classList.add('editing');
+
+  // Populate edit fields from current view values
+  const task = _currentTaskCache;
+  if (!task) return;
+
+  document.getElementById('mt-edit-title').value  = task.title || '';
+  document.getElementById('ov-edit-desc').value   = task.description || '';
+  document.getElementById('ov-edit-branch').value = task.git_branch || '';
+  document.getElementById('ov-edit-path').value   = task.project_path || '';
+
+  // Phase checkboxes
+  const phases = task.phases_selected || ['planning','coding','qa'];
+  ['planning','coding','qa'].forEach(p => {
+    const cb = document.getElementById('ov-phase-' + p);
+    if (cb) cb.checked = phases.includes(p);
+  });
+
+  // Model selects — build from cached providers
+  _populateOvModelSelects(task);
+
+  document.getElementById('mt-edit-title').focus();
+}
+
+function cancelEditMode() {
+  const modal = document.getElementById('modal-task');
+  if (modal) modal.classList.remove('editing');
+}
+
+async function saveTaskEdit() {
+  if (!activeTaskId) return;
+  const title = document.getElementById('mt-edit-title').value.trim();
+  if (!title) { document.getElementById('mt-edit-title').focus(); return; }
+
+  const phases = ['planning','coding','qa'].filter(p => {
+    const cb = document.getElementById('ov-phase-' + p);
+    return cb && cb.checked;
+  });
+
+  const cfg = {
+    title,
+    description:    document.getElementById('ov-edit-desc').value.trim(),
+    project_path:   document.getElementById('ov-edit-path').value.trim(),
+    git_branch:     document.getElementById('ov-edit-branch').value.trim() || 'main',
+    planning_model: document.getElementById('ov-edit-planning-model').value,
+    coding_model:   document.getElementById('ov-edit-coding-model').value,
+    qa_model:       document.getElementById('ov-edit-qa-model').value,
+    phases,
+  };
+
+  const res = await eel.update_task(activeTaskId, cfg)();
+  if (!res || !res.ok) { alert('Error: ' + (res?.error || 'unknown')); return; }
+
+  // Refresh the modal with updated task
+  const updated = await eel.get_task(activeTaskId)();
+  if (updated) {
+    _currentTaskCache = updated;
+    populateModal(updated);
+  }
+}
+
+/** Populate the three ov-edit model selects, grouped by provider. */
+function _populateOvModelSelects(task) {
+  const selMap = {
+    'ov-edit-planning-model': task.models?.planning || '',
+    'ov-edit-coding-model':   task.models?.coding   || '',
+    'ov-edit-qa-model':       task.models?.qa       || '',
+  };
+  const activeProviders = Object.values(cachedModelsByProvider).filter(p => p.is_active);
+
+  Object.entries(selMap).forEach(([id, currentVal]) => {
+    const sel = document.getElementById(id);
+    if (!sel) return;
+
+    let html = '';
+    activeProviders.forEach(p => {
+      if (!p.models.length) return;
+      html += `<optgroup label="${esc(p.name)}">`;
+      p.models.forEach(m => {
+        html += `<option value="${esc(m)}"${m === currentVal ? ' selected' : ''}>${esc(m)}</option>`;
+      });
+      html += '</optgroup>';
+    });
+
+    // If current model not in active providers, show it as a stale option
+    const allActive = activeProviders.flatMap(p => p.models);
+    if (currentVal && !allActive.includes(currentVal)) {
+      html = `<option value="${esc(currentVal)}" selected>${esc(currentVal)} ⚠</option>` + html;
+    }
+
+    sel.innerHTML = html || '<option value="">No models available</option>';
+  });
+}
+
+async function submitTaskModal() {
   const title = document.getElementById('new-title').value.trim();
   if (!title) { document.getElementById('new-title').focus(); return; }
 
   const phases = [...document.querySelectorAll('.phase-chk input:checked')].map(el => el.value);
-
   const cfg = {
     title,
     description:    document.getElementById('new-desc').value.trim(),
@@ -230,17 +388,10 @@ async function createTask() {
   };
 
   const res = await eel.add_task(cfg)();
-  if (res.ok) {
-    closeNewTaskModal();
-    const board = await eel.get_board()();
-    renderBoard(board);
-    // Clear form
-    document.getElementById('new-title').value = '';
-    document.getElementById('new-desc').value = '';
-    document.getElementById('new-dir').value = '';
-  } else {
-    alert('Error: ' + res.error);
-  }
+  if (!res || !res.ok) { alert('Error: ' + (res?.error || 'unknown')); return; }
+  closeNewTaskModal();
+  const board = await eel.get_board()();
+  renderBoard(board);
 }
 
 // ─── Task Detail Modal ───────────────────────────────────────────
@@ -248,6 +399,7 @@ async function openTaskModal(taskId) {
   activeTaskId = taskId;
   const task = await eel.get_task(taskId)();
   if (!task) return;
+  _currentTaskCache = task;
   populateModal(task);
   document.getElementById('overlay-task').classList.add('open');
   // Switch to overview tab
@@ -308,14 +460,21 @@ function populateModal(task) {
   // Patch Indicator
   updatePatchIndicator(task);
 
-  // Overview
+  // Overview — view fields
+  document.getElementById('mt-title').textContent   = task.title;
   document.getElementById('ov-desc').textContent    = task.description || '—';
   document.getElementById('ov-branch').textContent  = task.git_branch || '—';
   document.getElementById('ov-path').textContent    = task.project_path || '—';
   document.getElementById('ov-models').textContent  =
     `Planning: ${task.models?.planning || '—'}  |  Coding: ${task.models?.coding || '—'}  |  QA: ${task.models?.qa || '—'}`;
+  const phaseLabels = { planning:'Planning', coding:'Coding', qa:'QA' };
+  document.getElementById('ov-phases-view').textContent =
+    (task.phases_selected || ['planning','coding','qa']).map(p => phaseLabels[p] || p).join(' → ');
   document.getElementById('ov-created').textContent = task.created_at || '—';
   document.getElementById('ov-updated').textContent = task.updated_at || '—';
+
+  // Ensure edit mode is off when re-populating
+  cancelEditMode();
 
   // Patch / corrections info row
   _renderPatchInfo(task);
@@ -1020,6 +1179,148 @@ async function applyDir() {
   }
 }
 
+// ─── Providers Modal ─────────────────────────────────────────────
+
+async function showProvidersModal() {
+  await renderProviderList();
+  onProviderTypeChange(); // set initial URL placeholder
+  document.getElementById('overlay-providers').classList.add('open');
+}
+
+function closeProvidersModal() {
+  document.getElementById('overlay-providers').classList.remove('open');
+}
+
+async function renderProviderList() {
+  const providers = await eel.get_providers()();
+  const listEl = document.getElementById('prov-list');
+  if (!providers.length) {
+    listEl.innerHTML = '<div class="prov-empty">No providers configured</div>';
+    return;
+  }
+  listEl.innerHTML = providers.map(p => {
+    const activeClass = p.is_active ? 'prov-active' : 'prov-inactive';
+    const activeLabel = p.is_active ? 'Active' : 'Inactive';
+    const typeLabels  = { lmstudio: 'LM Studio', omniroute: 'OmniRoute', gemini: 'Gemini' };
+    const typeLabel   = typeLabels[p.type] || p.type;
+    const keyInfo = p.api_key_masked
+      ? `<span class="prov-key-badge">${esc(p.api_key_masked)}</span>`
+      : '';
+    return `
+      <div class="prov-item ${activeClass}" data-id="${esc(p.id)}">
+        <div class="prov-item-left">
+          <div class="prov-item-name">${esc(p.name)}</div>
+          <div class="prov-item-meta">
+            <span class="prov-type-badge">${esc(typeLabel)}</span>
+            <span class="prov-url">${esc(p.base_url)}</span>
+            ${keyInfo}
+          </div>
+        </div>
+        <div class="prov-item-actions">
+          <span class="prov-status-dot ${activeClass}" title="${activeLabel}"></span>
+          <button class="prov-toggle-btn" onclick="toggleProvider('${esc(p.id)}')" title="${p.is_active ? 'Deactivate' : 'Activate'}">
+            ${p.is_active ? 'Deactivate' : 'Activate'}
+          </button>
+          <button class="prov-remove-btn" onclick="removeProvider('${esc(p.id)}')" title="Remove">✕</button>
+        </div>
+      </div>`;
+  }).join('');
+}
+
+const PROVIDER_DEFAULTS = {
+  lmstudio:  { url: 'http://localhost:1234',                                        needsKey: false },
+  omniroute: { url: 'https://api.omni-route.com',                                  needsKey: true  },
+  gemini:    { url: 'https://generativelanguage.googleapis.com/v1beta/openai',      needsKey: true  },
+};
+
+function onProviderTypeChange() {
+  const type     = document.getElementById('prov-type').value;
+  const keyRow   = document.getElementById('prov-key-row');
+  const urlInput = document.getElementById('prov-url');
+  const def      = PROVIDER_DEFAULTS[type] || PROVIDER_DEFAULTS.lmstudio;
+
+  if (def.needsKey) {
+    keyRow.classList.remove('hidden');
+  } else {
+    keyRow.classList.add('hidden');
+  }
+
+  // Only auto-fill URL if the field is empty or still holds another provider's default
+  const currentIsDefault = Object.values(PROVIDER_DEFAULTS).some(d => d.url === urlInput.value);
+  if (!urlInput.value || currentIsDefault) {
+    urlInput.value = def.url;
+  }
+  urlInput.placeholder = def.url;
+}
+
+async function addProvider() {
+  const errEl = document.getElementById('prov-form-error');
+  errEl.classList.add('hidden');
+
+  const cfg = {
+    type:     document.getElementById('prov-type').value,
+    name:     document.getElementById('prov-name').value.trim(),
+    base_url: document.getElementById('prov-url').value.trim(),
+    api_key:  document.getElementById('prov-key').value.trim(),
+  };
+
+  let res;
+  try {
+    res = await eel.add_provider(cfg)();
+  } catch (e) {
+    errEl.textContent = 'Error: ' + e;
+    errEl.classList.remove('hidden');
+    return;
+  }
+  if (!res || !res.ok) {
+    errEl.textContent = (res && res.error) || 'Unknown error';
+    errEl.classList.remove('hidden');
+    return;
+  }
+
+  // Clear form
+  document.getElementById('prov-name').value = '';
+  document.getElementById('prov-url').value  = '';
+  document.getElementById('prov-key').value  = '';
+
+  await _refreshAfterProviderChange();
+}
+
+async function toggleProvider(providerId) {
+  let res;
+  try {
+    res = await eel.toggle_provider(providerId)();
+  } catch (e) { alert('Error: ' + e); return; }
+  if (!res || !res.ok) { alert((res && res.error) || 'Toggle failed'); return; }
+  await _refreshAfterProviderChange();
+}
+
+async function removeProvider(providerId) {
+  if (!confirm('Remove this provider?')) return;
+  let res;
+  try {
+    res = await eel.remove_provider(providerId)();
+  } catch (e) { alert('Error: ' + e); return; }
+  if (!res || !res.ok) { alert((res && res.error) || 'Remove failed'); return; }
+  await _refreshAfterProviderChange();
+}
+
+/**
+ * After any provider change: reload model cache, re-render provider list,
+ * then re-render the board so provider-error styles update on all cards.
+ */
+async function _refreshAfterProviderChange() {
+  // First reload model cache (this can be slow if providers are offline)
+  cachedModelsByProvider = await eel.get_models_by_provider()();
+  cachedModels = Object.values(cachedModelsByProvider).flatMap(p => p.models);
+  populateModelSelects(cachedModelsByProvider);
+  // Refresh provider list in modal
+  await renderProviderList();
+  // Re-render board so provider-error CSS updates on all cards
+  const board = await eel.get_board()();
+  renderBoard(board);
+}
+
 // ─── Misc ────────────────────────────────────────────────────────
 async function refreshBoard() {
   const board = await eel.get_board()();
@@ -1027,20 +1328,81 @@ async function refreshBoard() {
 }
 
 async function reloadModels() {
-  cachedModels = await eel.get_ollama_models()();
-  populateModelSelects(cachedModels);
+  cachedModelsByProvider = await eel.get_models_by_provider()();
+  cachedModels = Object.values(cachedModelsByProvider).flatMap(p => p.models);
+  populateModelSelects(cachedModelsByProvider);
+  const board = await eel.get_board()();
+  renderBoard(board);
 }
 
-function populateModelSelects(models) {
+/**
+ * Populate the three model <select> elements using grouped data from providers.
+ * modelsByProvider: {id: {id, name, type, is_active, models: []}}
+ * Active providers get their models shown; inactive providers are omitted.
+ * Each provider becomes an <optgroup>.
+ */
+function populateModelSelects(modelsByProvider) {
   const IDS = ['new-planning-model','new-coding-model','new-qa-model'];
+  const activeProviders = Object.values(modelsByProvider).filter(p => p.is_active);
+  const totalModels = activeProviders.reduce((s, p) => s + p.models.length, 0);
+
   IDS.forEach(id => {
     const sel = document.getElementById(id);
     if (!sel) return;
     const prev = sel.value;
-    sel.innerHTML = models.length
-      ? models.map(m => `<option value="${esc(m)}"${m===prev?' selected':''}>${esc(m)}</option>`).join('')
-      : '<option value="">No models (Ollama running?)</option>';
+
+    if (!totalModels) {
+      sel.innerHTML = '<option value="">No models available</option>';
+      return;
+    }
+
+    let html = '';
+    activeProviders.forEach(p => {
+      if (!p.models.length) return;
+      html += `<optgroup label="${esc(p.name)}">`;
+      p.models.forEach(m => {
+        html += `<option value="${esc(m)}"${m === prev ? ' selected' : ''}>${esc(m)}</option>`;
+      });
+      html += '</optgroup>';
+    });
+    sel.innerHTML = html;
   });
+}
+
+/**
+ * Called when model selects change — warn if any selected model is from an inactive provider.
+ */
+function checkNewTaskProviderStatus() {
+  const warnEl = document.getElementById('new-task-provider-warn');
+  if (!warnEl) return;
+
+  const selected = [
+    document.getElementById('new-planning-model')?.value,
+    document.getElementById('new-coding-model')?.value,
+    document.getElementById('new-qa-model')?.value,
+  ].filter(Boolean);
+
+  // Build map of model -> provider for ALL providers (including inactive)
+  const allProviders = Object.values(cachedModelsByProvider);
+  const activeModels = new Set(
+    allProviders.filter(p => p.is_active).flatMap(p => p.models)
+  );
+  const inactiveIssues = [];
+  selected.forEach(m => {
+    if (m && !activeModels.has(m)) {
+      const owner = allProviders.find(p => p.models.includes(m));
+      inactiveIssues.push(owner
+        ? `Model '${m}' belongs to inactive provider '${owner.name}'`
+        : `Model '${m}' is not available from any active provider`);
+    }
+  });
+
+  if (inactiveIssues.length) {
+    warnEl.textContent = '⚠ ' + inactiveIssues.join(' · ');
+    warnEl.classList.remove('hidden');
+  } else {
+    warnEl.classList.add('hidden');
+  }
 }
 
 function relativeTime(iso) {
@@ -1070,6 +1432,7 @@ document.addEventListener('keydown', e => {
     if (document.getElementById('overlay-task').classList.contains('open')) closeTaskModal();
     else if (document.getElementById('overlay-new').classList.contains('open')) closeNewTaskModal();
     else if (document.getElementById('overlay-dir').classList.contains('open')) closeDirModal();
+    else if (document.getElementById('overlay-providers').classList.contains('open')) closeProvidersModal();
   }
 });
 

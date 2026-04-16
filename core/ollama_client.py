@@ -38,8 +38,9 @@ def shutdown_all_clients() -> None:
 
 
 class OllamaClient:
-    def __init__(self, base_url: str = "http://localhost:1234"):
+    def __init__(self, base_url: str = "http://localhost:1234", api_key: str = ""):
         self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
         # Persistent session — closed on abort() to cancel in-flight requests
         self._session = requests.Session()
         self._session.trust_env = False   # ignore system HTTP_PROXY
@@ -66,15 +67,31 @@ class OllamaClient:
             return self._session
 
     def _api_base(self) -> str:
-        """LM Studio OpenAI-compatible base URL."""
+        """Return the OpenAI-compatible API base URL.
+
+        Rules:
+          - If base_url already has a non-trivial path (e.g. /v1beta/openai
+            for Gemini), use it as-is — the URL is already the API root.
+          - Otherwise append /v1 (LM Studio / OmniRoute convention).
+        """
+        from urllib.parse import urlparse
         base = self.base_url.rstrip("/")
-        return base if base.endswith("/v1") else f"{base}/v1"
+        path = urlparse(base).path.rstrip("/")
+        if path:          # URL already has a path component → use as-is
+            return base
+        return f"{base}/v1"
 
     def _chat_completions_url(self) -> str:
         return f"{self._api_base()}/chat/completions"
 
     def _models_url(self) -> str:
         return f"{self._api_base()}/models"
+
+    def _auth_headers(self) -> dict:
+        """Return Authorization header if api_key is set."""
+        if self.api_key:
+            return {"Authorization": f"Bearer {self.api_key}"}
+        return {}
 
     def _post(self, url: str, json_payload: dict, timeout) -> requests.Response:
         """
@@ -101,10 +118,12 @@ class OllamaClient:
         elif timeout is not None:
             timeout = min(float(timeout), MAX_READ_TIMEOUT)
 
+        auth_headers = self._auth_headers()
+
         def _do_post():
             try:
                 print(f"[THREAD] Starting HTTP POST to {url[:50]}... (timeout={timeout}s)", flush=True)
-                result = self._sess().post(url, json=json_payload, timeout=timeout)
+                result = self._sess().post(url, json=json_payload, headers=auth_headers, timeout=timeout)
                 print(f"[THREAD] HTTP POST completed: status={result.status_code}", flush=True)
                 return result
             except Exception as e:
@@ -282,7 +301,7 @@ class OllamaClient:
 
     def list_models(self) -> list[str]:
         try:
-            r = requests.get(self._models_url(), timeout=5)
+            r = requests.get(self._models_url(), headers=self._auth_headers(), timeout=5)
             r.raise_for_status()
             return [m["id"] for m in r.json().get("data", [])]
         except Exception:
@@ -482,13 +501,17 @@ class OllamaClient:
                 })
                 _injected_files.update(new_read_files.keys())
 
+            # Build messages list: system prompt as first message (OpenAI format),
+            # not as a top-level "system" field (Ollama-only, rejected by Gemini etc.)
+            final_messages = messages
+            if system and (not messages or messages[0].get("role") != "system"):
+                final_messages = [{"role": "system", "content": system}] + messages
+
             payload: dict = {
                 "model": model,
-                "messages": messages,
+                "messages": final_messages,
                 "stream": False,
             }
-            if system:
-                payload["system"] = system
             if tools:
                 payload["tools"] = tools
 
@@ -501,6 +524,12 @@ class OllamaClient:
                     payload,
                     (10, 6000),
                 )
+                if not resp.ok:
+                    try:
+                        err_body = resp.json()
+                    except Exception:
+                        err_body = resp.text[:500]
+                    print(f"[Ollama] HTTP {resp.status_code} body: {err_body}", flush=True)
                 resp.raise_for_status()
             except requests.exceptions.HTTPError as e:
                 if e.response.status_code == 500:

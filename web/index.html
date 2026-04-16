@@ -23,8 +23,9 @@
   <div class="topbar-right">
     <div class="model-badge" id="model-badge">
       <span class="model-dot"></span>
-      <span id="model-label">Ollama</span>
+      <span id="model-label">Providers</span>
     </div>
+    <button class="topbar-btn" onclick="showProvidersModal()">⚙ Providers</button>
     <button class="topbar-btn" onclick="refreshBoard()">↻ Refresh Tasks</button>
   </div>
 </header>
@@ -109,7 +110,7 @@
 <div class="overlay" id="overlay-new" onclick="if(event.target===this)closeNewTaskModal()">
   <div class="modal-new">
     <div class="modal-new-header">
-      <h2>New Task</h2>
+      <h2 id="new-modal-title">New Task</h2>
       <button class="modal-close" onclick="closeNewTaskModal()">✕</button>
     </div>
     <div class="modal-new-body">
@@ -131,17 +132,18 @@
       <div class="model-row">
         <div class="model-field">
           <label class="field-label">Planning model</label>
-          <select id="new-planning-model" class="inp inp-sel"></select>
+          <select id="new-planning-model" class="inp inp-sel" onchange="checkNewTaskProviderStatus()"></select>
         </div>
         <div class="model-field">
           <label class="field-label">Coding model</label>
-          <select id="new-coding-model" class="inp inp-sel"></select>
+          <select id="new-coding-model" class="inp inp-sel" onchange="checkNewTaskProviderStatus()"></select>
         </div>
         <div class="model-field">
           <label class="field-label">QA model</label>
-          <select id="new-qa-model" class="inp inp-sel"></select>
+          <select id="new-qa-model" class="inp inp-sel" onchange="checkNewTaskProviderStatus()"></select>
         </div>
       </div>
+      <div class="provider-warn hidden" id="new-task-provider-warn"></div>
 
       <div class="phase-picks">
         <label class="field-label">Phases to run</label>
@@ -154,7 +156,7 @@
     </div>
     <div class="modal-new-footer">
       <button class="btn-ghost" onclick="closeNewTaskModal()">Cancel</button>
-      <button class="btn-primary" onclick="createTask()">Create Task</button>
+      <button class="btn-primary" id="new-modal-submit" onclick="submitTaskModal()">Create Task</button>
     </div>
   </div>
 </div>
@@ -166,10 +168,13 @@
     <!-- Header -->
     <div class="mt-header">
       <div class="mt-title-row">
-        <h2 class="mt-title" id="mt-title">Task Title</h2>
+        <h2 class="mt-title ov-view" id="mt-title">Task Title</h2>
+        <input class="mt-title-input ov-edit-field inp" id="mt-edit-title" type="text" placeholder="Task title" />
         <div class="mt-header-actions">
-          <button class="mt-ico-btn" title="Edit">✎</button>
-          <button class="mt-ico-btn" onclick="closeTaskModal()" title="Close">✕</button>
+          <button class="mt-ico-btn ov-view" id="btn-edit-task" title="Edit" onclick="enterEditMode()">✎</button>
+          <button class="mt-ico-btn ov-edit-field" id="btn-save-task" title="Save" onclick="saveTaskEdit()">✓</button>
+          <button class="mt-ico-btn ov-edit-field" id="btn-cancel-edit" title="Cancel edit" onclick="cancelEditMode()">✕</button>
+          <button class="mt-ico-btn ov-view" onclick="closeTaskModal()" title="Close">✕</button>
         </div>
       </div>
       <div class="mt-meta">
@@ -237,15 +242,53 @@
       <!-- Overview -->
       <div class="mt-pane active" id="mtpane-overview">
         <div class="overview-grid">
-          <div class="ov-row"><span class="ov-label">Description</span><span class="ov-val" id="ov-desc"></span></div>
+          <div class="ov-row">
+            <span class="ov-label">Description</span>
+            <span class="ov-val ov-view" id="ov-desc"></span>
+            <textarea class="ov-edit-field inp inp-area" id="ov-edit-desc" rows="3"></textarea>
+          </div>
           <div class="ov-row hidden" id="ov-patch-row">
             <span class="ov-label">Patch</span>
             <div class="ov-val" id="ov-patch-info"></div>
           </div>
-          <div class="ov-row"><span class="ov-label">Git branch</span><span class="ov-val mono" id="ov-branch"></span></div>
-          <div class="ov-row"><span class="ov-label">Project path</span><span class="ov-val mono" id="ov-path"></span></div>
-          <div class="ov-row"><span class="ov-label">Models</span>
-            <span class="ov-val mono" id="ov-models"></span>
+          <div class="ov-row">
+            <span class="ov-label">Git branch</span>
+            <span class="ov-val mono ov-view" id="ov-branch"></span>
+            <input class="ov-edit-field inp" id="ov-edit-branch" type="text" />
+          </div>
+          <div class="ov-row">
+            <span class="ov-label">Project path</span>
+            <span class="ov-val mono ov-view" id="ov-path"></span>
+            <input class="ov-edit-field inp" id="ov-edit-path" type="text" />
+          </div>
+          <div class="ov-row">
+            <span class="ov-label">Models</span>
+            <span class="ov-val mono ov-view" id="ov-models"></span>
+            <div class="ov-edit-field ov-models-edit">
+              <div class="ov-model-row">
+                <label class="field-label">Planning</label>
+                <select id="ov-edit-planning-model" class="inp inp-sel"></select>
+              </div>
+              <div class="ov-model-row">
+                <label class="field-label">Coding</label>
+                <select id="ov-edit-coding-model" class="inp inp-sel"></select>
+              </div>
+              <div class="ov-model-row">
+                <label class="field-label">QA</label>
+                <select id="ov-edit-qa-model" class="inp inp-sel"></select>
+              </div>
+            </div>
+          </div>
+          <div class="ov-row">
+            <span class="ov-label">Phases</span>
+            <span class="ov-val ov-view" id="ov-phases-view"></span>
+            <div class="ov-edit-field">
+              <div class="phase-row">
+                <label class="phase-chk"><input type="checkbox" id="ov-phase-planning" value="planning" /> Planning</label>
+                <label class="phase-chk"><input type="checkbox" id="ov-phase-coding"   value="coding"   /> Coding</label>
+                <label class="phase-chk"><input type="checkbox" id="ov-phase-qa"       value="qa"       /> QA</label>
+              </div>
+            </div>
           </div>
           <div class="ov-row"><span class="ov-label">Created</span><span class="ov-val" id="ov-created"></span></div>
           <div class="ov-row"><span class="ov-label">Updated</span><span class="ov-val" id="ov-updated"></span></div>
@@ -394,6 +437,64 @@
     <div class="modal-new-footer">
       <button class="btn-ghost" onclick="closeDiffModal()">Close</button>
       <button class="btn-merge" onclick="closeDiffModal();mergeWorkdir()">⇥ Merge to Branch</button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════ PROVIDERS MODAL ══════════════════════════════ -->
+<div class="overlay" id="overlay-providers" onclick="if(event.target===this)closeProvidersModal()">
+  <div class="modal-providers">
+    <div class="modal-new-header">
+      <h2>Providers</h2>
+      <button class="modal-close" onclick="closeProvidersModal()">✕</button>
+    </div>
+    <div class="modal-providers-body">
+
+      <!-- Provider list -->
+      <div class="prov-section-label">Configured providers</div>
+      <div class="prov-list" id="prov-list">
+        <div class="prov-empty">No providers configured</div>
+      </div>
+
+      <!-- Add provider form -->
+      <div class="prov-section-label prov-add-label">Add provider</div>
+      <div class="prov-add-form">
+        <div class="prov-form-row">
+          <div class="prov-form-field">
+            <label class="field-label">Type</label>
+            <select id="prov-type" class="inp inp-sel" onchange="onProviderTypeChange()">
+              <option value="lmstudio">LM Studio</option>
+              <option value="omniroute">OmniRoute</option>
+              <option value="gemini">Gemini</option>
+            </select>
+          </div>
+          <div class="prov-form-field prov-form-field--grow">
+            <label class="field-label">Name</label>
+            <input type="text" id="prov-name" class="inp" placeholder="e.g. My LM Studio" />
+          </div>
+        </div>
+        <div class="prov-form-row">
+          <div class="prov-form-field prov-form-field--grow">
+            <label class="field-label">Base URL</label>
+            <input type="text" id="prov-url" class="inp" placeholder="http://localhost:1234" />
+          </div>
+        </div>
+        <div class="prov-form-row" id="prov-key-row">
+          <div class="prov-form-field prov-form-field--grow">
+            <label class="field-label">API Key <span class="prov-key-hint">sk-…</span></label>
+            <input type="password" id="prov-key" class="inp" placeholder="sk-963d3…dbc1" autocomplete="off" />
+          </div>
+        </div>
+        <div class="prov-form-error hidden" id="prov-form-error"></div>
+        <div class="prov-form-actions">
+          <button class="btn-primary btn-sm" onclick="addProvider()">+ Add Provider</button>
+        </div>
+      </div>
+
+    </div>
+    <div class="modal-new-footer">
+      <button class="btn-ghost" onclick="closeProvidersModal()">Close</button>
+      <button class="topbar-btn" onclick="reloadModels()">↻ Reload Models</button>
     </div>
   </div>
 </div>

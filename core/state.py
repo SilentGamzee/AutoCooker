@@ -201,6 +201,12 @@ class KanbanTask:
     purpose: dict = field(default_factory=dict)
     # Purpose: {"problem": str, "solution": str, "use_cases": str}
 
+    # ══════════════════════════════════════════════════════
+    # Provider validation
+    # ══════════════════════════════════════════════════════
+    provider_error: str = ""     # human-readable error about inactive providers
+    has_provider_error: bool = False
+
     def to_dict(self) -> dict:
         return {
             "id": self.id, "title": self.title, "description": self.description,
@@ -236,6 +242,9 @@ class KanbanTask:
             "user_flow_steps": self.user_flow_steps,
             "system_flow_steps": self.system_flow_steps,
             "purpose": self.purpose,
+            # Provider validation
+            "provider_error": self.provider_error,
+            "has_provider_error": self.has_provider_error,
         }
 
     def to_dict_ui(self) -> dict:
@@ -452,6 +461,9 @@ class AppState:
                     user_flow_steps=d.get("user_flow_steps", []),
                     system_flow_steps=d.get("system_flow_steps", []),
                     purpose=d.get("purpose", {}),
+                    # Provider validation
+                    provider_error=d.get("provider_error", ""),
+                    has_provider_error=d.get("has_provider_error", False),
                 )
                 self.load_logs_for_task(t)
                 self.kanban_tasks.append(t)

@@ -51,7 +51,13 @@ class BasePhase:
         self.state = state
         self.task = task
         self.phase_name = phase_name   # "planning" | "coding" | "qa"
-        self.ollama = OllamaClient()
+        # Build OllamaClient for the right provider (based on the phase's model)
+        model_id = task.models.get(phase_name, "")
+        try:
+            from core import providers as _providers_mod
+            self.ollama = _providers_mod.get().make_client_for_model(model_id)
+        except Exception:
+            self.ollama = OllamaClient()
 
     # ── Gevent-safe eel dispatcher ────────────────────────────────
     @staticmethod
