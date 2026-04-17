@@ -850,9 +850,27 @@ def restart_task(task_id: str) -> dict:
     task.has_errors    = False
     task.column        = "planning"
     task.tags          = [t for t in task.tags
-                          if t not in ("Has Errors", "Needs Review", "Complete", "Aborted")]
+                          if t not in ("Has Errors", "Needs Review", "Complete", "Aborted",
+                                       "QA Failed", "In Progress")]
     task.file_contents = {}
     task.files         = []
+
+    # Reset phase/resume state so pipeline starts fresh from Planning,
+    # not from a previously saved coding/qa resume point.
+    task.phase_status = {"planning": "pending", "coding": "pending", "qa": "pending"}
+    task.last_active_phase        = ""
+    task.can_resume               = True
+    task.resume_from_phase        = ""
+    task.current_iteration        = 0
+    task.patch_count              = 0
+    task.last_executed_subtask_id = ""
+    task.requirements_checklist   = []
+    task.qa_verification_report   = {}
+    task.user_flow_steps          = []
+    task.system_flow_steps        = []
+    task.purpose                  = {}
+    task.provider_error           = ""
+    task.has_provider_error       = False
 
     STATE._save_kanban()
     _push_task(task)
