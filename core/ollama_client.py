@@ -444,6 +444,8 @@ class OllamaClient:
         _dedup_count = 0          # consecutive write_file DEDUP hits this session
         _last_call = ("", "")
         _repeat_count = 0
+        _spiral_count = 0         # consecutive identical error results
+        _spiral_last = ""
         _files_read: set[str] = set()
         # Per-session write deduplication: path → content written this chat_with_tools call.
         _written_files: dict[str, str] = {}
@@ -478,6 +480,22 @@ class OllamaClient:
                     )
                 }
                 messages = [first_msg, compress_note] + recent
+
+            # History compaction: shrink bulky tool results older than 4 messages.
+            # Large read_file / list_directory results duplicate info that the
+            # model has already processed; replace body with a pointer, keep the
+            # tool_call_id so the turn remains structurally valid.
+            if len(messages) > 6:
+                for _mi in range(1, len(messages) - 4):
+                    _m = messages[_mi]
+                    if _m.get("role") != "tool":
+                        continue
+                    _content = _m.get("content") or ""
+                    if isinstance(_content, str) and len(_content) > 1500:
+                        _m["content"] = (
+                            f"[elided — original tool result was {len(_content)} chars; "
+                            "cached files remain visible in system prompt]"
+                        )
 
             # Expire old read-file entries by round count.
             expired_files: list[str] = []
@@ -601,65 +619,110 @@ class OllamaClient:
                 _ctx_chars = sum(len(str(m.get("content") or "")) for m in final_messages)
                 log_fn(f"[Ollama] Sending request (round {_round + 1}, context ~{_ctx_chars:,} chars)…")
 
-            try:
-                resp = self._post(
-                    self._chat_completions_url(),
-                    payload,
-                    (10, 6000),
-                )
-                resp.raise_for_status()
-            except requests.exceptions.HTTPError as e:
-                if e.response.status_code == 500:
-                    error_msg = (
-                        "Ollama returned 500 Internal Server Error. "
-                        "This usually means:\n"
-                        "  1. Context is too large for the model\n"
-                        "  2. Model ran out of memory\n"
-                        "  3. Request format issue\n\n"
-                        "Try:\n"
-                        "  - Using a smaller model\n"
-                        "  - Reducing number of files\n"
-                        "  - Increasing Ollama's num_ctx parameter\n"
-                    )
-                    print(f"\n[Ollama] {error_msg}", flush=True)
-                    raise RuntimeError(f"Ollama 500 error - {error_msg}") from e
-                raise RuntimeError(f"Ollama HTTP {e.response.status_code} error: {e}") from e
-            except requests.exceptions.ReadTimeout as e:
-                msg = (
-                    f"Request timed out after {self.read_timeout}s waiting for the model to respond. "
-                    "For cloud providers (Gemini, OmniRoute) this usually means the API is overloaded "
-                    "or the context is too large. Try again or use a different model."
-                )
-                print(f"\n[Ollama] {msg}", flush=True)
-                if log_fn:
-                    log_fn(f"[ERROR] {msg}", "error")
-                raise RuntimeError(msg) from e
-            except requests.exceptions.ConnectionError as e:
+            # Adaptive read timeout: scales with payload size for cloud providers.
+            # Cloud read_timeout=120s → base 30s + 1s per 2KB, capped at self.read_timeout.
+            # Local read_timeout≥600s → effectively disabled (min 60s).
+            _payload_bytes = sum(len(str(m.get("content") or "")) for m in final_messages)
+            _adaptive = max(60, min(self.read_timeout, 30 + _payload_bytes // 2048))
+
+            # Retry loop: on ReadTimeout and 5xx, try up to 3 total attempts with backoff.
+            _max_attempts = 3
+            _last_exc: Optional[BaseException] = None
+            resp = None
+            _retry_loop_failed = False
+            for _attempt in range(1, _max_attempts + 1):
                 if is_aborted and is_aborted():
                     raise RuntimeError("__ABORTED__")
-                raise RuntimeError(f"Ollama connection error: {e}") from e
-            except BaseException as e:
-                error_str = str(e)
-                if "Channel Error" in error_str or "channel error" in error_str.lower():
-                    fatal_msg = (
-                        "LM Studio Channel Error - this is usually caused by:\n"
-                        "  1. Model not understanding tool/JSON format requirements\n"
-                        "  2. Conversation structure becoming malformed\n"
-                        "  3. Model capability limitations\n\n"
-                        "SOLUTION: Try a different model:\n"
-                        "  - llama-3.1-8b-instruct (better tool use)\n"
-                        "  - qwen-2.5-14b-instruct (excellent JSON)\n"
-                        "  - mistral-7b-instruct-v0.3 (good balance)\n\n"
-                        f"Current model '{model}' cannot handle this task.\n"
+                try:
+                    import time as _time
+                    _t0 = _time.monotonic()
+                    resp = self._post(
+                        self._chat_completions_url(),
+                        payload,
+                        (10, _adaptive),
                     )
+                    resp.raise_for_status()
+                    _elapsed = _time.monotonic() - _t0
+                    if log_fn and _attempt > 1:
+                        log_fn(f"[Ollama] Attempt {_attempt} succeeded after {_elapsed:.1f}s", "ok")
+                    _last_exc = None
+                    break
+                except requests.exceptions.HTTPError as e:
+                    status = getattr(getattr(e, "response", None), "status_code", 0)
+                    _last_exc = e
+                    if status == 500:
+                        error_msg = (
+                            "Ollama returned 500 Internal Server Error. "
+                            "Context may be too large; try reducing files or model.\n"
+                        )
+                        print(f"\n[Ollama] {error_msg}", flush=True)
+                        if log_fn:
+                            log_fn(f"[ERROR] {error_msg}", "error")
+                        raise RuntimeError(f"Ollama 500 error - {error_msg}") from e
+                    if status in (429, 502, 503, 504) and _attempt < _max_attempts:
+                        backoff = 2 * _attempt
+                        if log_fn:
+                            log_fn(
+                                f"[Ollama] HTTP {status} (attempt {_attempt}/{_max_attempts}) — "
+                                f"retrying in {backoff}s",
+                                "warn",
+                            )
+                        import time as _time
+                        _time.sleep(backoff)
+                        continue
+                    raise RuntimeError(f"Ollama HTTP {status} error: {e}") from e
+                except requests.exceptions.ReadTimeout as e:
+                    import time as _time
+                    _elapsed = _time.monotonic() - _t0
+                    _last_exc = e
+                    if _attempt < _max_attempts:
+                        backoff = 2 * _attempt
+                        if log_fn:
+                            log_fn(
+                                f"[Ollama] Timeout after {_elapsed:.0f}s "
+                                f"(attempt {_attempt}/{_max_attempts}) — retrying in {backoff}s",
+                                "warn",
+                            )
+                        _time.sleep(backoff)
+                        continue
+                    msg = (
+                        f"Request timed out after {_elapsed:.0f}s (timeout={_adaptive}s) "
+                        f"on attempt {_attempt}/{_max_attempts}. Cloud provider overloaded or "
+                        "context too large."
+                    )
+                    print(f"\n[Ollama] {msg}", flush=True)
                     if log_fn:
-                        log_fn(f"[FATAL] {fatal_msg}", "error")
-                    print(f"\n[FATAL ERROR] {fatal_msg}", flush=True)
-                    raise RuntimeError(f"FATAL: Channel Error - {fatal_msg}") from e
+                        log_fn(f"[ERROR] {msg}", "error")
+                    raise RuntimeError(msg) from e
+                except requests.exceptions.ConnectionError as e:
+                    if is_aborted and is_aborted():
+                        raise RuntimeError("__ABORTED__")
+                    raise RuntimeError(f"Ollama connection error: {e}") from e
+                except BaseException as e:
+                    error_str = str(e)
+                    if "Channel Error" in error_str or "channel error" in error_str.lower():
+                        fatal_msg = (
+                            "LM Studio Channel Error - this is usually caused by:\n"
+                            "  1. Model not understanding tool/JSON format requirements\n"
+                            "  2. Conversation structure becoming malformed\n"
+                            "  3. Model capability limitations\n\n"
+                            "SOLUTION: Try a different model:\n"
+                            "  - llama-3.1-8b-instruct (better tool use)\n"
+                            "  - qwen-2.5-14b-instruct (excellent JSON)\n"
+                            "  - mistral-7b-instruct-v0.3 (good balance)\n\n"
+                            f"Current model '{model}' cannot handle this task.\n"
+                        )
+                        if log_fn:
+                            log_fn(f"[FATAL] {fatal_msg}", "error")
+                        print(f"\n[FATAL ERROR] {fatal_msg}", flush=True)
+                        raise RuntimeError(f"FATAL: Channel Error - {fatal_msg}") from e
 
-                print(f"\n[Ollama] Request failed ({type(e).__name__}): {e!r}", flush=True)
-                traceback.print_exc(file=sys.stdout)
-                raise
+                    print(f"\n[Ollama] Request failed ({type(e).__name__}): {e!r}", flush=True)
+                    traceback.print_exc(file=sys.stdout)
+                    raise
+
+            if resp is None:
+                raise RuntimeError(f"Ollama request failed after {_max_attempts} attempts: {_last_exc}")
 
             data = resp.json()
             choice0 = (data.get("choices") or [{}])[0]
@@ -755,6 +818,38 @@ class OllamaClient:
 
                 call_status = "SUCCESS"
                 error_text = None
+
+                # ── confirm_task_done: block if no successful writes recorded ──
+                if tool_name == "confirm_task_done":
+                    successful_writes_ct = [
+                        h for h in tool_call_history
+                        if h.get("tool_name") in ("write_file", "modify_file")
+                        and h.get("status") == "SUCCESS"
+                        and str(h.get("result", "")).startswith("OK:")
+                    ]
+                    if not successful_writes_ct:
+                        result = (
+                            "[CONFIRM_TASK_DONE REJECTED] No successful write_file or modify_file "
+                            "calls in history. The task requires actual file changes. "
+                            "Write/modify the required files first, then call confirm_task_done."
+                        )
+                        if log_fn:
+                            log_fn(
+                                "  [GUARD] confirm_task_done rejected — no writes yet",
+                                "warn",
+                            )
+                        print(f"[CONFIRM_TASK_DONE] Rejected — no writes in history", flush=True)
+                        tool_call_history.append({
+                            "tool_name": tool_name,
+                            "arguments": raw_args,
+                            "status": "REJECTED",
+                            "result": _truncate(result, 400),
+                        })
+                        tool_message = {"role": "tool", "content": result}
+                        if tc.get("id"):
+                            tool_message["tool_call_id"] = tc["id"]
+                        messages.append(tool_message)
+                        continue
 
                 # ── confirm_phase_done: validate history before allowing exit ──
                 if tool_name == "confirm_phase_done":
@@ -924,6 +1019,35 @@ class OllamaClient:
                 else:
                     _last_call = call_key
                     _repeat_count = 1
+
+                # Death-spiral detector: 3 consecutive FAILED tool calls with
+                # error-shaped results → inject a hint and break to avoid burning
+                # rounds on the same wall.
+                _result_str = str(result)
+                _is_err = (call_status == "FAILED"
+                           or _result_str.startswith(("ERROR:", "BLOCKED:", "[CONFIRM")))
+                if _is_err:
+                    _err_signature = f"{tool_name}:{_result_str[:120]}"
+                    if _err_signature == _spiral_last:
+                        _spiral_count += 1
+                    else:
+                        _spiral_last = _err_signature
+                        _spiral_count = 1
+                    if _spiral_count >= 3:
+                        hint = (
+                            f"🚨 STOP — '{tool_name}' has failed 3 times with the same error. "
+                            "Do NOT call it again. Try a different approach: read an existing file to "
+                            "discover the correct path, or call confirm_phase_done / submit verdict "
+                            "reporting the blocker."
+                        )
+                        messages.append({"role": "user", "content": hint})
+                        if log_fn:
+                            log_fn(f"  [DEATH-SPIRAL] {tool_name} failed 3× — injecting hint", "warn")
+                        _spiral_count = 0
+                        _spiral_last = ""
+                else:
+                    _spiral_count = 0
+                    _spiral_last = ""
 
                 if _rounds_without_write >= READ_MAX_ROUNDS:
                     if log_fn:

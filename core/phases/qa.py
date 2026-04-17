@@ -160,6 +160,9 @@ class QAPhase(BasePhase):
         branch_diff: str = "",
     ) -> tuple[str, list[str], str]:
         workdir = os.path.join(self.task.task_dir, WORKDIR_NAME)
+        # Ensure workdir exists so list_directory('.') can resolve even when
+        # planning hasn't been re-run (e.g. resuming QA on a stale task).
+        os.makedirs(workdir, exist_ok=True)
         executor = self._make_executor(workdir)
 
         subtask_detail = "\n".join(

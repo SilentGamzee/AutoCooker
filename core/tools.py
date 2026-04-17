@@ -412,9 +412,25 @@ class ToolExecutor:
         on_content_cached: Optional[Callable[[str, str], None]] = None,
         log_fn: Optional[Callable[[str, str], None]] = None,
         sandbox: Optional['core.sandbox.Sandbox'] = None,
+        fallback_read_root: Optional[str] = None,
     ):
         self.working_dir = os.path.realpath(working_dir)
+        # Secondary read-only root: if a file is listed in cached paths but not
+        # present in working_dir (e.g. workdir not populated for this path),
+        # read from fallback_read_root. Writes always go to working_dir.
+        self.fallback_read_root = os.path.realpath(fallback_read_root) if fallback_read_root else None
         self.cache = cache
+        # Hook cache eviction → purge session_read_files so [ALREADY READ] never
+        # lies about content availability.
+        try:
+            prev_on_evict = getattr(cache, "on_evict", None)
+            def _composite_evict(rel: str, _prev=prev_on_evict):
+                self.session_read_files.pop(rel, None)
+                if callable(_prev):
+                    _prev(rel)
+            cache.on_evict = _composite_evict
+        except Exception:
+            pass
         self.on_task_confirmed = on_task_confirmed
         self.on_task_created = on_task_created
         # Called with (rel_path, content) after every write_file or modify_file
@@ -514,19 +530,27 @@ class ToolExecutor:
 
         rel = self._to_rel(abs_path)
 
-        # Session-level deduplication: if already read, return cached content with note.
-        # This prevents the model from re-reading the same file multiple times during
-        # the read phase of Discovery.
-        if self.session_read_files and rel in self.session_read_files:
+        # Session-level deduplication: return [ALREADY READ] ONLY when the
+        # content is still in cache — so the model can rely on it being present
+        # somewhere in context. If the cache dropped it (LRU eviction), fall
+        # through and actually re-read from disk.
+        if rel in self.session_read_files and self.cache.has_content(rel):
             return (
-                f"[ALREADY READ] {rel} — content is in 'Read files from last call:'. "
+                f"[ALREADY READ] {rel} — content is in 'Relevant cached files'. "
                 f"Do NOT call read_file on this path again."
             )
 
-        if not os.path.isfile(abs_path):
+        # Primary: working_dir; fallback: fallback_read_root (e.g. project_path)
+        read_path = abs_path if os.path.isfile(abs_path) else None
+        if read_path is None and self.fallback_read_root:
+            fb = os.path.realpath(os.path.join(self.fallback_read_root, rel))
+            if fb.startswith(self.fallback_read_root) and os.path.isfile(fb):
+                read_path = fb
+
+        if read_path is None:
             return f"ERROR: File not found: {path_raw}"
         try:
-            with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
+            with open(read_path, "r", encoding="utf-8", errors="replace") as f:
                 content = f.read()
             self.cache.update_content(rel, content)
             if self.on_content_cached:

@@ -51,13 +51,45 @@ def _extract_style_audit(project_path: str) -> str:
 
 # ── Validators ────────────────────────────────────────────────────
 
+def _lenient_json_loads(raw: str):
+    """Try strict parse, then strip ```json fences, strip control chars and trailing commas, then repair."""
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+    s = raw.strip()
+    # Strip ```json ... ``` fences if present
+    fence = re.match(r"^```(?:json|JSON)?\s*\n(.*)\n```\s*$", s, re.DOTALL)
+    if fence:
+        s = fence.group(1)
+    # Remove raw control chars that commonly break Gemini output
+    s2 = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", s)
+    try:
+        return json.loads(s2)
+    except json.JSONDecodeError:
+        pass
+    # Remove trailing commas before } or ]
+    s3 = re.sub(r",(\s*[}\]])", r"\1", s2)
+    try:
+        return json.loads(s3)
+    except json.JSONDecodeError:
+        pass
+    # Last resort: structural repair
+    try:
+        from core.json_repair import repair_json
+        repaired, _ = repair_json(s3)
+        return json.loads(repaired)
+    except Exception as e:
+        raise json.JSONDecodeError(str(e), raw, 0)
+
+
 def _read_json(path: str) -> tuple[bool, dict | list | None, str]:
     if not os.path.isfile(path):
         return False, None, f"Not found: {path}"
     try:
         with open(path, "r", encoding="utf-8") as f:
             raw = f.read()
-        data = json.loads(raw)
+        data = _lenient_json_loads(raw)
         return True, data, ""
     except json.JSONDecodeError as e:
         pos = e.pos or 0

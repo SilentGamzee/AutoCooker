@@ -127,19 +127,34 @@ class BasePhase:
                 "\n\n---\n## Cached project file paths\n```\n"
                 + cache.paths_summary() + "\n```"
             )
-        if cache.file_contents:
-            current_files = getattr(self.task, "_current_subtask_files", None)
-            if current_files:
-                # Only show files relevant to the current subtask (SIMP-6)
-                relevant = {p: c for p, c in cache.file_contents.items() if p in current_files}
-            else:
-                relevant = cache.file_contents
-            if relevant:
-                parts_list = [
-                    f"### {p}\n```\n{c[:3000]}\n```"
-                    for p, c in list(relevant.items())[:3]
-                ]
-                parts.append("\n\n---\n## Relevant cached files\n" + "\n\n".join(parts_list))
+        # HOT tier: small, full-content injection. COLD tier: listed as skeletons
+        # so the model knows they exist without paying the token cost.
+        current_files = getattr(self.task, "_current_subtask_files", None)
+        hot_entries = cache.get_hot_for_prompt(max_chars=12000, per_file_cap=3000)
+        if current_files:
+            hot_entries = [(p, c) for p, c in hot_entries if p in current_files] or hot_entries
+        if hot_entries:
+            parts_list = [f"### {p}\n```\n{c}\n```" for p, c in hot_entries]
+            parts.append("\n\n---\n## Relevant cached files (full)\n" + "\n\n".join(parts_list))
+
+        cold_paths = [p for p in cache.cold_paths() if not current_files or p in current_files]
+        if cold_paths:
+            skeleton_blocks: list[str] = []
+            budget = 4000
+            for p in cold_paths[:12]:
+                c = cache.get_content(p) or ""
+                sk = cache.skeleton(p, c)
+                if len(sk) > 600:
+                    sk = sk[:600] + "\n…(truncated skeleton)"
+                skeleton_blocks.append(sk)
+                budget -= len(sk)
+                if budget <= 0:
+                    break
+            if skeleton_blocks:
+                parts.append(
+                    "\n\n---\n## Other cached files (skeletons — call read_file for full content)\n"
+                    + "\n\n".join(skeleton_blocks)
+                )
         recent_logs = self.task.logs[-10:]
         if recent_logs:
             log_lines = "\n".join(
@@ -817,6 +832,10 @@ Token count: {token_count} / {config['max_total_tokens']}
                 task.task_dir,
                 task.project_path or self.state.working_dir,
             ),
+            # Fallback: if a file listed in cache is missing from wd
+            # (e.g. workdir not populated for this path), read it from the
+            # source project. Writes still go to wd.
+            fallback_read_root=task.project_path or self.state.working_dir,
             **kwargs,
         )
 
@@ -915,6 +934,11 @@ Token count: {token_count} / {config['max_total_tokens']}
         last_read_files: dict[str, dict[str, object]] = (
             shared_last_read_files if shared_last_read_files is not None else {}
         )
+        # ── Phase metrics: accumulate time spent on LLM vs tools ────
+        import time as _metrics_time
+        _metrics_start = _metrics_time.monotonic()
+        _metrics_llm_calls = 0
+        _metrics_retries = 0
         for outer in range(max_outer_iterations):
             # ── Abort checkpoint ──────────────────────────────────
             self.state.check_abort(self.task.id)
@@ -968,14 +992,36 @@ Token count: {token_count} / {config['max_total_tokens']}
             if _DEBUG: print(f"[RUN_LOOP] Validation result: ok={ok}", flush=True)
             if ok:
                 self.log(f"  ✓ Validation passed: {step_name}", "ok")
+                _elapsed = _metrics_time.monotonic() - _metrics_start
+                self.log(
+                    f"  [METRICS] step='{step_name}' elapsed={_elapsed:.1f}s "
+                    f"iterations={outer + 1} retries={_metrics_retries} tool_calls={tool_calls_made}",
+                    "info",
+                )
                 return True
             else:
+                _metrics_retries += 1
+                # INFRA: prefix means the critic output file was never written —
+                # likely a timeout/5xx killed the sub-phase. Log it specially so it
+                # stands out from "LLM returned bad output" failures.
+                if isinstance(reason, str) and reason.startswith("INFRA:"):
+                    self.log(
+                        f"  [INFRA-FAIL] Step '{step_name}' — output missing; "
+                        "likely timeout or provider error. Retrying.",
+                        "warn",
+                    )
                 # Валидация failed
                 if outer == max_outer_iterations - 1:
                     # Последняя итерация - показываем полную ошибку и выходим
                     self.log(f"  ✗ Validation failed: {reason}", "error")
                     self.log(
                         f"  [WARN] Step '{step_name}' exhausted {max_outer_iterations} iterations",
+                        "warn",
+                    )
+                    _elapsed = _metrics_time.monotonic() - _metrics_start
+                    self.log(
+                        f"  [METRICS] step='{step_name}' FAILED elapsed={_elapsed:.1f}s "
+                        f"iterations={outer + 1} retries={_metrics_retries}",
                         "warn",
                     )
                     return False

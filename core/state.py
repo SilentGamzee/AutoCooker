@@ -2,9 +2,11 @@
 from __future__ import annotations
 import json
 import os
+import re
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 
 
 # ─── Log entry ────────────────────────────────────────────────────
@@ -73,10 +75,38 @@ class Subtask:
 
 # ─── File cache ───────────────────────────────────────────────────
 class FileCache:
+    """Two-tier LRU cache.
+
+    hot: small set of files injected into the system prompt in full.
+    cold: larger set holding recently-read/written files — NOT injected in full,
+          only as skeletons. Used for fast tool responses without disk IO.
+
+    Increasing `cold` capacity does NOT inflate prompt size, because only `hot`
+    is rendered into the prompt body.
+    """
+
+    HOT_LIMIT = 8
+    COLD_LIMIT = 60
+
     def __init__(self):
         self.file_paths: list[str] = []
-        self.file_contents: dict[str, str] = {}
+        self._hot: "OrderedDict[str, str]" = OrderedDict()
+        self._cold: "OrderedDict[str, str]" = OrderedDict()
         self._root: str = ""
+        # Callback(rel_path) fired when a path is evicted entirely (from both tiers).
+        # Used by ToolExecutor to purge its session_read_files dedup.
+        self.on_evict: Optional[Callable[[str], None]] = None
+
+    # ── Back-compat dict-like view ───────────────────────────────
+    @property
+    def file_contents(self) -> dict[str, str]:
+        """Read-only merged view for legacy callers (hot + cold, hot last = most recent)."""
+        merged: dict[str, str] = {}
+        for k, v in self._cold.items():
+            merged[k] = v
+        for k, v in self._hot.items():
+            merged[k] = v
+        return merged
 
     def update_file_paths(self, root: str, subdir: str = "") -> list[str]:
         self._root = root
@@ -97,35 +127,171 @@ class FileCache:
                     new_paths.append(rel)
         return new_paths
 
-    def update_content(self, rel_path: str, content: str):
-        # Simple FIFO eviction: remove the oldest entry when cache is full.
-        # This prevents unbounded memory growth across long Planning+Coding sessions.
-        # The value 20 is generous enough to keep all actively used files in memory
-        # while preventing stale early-phase files from bloating the system prompt.
-        MAX_CACHED_FILES = 20
-        if rel_path in self.file_contents:
-            # Move to end (most recently used) by re-inserting
-            del self.file_contents[rel_path]
-        elif len(self.file_contents) >= MAX_CACHED_FILES:
-            # Evict oldest (first inserted)
-            oldest = next(iter(self.file_contents))
-            del self.file_contents[oldest]
-        self.file_contents[rel_path] = content
+    # ── Tier management ──────────────────────────────────────────
+    def _promote(self, rel_path: str, content: str) -> None:
+        """Put file in hot tier (most recently used). Evict LRU hot→cold if over limit."""
+        self._cold.pop(rel_path, None)
+        if rel_path in self._hot:
+            self._hot.move_to_end(rel_path)
+            self._hot[rel_path] = content
+            return
+        self._hot[rel_path] = content
+        while len(self._hot) > self.HOT_LIMIT:
+            old_key, old_val = self._hot.popitem(last=False)
+            self._cold[old_key] = old_val
+            self._cold.move_to_end(old_key)
+        self._evict_cold_if_full()
+
+    def _evict_cold_if_full(self) -> None:
+        while len(self._cold) > self.COLD_LIMIT:
+            evicted_key, _ = self._cold.popitem(last=False)
+            if self.on_evict:
+                try:
+                    self.on_evict(evicted_key)
+                except Exception:
+                    pass
+
+    def update_content(self, rel_path: str, content: str) -> None:
+        self._promote(rel_path, content)
 
     def get_content(self, rel_path: str) -> Optional[str]:
-        return self.file_contents.get(rel_path)
-    
+        if rel_path in self._hot:
+            self._hot.move_to_end(rel_path)
+            return self._hot[rel_path]
+        if rel_path in self._cold:
+            # Touch in cold tier; do not auto-promote on read — only on explicit use.
+            self._cold.move_to_end(rel_path)
+            return self._cold[rel_path]
+        return None
+
+    def has_content(self, rel_path: str) -> bool:
+        return rel_path in self._hot or rel_path in self._cold
+
+    def purge(self, rel_path: str) -> None:
+        """Remove from both tiers. Caller-initiated eviction."""
+        removed = False
+        if rel_path in self._hot:
+            del self._hot[rel_path]
+            removed = True
+        if rel_path in self._cold:
+            del self._cold[rel_path]
+            removed = True
+        if removed and self.on_evict:
+            try:
+                self.on_evict(rel_path)
+            except Exception:
+                pass
+
     def get_all_contents(self) -> dict[str, str]:
-        return self.file_contents.copy()
+        return self.file_contents
 
     def paths_summary(self) -> str:
         return "\n".join(self.file_paths) if self.file_paths else "(no files cached yet)"
 
+    def hot_paths(self) -> list[str]:
+        return list(self._hot.keys())
+
+    def cold_paths(self) -> list[str]:
+        return list(self._cold.keys())
+
+    def get_hot_for_prompt(self, max_chars: int = 12000, per_file_cap: int = 3000) -> list[tuple[str, str]]:
+        """Return [(path, rendered_content)] for prompt injection, fitting under max_chars total."""
+        out: list[tuple[str, str]] = []
+        used = 0
+        # Iterate from most-recently-used (hot end) to oldest.
+        for path in reversed(list(self._hot.keys())):
+            content = self._hot[path]
+            snippet = content[:per_file_cap]
+            entry_len = len(path) + len(snippet) + 16  # headers/fences
+            if used + entry_len > max_chars and out:
+                break
+            out.append((path, snippet))
+            used += entry_len
+        return out
+
+    def skeleton(self, rel_path: str, content: Optional[str] = None) -> str:
+        """Compact structural view: signatures, keys, headings. Used for cold files."""
+        if content is None:
+            content = self.get_content(rel_path)
+        if content is None:
+            return f"(not cached)"
+        return _skeleton(rel_path, content)
+
     def contents_summary(self) -> str:
-        if not self.file_contents:
+        merged = self.file_contents
+        if not merged:
             return "(no file contents cached yet)"
-        parts = [f"### {p}\n```\n{c}\n```" for p, c in self.file_contents.items()]
+        parts = [f"### {p}\n```\n{c}\n```" for p, c in merged.items()]
         return "\n\n".join(parts)
+
+
+def _skeleton(rel_path: str, content: str, max_lines: int = 40) -> str:
+    """Produce a compact skeleton of a file's structure for prompt context.
+
+    Python: def/class signatures + first docstring line.
+    JSON: top-level keys (and type).
+    Markdown: headings.
+    Otherwise: first and last few lines.
+    """
+    ext = os.path.splitext(rel_path)[1].lower()
+    lines: list[str] = []
+    try:
+        if ext == ".py":
+            src_lines = content.splitlines()
+            for i, ln in enumerate(src_lines):
+                m = re.match(r"^(\s*)(def |class |async def )(\w[\w_]*)", ln)
+                if m:
+                    sig = ln.rstrip()
+                    # Attempt to grab docstring first line
+                    doc = ""
+                    for j in range(i + 1, min(i + 4, len(src_lines))):
+                        s = src_lines[j].strip()
+                        if s.startswith(("\"\"\"", "'''")):
+                            doc = s.strip("\"'` ").splitlines()[0] if s else ""
+                            break
+                    lines.append(sig + (f"  # {doc}" if doc else ""))
+                    if len(lines) >= max_lines:
+                        lines.append("…")
+                        break
+        elif ext == ".json":
+            try:
+                obj = json.loads(content)
+                if isinstance(obj, dict):
+                    for k, v in list(obj.items())[:max_lines]:
+                        lines.append(f"{k}: {type(v).__name__}")
+                elif isinstance(obj, list):
+                    lines.append(f"(list of {len(obj)} items)")
+            except Exception:
+                lines.append("(invalid JSON)")
+        elif ext in (".md", ".markdown"):
+            for ln in content.splitlines():
+                if ln.startswith("#"):
+                    lines.append(ln.rstrip())
+                    if len(lines) >= max_lines:
+                        break
+        elif ext in (".js", ".ts", ".tsx", ".jsx"):
+            for ln in content.splitlines():
+                if re.match(r"^\s*(export\s+)?(async\s+)?function\s+\w+", ln) or \
+                   re.match(r"^\s*(export\s+)?class\s+\w+", ln) or \
+                   re.match(r"^\s*(const|let|var)\s+\w+\s*=\s*(async\s*)?\(", ln):
+                    lines.append(ln.rstrip())
+                    if len(lines) >= max_lines:
+                        lines.append("…")
+                        break
+        if not lines:
+            src_lines = content.splitlines()
+            head = src_lines[:6]
+            tail = src_lines[-3:] if len(src_lines) > 9 else []
+            lines.extend(head)
+            if tail:
+                lines.append("…")
+                lines.extend(tail)
+    except Exception as e:
+        return f"(skeleton error: {e})"
+    total = len(content)
+    header = f"# skeleton of {rel_path} ({total} chars)"
+    body = "\n".join(lines) if lines else "(empty)"
+    return f"{header}\n{body}"
 
 
 # ─── Kanban task ──────────────────────────────────────────────────

@@ -8,13 +8,35 @@ from typing import Tuple
 
 def _load_json(path: str) -> Tuple[bool, dict | list | None, str]:
     if not os.path.isfile(path):
-        return False, None, f"File not found: {path}"
+        # Distinguish "never written" (the tool was never called) from
+        # "malformed" — caller uses INFRA: prefix to suppress retry counting.
+        return False, None, f"INFRA: artifact missing (tool never wrote it): {path}"
     try:
         with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return True, data, ""
-    except json.JSONDecodeError as e:
-        return False, None, f"JSON parse error: {e}"
+            raw = f.read()
+    except OSError as e:
+        return False, None, f"INFRA: read error: {e}"
+    try:
+        return True, json.loads(raw), ""
+    except json.JSONDecodeError:
+        pass
+    # Lenient: strip control chars + trailing commas + ```json fences, then repair.
+    try:
+        s = raw.strip()
+        m = re.match(r"^```(?:json|JSON)?\s*\n(.*)\n```\s*$", s, re.DOTALL)
+        if m:
+            s = m.group(1)
+        s = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", s)
+        s = re.sub(r",(\s*[}\]])", r"\1", s)
+        try:
+            return True, json.loads(s), ""
+        except json.JSONDecodeError:
+            pass
+        from core.json_repair import repair_json
+        repaired, _ = repair_json(s)
+        return True, json.loads(repaired), ""
+    except Exception as e:
+        return False, None, f"JSON parse error (after lenient repair): {e}"
 
 
 def validate_task_info(path: str) -> Tuple[bool, str]:
