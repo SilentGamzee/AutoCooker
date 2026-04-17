@@ -626,6 +626,20 @@ class ToolExecutor:
     def _write_file(self, args: dict) -> str:
         path_raw = args.get("path", "")
         content  = args.get("content", "")
+
+        # Guard: empty path means the model forgot to include it
+        if not path_raw or not path_raw.strip():
+            msg = (
+                "ERROR: 'path' argument is missing or empty. "
+                "You must specify the file path, e.g.: "
+                "'.tasks/task_NNN/actions/T001.json' for action files, "
+                "or '.tasks/task_NNN/spec.json' for spec. "
+                "Retry write_file with the correct 'path' value."
+            )
+            if self.log_fn:
+                self.log_fn(f"  [write_file] missing path: {msg}", "warn")
+            return msg
+
         abs_path = self._safe_path(path_raw)
 
         # Validate path with sandbox

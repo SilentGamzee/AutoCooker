@@ -149,19 +149,27 @@ function getProviderError(task) {
     task.models?.qa,
   ].filter(Boolean);
   if (!models.length) return '';
+  // Normalize model id: strip provider prefix (e.g. "gemini-cli/gemini-2.5-flash" → "gemini-2.5-flash")
+  const normalize = id => id.includes('/') ? id.split('/').slice(1).join('/') : id;
 
   const allProviders = Object.values(cachedModelsByProvider);
-  const activeModels = new Set(
-    allProviders.filter(p => p.is_active).flatMap(p => p.models)
-  );
+  // Build set of all active model IDs, both raw and normalized
+  const activeModels = new Set();
+  allProviders.filter(p => p.is_active).flatMap(p => p.models).forEach(m => {
+    activeModels.add(m);
+    activeModels.add(normalize(m));
+  });
 
   const errors = [];
   const seen = new Set();
   for (const m of models) {
     if (seen.has(m)) continue;
     seen.add(m);
-    if (!activeModels.has(m)) {
-      const owner = allProviders.find(p => p.models.includes(m));
+    if (!activeModels.has(m) && !activeModels.has(normalize(m))) {
+      const owner = allProviders.find(p =>
+        p.models.includes(m) || p.models.includes(normalize(m)) ||
+        p.models.some(pm => normalize(pm) === normalize(m))
+      );
       if (owner && !owner.is_active) {
         errors.push(`Model '${m}' — provider '${owner.name}' is inactive`);
       } else {

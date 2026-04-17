@@ -301,16 +301,23 @@ class ProvidersManager:
             base_url=provider.base_url,
             api_key=provider.api_key,
             read_timeout=self._read_timeout_for(provider),
-            auth_style="urllib" if provider.type == "gemini" else "bearer",
+            auth_style="gemini_native" if provider.type == "gemini" else "bearer",
         )
+
+    @staticmethod
+    def _normalize_model_id(model_id: str) -> str:
+        """Strip provider prefix: 'gemini-cli/gemini-2.5-flash' → 'gemini-2.5-flash'."""
+        return model_id.split("/", 1)[-1] if "/" in model_id else model_id
 
     def make_client_for_model(self, model_id: str) -> "OllamaClient":
         """
         Return an OllamaClient configured for the provider that has model_id.
         Falls back to the first active provider if model cannot be found.
         """
+        norm_id = self._normalize_model_id(model_id)
         for p in self.get_active():
-            if model_id in self.fetch_models_for(p):
+            provider_models = self.fetch_models_for(p)
+            if model_id in provider_models or norm_id in provider_models:
                 return self._make_client(p)
         # Fallback: first active provider
         active = self.get_active()
