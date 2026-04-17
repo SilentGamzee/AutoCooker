@@ -87,33 +87,182 @@ class OllamaClient:
                 err.response = self  # type: ignore[attr-defined]
                 raise err
 
-    def _urllib_post(self, url: str, json_payload: dict, headers: dict, timeout) -> "_UrllibResponse":
+    # ── Gemini native API (bypasses OpenAI compat layer entirely) ──────────────
+
+    def _gemini_native_post(self, json_payload: dict, timeout) -> "_UrllibResponse":
         """
-        POST via stdlib urllib — bypasses google-auth's monkey-patching of requests.
-        Used for Gemini to prevent google-generativeai from injecting a second Bearer token.
+        Call Gemini's native generateContent API with ?key= auth.
+        Bypasses the /v1beta/openai/ compat endpoint which conflicts with
+        system-level Google OAuth credentials (AQ. token format).
+        Translates OpenAI request/response format ↔ Gemini native format.
         """
         import json as _json
-        import urllib.request as _ur
-        import urllib.error as _ue
+        import http.client as _hc
         import ssl as _ssl
+        from urllib.parse import urlparse as _up
 
-        body = _json.dumps(json_payload).encode("utf-8")
-        req_headers = {
+        model = json_payload.get("model", "gemini-2.0-flash")
+        messages = json_payload.get("messages", [])
+        tools = json_payload.get("tools", [])
+
+        gemini_req = self._openai_to_gemini(messages, tools)
+
+        # Host from base_url (strip any path)
+        parsed = _up(self.base_url)
+        host = parsed.netloc
+        path = f"/v1beta/models/{model}:generateContent"
+
+        body = _json.dumps(gemini_req).encode("utf-8")
+        headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
-            **headers,
+            "User-Agent": "python-httpclient/3",
+            "X-goog-api-key": self.api_key,
         }
-        req = _ur.Request(url, data=body, headers=req_headers, method="POST")
-        ctx = _ssl.create_default_context()  # verify SSL properly
+        print(f"[gemini_native] POST https://{host}{path[:60]}…", flush=True)
 
-        read_t = timeout[1] if isinstance(timeout, tuple) else timeout
+        read_t = timeout[1] if isinstance(timeout, tuple) else (timeout or 120)
+        ctx = _ssl.create_default_context()
+        conn = _hc.HTTPSConnection(host, timeout=read_t, context=ctx)
         try:
-            with _ur.urlopen(req, context=ctx, timeout=read_t) as resp:
-                resp_body = resp.read()
-                return self._UrllibResponse(resp.status, resp_body, dict(resp.headers))
-        except _ue.HTTPError as e:
-            resp_body = e.read()
-            return self._UrllibResponse(e.code, resp_body, dict(e.headers))
+            conn.request("POST", path, body=body, headers=headers)
+            resp = conn.getresponse()
+            resp_body = resp.read()
+            status = resp.status
+            print(f"[gemini_native] status={status}", flush=True)
+            if 200 <= status < 300:
+                gemini_resp = _json.loads(resp_body)
+                openai_resp = self._gemini_to_openai(gemini_resp)
+                return self._UrllibResponse(status, _json.dumps(openai_resp).encode(), {})
+            else:
+                print(f"[gemini_native] error body: {resp_body[:500]}", flush=True)
+                return self._UrllibResponse(status, resp_body, {})
+        except (TimeoutError, OSError, ConnectionError, _hc.HTTPException) as e:
+            msg = (
+                f"Network error communicating with Gemini API ({type(e).__name__}: {e}). "
+                f"The request will be retried."
+            )
+            print(f"[gemini_native] {msg}", flush=True)
+            raise RuntimeError(msg) from e
+        finally:
+            conn.close()
+
+    def _openai_to_gemini(self, messages: list, tools: list) -> dict:
+        """Translate OpenAI messages + tools to Gemini native request format."""
+        import json as _json
+
+        system_instruction = None
+        contents = []
+        # Map tool_call_id → function_name for resolving tool result messages
+        tc_id_to_name: dict[str, str] = {}
+
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content") or ""
+
+            if role == "system":
+                system_instruction = {"parts": [{"text": content}]}
+                continue
+
+            if role == "assistant":
+                parts = []
+                if content:
+                    parts.append({"text": content})
+                for tc in (msg.get("tool_calls") or []):
+                    fn = tc.get("function", {})
+                    args = fn.get("arguments", {})
+                    if isinstance(args, str):
+                        try:
+                            args = _json.loads(args)
+                        except Exception:
+                            args = {}
+                    fn_name = fn.get("name", "")
+                    tc_id_to_name[tc.get("id", "")] = fn_name
+                    parts.append({"functionCall": {"name": fn_name, "args": args}})
+                if parts:
+                    contents.append({"role": "model", "parts": parts})
+                continue
+
+            if role == "tool":
+                # Resolve function name via tool_call_id
+                tc_id = msg.get("tool_call_id", "")
+                fn_name = tc_id_to_name.get(tc_id, "unknown")
+                result_str = content if isinstance(content, str) else str(content)
+                fn_resp = {"functionResponse": {
+                    "name": fn_name,
+                    "response": {"content": result_str},
+                }}
+                # Batch consecutive tool responses into one user content
+                if contents and contents[-1].get("role") == "user" and \
+                        any("functionResponse" in p for p in contents[-1].get("parts", [])):
+                    contents[-1]["parts"].append(fn_resp)
+                else:
+                    contents.append({"role": "user", "parts": [fn_resp]})
+                continue
+
+            # user role
+            if isinstance(content, list):
+                parts = [{"text": c["text"]} for c in content if c.get("type") == "text"]
+            else:
+                parts = [{"text": content}]
+            # Merge consecutive user messages
+            if contents and contents[-1].get("role") == "user" and \
+                    not any("functionResponse" in p for p in contents[-1].get("parts", [])):
+                contents[-1]["parts"].extend(parts)
+            else:
+                contents.append({"role": "user", "parts": parts})
+
+        req: dict = {"contents": contents}
+        if system_instruction:
+            req["systemInstruction"] = system_instruction
+        if tools:
+            fn_decls = []
+            for t in tools:
+                fn = t.get("function", {})
+                decl: dict = {"name": fn.get("name", ""), "description": fn.get("description", "")}
+                if fn.get("parameters"):
+                    decl["parameters"] = fn["parameters"]
+                fn_decls.append(decl)
+            req["tools"] = [{"functionDeclarations": fn_decls}]
+            req["toolConfig"] = {"functionCallingConfig": {"mode": "AUTO"}}
+        return req
+
+    def _gemini_to_openai(self, gemini_resp: dict) -> dict:
+        """Translate Gemini native response to OpenAI response format."""
+        import json as _json
+        import uuid as _uuid
+
+        candidates = gemini_resp.get("candidates", [{}])
+        candidate = candidates[0] if candidates else {}
+        parts = (candidate.get("content") or {}).get("parts", [])
+        finish = candidate.get("finishReason", "STOP").upper()
+        finish_map = {"STOP": "stop", "MAX_TOKENS": "length", "SAFETY": "stop"}
+        finish_reason = finish_map.get(finish, "stop")
+
+        text = "\n".join(p["text"] for p in parts if "text" in p)
+        tool_calls = []
+        for p in parts:
+            if "functionCall" in p:
+                fc = p["functionCall"]
+                tool_calls.append({
+                    "id": f"call_{_uuid.uuid4().hex[:8]}",
+                    "type": "function",
+                    "function": {
+                        "name": fc.get("name", ""),
+                        "arguments": _json.dumps(fc.get("args", {}), ensure_ascii=False),
+                    },
+                })
+        if tool_calls:
+            finish_reason = "tool_calls"
+
+        message: dict = {"role": "assistant", "content": text}
+        if tool_calls:
+            message["tool_calls"] = tool_calls
+
+        return {
+            "choices": [{"message": message, "finish_reason": finish_reason, "index": 0}],
+            "model": gemini_resp.get("modelVersion", "gemini"),
+        }
 
     # ── Session management ────────────────────────────────────────
 
@@ -190,12 +339,12 @@ class OllamaClient:
 
         def _do_post():
             try:
-                print(f"[THREAD] POST {url[:80]}", flush=True)
-                if self.auth_style == "urllib":
-                    # google-auth patches requests globally on machines with google-generativeai
-                    # installed, injecting a second Bearer token. Using urllib bypasses this.
-                    result = self._urllib_post(url, json_payload, auth_headers, timeout)
+                if self.auth_style == "gemini_native":
+                    # Use Gemini's native generateContent API (bypasses /v1beta/openai/
+                    # compat layer which conflicts with system Google OAuth credentials)
+                    result = self._gemini_native_post(json_payload, timeout)
                 else:
+                    print(f"[THREAD] POST {url[:80]}", flush=True)
                     sess = self._sess()
                     req = requests.Request("POST", url, json=json_payload, headers=auth_headers)
                     prepped = sess.prepare_request(req)
@@ -656,6 +805,18 @@ class OllamaClient:
                         log_fn(f"[FATAL] {fatal_msg}", "error")
                     print(f"\n[FATAL ERROR] {fatal_msg}", flush=True)
                     raise RuntimeError(f"FATAL: Channel Error - {fatal_msg}") from e
+
+                # Convert native network/timeout errors to RuntimeError so that
+                # run_loop can catch them and retry instead of crashing the phase.
+                if isinstance(e, (TimeoutError, OSError, ConnectionError, EOFError)):
+                    msg = (
+                        f"Network error during API request ({type(e).__name__}: {e}). "
+                        f"Will retry."
+                    )
+                    print(f"\n[Ollama] {msg}", flush=True)
+                    if log_fn:
+                        log_fn(f"[ERROR] {msg}", "error")
+                    raise RuntimeError(msg) from e
 
                 print(f"\n[Ollama] Request failed ({type(e).__name__}): {e!r}", flush=True)
                 traceback.print_exc(file=sys.stdout)

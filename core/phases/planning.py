@@ -3265,6 +3265,13 @@ Be concrete and specific. Return ONLY the JSON, no other text.
         # the same directory into workdir. This gives the coding agent real
         # context — it sees what already exists in that directory and can match
         # naming conventions, imports, and code style without guessing.
+        _SIBLING_SKIP_EXTS = {
+            ".log", ".lock", ".pyc", ".pyo", ".pyd",
+            ".exe", ".dll", ".so", ".bin", ".zip", ".tar", ".gz",
+            ".png", ".jpg", ".jpeg", ".gif", ".ico", ".svg",
+        }
+        _SIBLING_MAX_BYTES = 200 * 1024  # 200 KB — skip large non-code files
+
         for subtask in self.task.subtasks:
             for new_file in subtask.get("files_to_create", []):
                 if not new_file:
@@ -3276,6 +3283,9 @@ Be concrete and specific. Return ONLY the JSON, no other text.
                     and p not in to_copy
                     and not p.startswith(".tasks")
                     and not p.startswith(".git")
+                    and os.path.splitext(p)[1].lower() not in _SIBLING_SKIP_EXTS
+                    and os.path.getsize(os.path.join(project, p)) <= _SIBLING_MAX_BYTES
+                    if os.path.isfile(os.path.join(project, p))
                 ]
                 # Copy up to 4 siblings — enough for patterns, not overwhelming
                 for sib in siblings[:4]:

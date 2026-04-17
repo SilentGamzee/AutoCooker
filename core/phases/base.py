@@ -954,6 +954,12 @@ Token count: {token_count} / {config['max_total_tokens']}
                     self.state.abort_requested.discard(self.task.id)
                     raise TaskAbortedError(self.task.id)
                 self.log(f"  [ERROR] Ollama: {e}", "error")
+                # Brief pause after network errors to avoid hammering the API
+                err_str = str(e)
+                if any(kw in err_str for kw in ("Network error", "timed out", "connection", "TimeoutError")):
+                    import time as _time
+                    self.log("  [RETRY] Network error — waiting 5s before retry…", "warn")
+                    _time.sleep(5)
                 continue
             except Exception as e:
                 # Логирование неожиданных ошибок
