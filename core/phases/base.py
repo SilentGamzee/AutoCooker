@@ -987,11 +987,10 @@ Token count: {token_count} / {config['max_total_tokens']}
                     self.state.abort_requested.discard(self.task.id)
                     raise TaskAbortedError(self.task.id)
                 self.log(f"  [ERROR] Ollama: {e}", "error")
-                # Network errors get a short outer retry with a small circuit-
-                # breaker: after 2 consecutive network failures the whole step
-                # fails instead of spinning through max_outer_iterations (which
-                # would multiply 2×120s attempts across every iteration and
-                # stretch a single dead call into tens of minutes).
+                # Network errors get an outer retry with a circuit-breaker:
+                # after 5 consecutive network failures the whole step fails
+                # instead of spinning forever. Outer sleep escalates with
+                # the number of consecutive failures, capped at 5 minutes.
                 err_str = str(e)
                 is_network = any(kw in err_str for kw in (
                     "Network error", "timed out", "connection", "TimeoutError"
@@ -999,7 +998,7 @@ Token count: {token_count} / {config['max_total_tokens']}
                 if is_network:
                     _consec_net = getattr(self, "_consec_net_errors", 0) + 1
                     self._consec_net_errors = _consec_net
-                    if _consec_net >= 2:
+                    if _consec_net >= 5:
                         self.log(
                             f"  [FAIL] Step '{step_name}' — {_consec_net} consecutive "
                             "network failures; aborting step instead of retrying.",
@@ -1007,8 +1006,14 @@ Token count: {token_count} / {config['max_total_tokens']}
                         )
                         return False
                     import time as _time
-                    self.log("  [RETRY] Network error — waiting 3s before retry…", "warn")
-                    _time.sleep(3)
+                    # Escalating backoff: 60, 120, 180, 240 — capped at 300s (5 min).
+                    _outer_sleep = min(60 * _consec_net, 300)
+                    self.log(
+                        f"  [RETRY] Network error ({_consec_net}/5) — "
+                        f"waiting {_outer_sleep}s before retry…",
+                        "warn",
+                    )
+                    _time.sleep(_outer_sleep)
                 else:
                     # Non-network RuntimeError: clear the counter so a later
                     # genuine network error starts fresh.

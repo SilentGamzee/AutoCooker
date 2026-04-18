@@ -904,10 +904,10 @@ class OllamaClient:
             # connect_timeout + read_timeout before failing. With 5× long
             # retries we could easily spend 5-10 min on a flaky network.
             _max_attempts = 5                                       # ceiling for 429
-            _net_max_attempts = 2                                   # network / timeout
+            _net_max_attempts = 4                                   # network / timeout
             _backoff_schedule_429 = [2.0, 5.0, 15.0, 30.0, 60.0]    # up to 112s total
-            _backoff_schedule_net = [3.0, 8.0]                      # 1 retry only
-            _backoff_cap = 90.0
+            _backoff_schedule_net = [45.0, 60.0, 85.0]              # 3 retries, ~190s total
+            _backoff_cap = 120.0
             _last_exc: Optional[BaseException] = None
             resp = None
             _retry_loop_failed = False
