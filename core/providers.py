@@ -292,8 +292,9 @@ class ProvidersManager:
     _CLOUD_TYPES = {"omniroute", "gemini"}
 
     def _read_timeout_for(self, provider: ProviderConfig) -> int:
-        """120s for cloud APIs, 600s for local providers."""
-        return 120 if provider.type in self._CLOUD_TYPES else 600
+        """300s for cloud APIs (stream=False + large tool-call responses can
+        easily take 2-3 min to generate), 600s for local providers."""
+        return 300 if provider.type in self._CLOUD_TYPES else 600
 
     def _make_client(self, provider: ProviderConfig) -> "OllamaClient":
         from core.ollama_client import OllamaClient

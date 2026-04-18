@@ -892,10 +892,20 @@ class OllamaClient:
                 log_fn(f"[Ollama] Sending request (round {_round + 1}, context ~{_ctx_chars:,} chars)…")
 
             # Adaptive read timeout: scales with payload size for cloud providers.
-            # Cloud read_timeout=120s → base 30s + 1s per 2KB, capped at self.read_timeout.
-            # Local read_timeout≥600s → effectively disabled (min 60s).
+            # Note: we use stream=False, so the server must generate the ENTIRE
+            # response before any byte returns. For large planning contexts with
+            # tool-calls, generation alone can take 2-3 minutes before the first
+            # byte hits our socket — so we're generous here.
+            #   base 90s + 1s per 1KB of request payload, capped at self.read_timeout.
+            #   extra +30s if tools are enabled (tool_call responses are heavier).
+            # Cloud read_timeout=300s → up to 5 min ceiling.
+            # Local read_timeout≥600s → effectively disabled (min 90s).
             _payload_bytes = sum(len(str(m.get("content") or "")) for m in final_messages)
-            _adaptive = max(60, min(self.read_timeout, 30 + _payload_bytes // 2048))
+            _tool_overhead = 30 if tools else 0
+            _adaptive = max(
+                90,
+                min(self.read_timeout, 90 + _tool_overhead + _payload_bytes // 1024),
+            )
 
             # Retry loop with per-error-type budget.
             # Max attempts tuned by error class: 429 gets the long schedule
