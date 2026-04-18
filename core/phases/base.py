@@ -129,15 +129,18 @@ class BasePhase:
             )
         # HOT tier: small, full-content injection. COLD tier: listed as skeletons
         # so the model knows they exist without paying the token cost.
-        current_files = getattr(self.task, "_current_subtask_files", None)
+        # NOTE: we intentionally do NOT filter by current_subtask_files — the symbol/
+        # scope critic legitimately needs to see dependency files (e.g. core/state.py
+        # when the subtask only modifies main.py). The char-budget caps already bound
+        # prompt size.
         hot_entries = cache.get_hot_for_prompt(max_chars=12000, per_file_cap=3000)
-        if current_files:
-            hot_entries = [(p, c) for p, c in hot_entries if p in current_files] or hot_entries
+        rendered: set[str] = set()
         if hot_entries:
             parts_list = [f"### {p}\n```\n{c}\n```" for p, c in hot_entries]
             parts.append("\n\n---\n## Relevant cached files (full)\n" + "\n\n".join(parts_list))
+            rendered.update(p for p, _ in hot_entries)
 
-        cold_paths = [p for p in cache.cold_paths() if not current_files or p in current_files]
+        cold_paths = list(cache.cold_paths())
         if cold_paths:
             skeleton_blocks: list[str] = []
             budget = 4000
@@ -155,6 +158,12 @@ class BasePhase:
                     "\n\n---\n## Other cached files (skeletons — call read_file for full content)\n"
                     + "\n\n".join(skeleton_blocks)
                 )
+        # Publish the set of paths whose FULL content is actually in this prompt.
+        # ToolExecutor._read_file uses this to avoid returning [ALREADY READ] for
+        # files that only appear as skeletons (or not at all). Skeleton-only paths
+        # are excluded so the model can still fetch their full content.
+        cache._rendered_paths = rendered
+
         recent_logs = self.task.logs[-10:]
         if recent_logs:
             log_lines = "\n".join(

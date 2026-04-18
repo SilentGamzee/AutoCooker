@@ -530,11 +530,14 @@ class ToolExecutor:
 
         rel = self._to_rel(abs_path)
 
-        # Session-level deduplication: return [ALREADY READ] ONLY when the
-        # content is still in cache — so the model can rely on it being present
-        # somewhere in context. If the cache dropped it (LRU eviction), fall
-        # through and actually re-read from disk.
-        if rel in self.session_read_files and self.cache.has_content(rel):
+        # Session-level deduplication: return [ALREADY READ] ONLY when the file's
+        # FULL content is actually rendered in the current system prompt. If the
+        # cache holds it but build_system dropped it (filter / budget / skeleton-
+        # only), fall through and re-read from disk — otherwise the model sees
+        # neither the skeleton nor a fresh tool result and gets stuck.
+        rendered_paths = getattr(self.cache, "_rendered_paths", None)
+        visible_in_prompt = bool(rendered_paths and rel in rendered_paths)
+        if rel in self.session_read_files and visible_in_prompt:
             return (
                 f"[ALREADY READ] {rel} — content is in 'Relevant cached files'. "
                 f"Do NOT call read_file on this path again."
