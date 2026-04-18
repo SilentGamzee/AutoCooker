@@ -667,6 +667,28 @@ class CodingPhase(BasePhase):
 
             # Case A: find + replace
             if find_text and find_text.strip():
+                # GUARD: destructive find→replace — if find_text is somebody
+                # else's function/class signature (e.g. `@eel.expose\ndef
+                # delete_task(...)`) and replace_text defines a DIFFERENT
+                # function, a naive .replace() deletes the original function.
+                # Reject and force the LLM to handle it (which understands
+                # "insert before X" vs "replace X").
+                import re as _re
+                _sig_re = _re.compile(
+                    r"(?:^|\n)\s*(?:@\w[\w\.\s()=\"',:]*\n\s*)?"
+                    r"(?:async\s+)?(?:def|class|function)\s+(\w+)",
+                )
+                _find_sigs = [m.group(1) for m in _sig_re.finditer(find_text)]
+                _replace_sigs = [m.group(1) for m in _sig_re.finditer(replace_text)]
+                if _find_sigs and _replace_sigs and set(_find_sigs).isdisjoint(_replace_sigs):
+                    pending += 1
+                    self.log(
+                        f"  [mech] destructive find→replace "
+                        f"(find='{_find_sigs[0]}' → replace='{_replace_sigs[0]}') "
+                        f"— needs LLM: {action[:60]}",
+                        "warn",
+                    )
+                    continue
                 matched_file = None
                 for rel in candidate_files:
                     content = _load(rel)

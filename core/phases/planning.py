@@ -1410,6 +1410,56 @@ class PlanningPhase(BasePhase):
                             "Must be actual source code, not 'path/file.py: func()' references."
                         )
 
+                    # Reject JSON-leak tails: when the planner mis-escapes its
+                    # own JSON, closing braces/brackets of the outer action
+                    # file leak into code.content. Classic fingerprint seen
+                    # in task_029 T-002: content ends with `"}\n}\n  ],`.
+                    _tail = str(code_content).rstrip()[-40:]
+                    _leak_sigs = (
+                        '"\n    }\n  ],',
+                        '"\n  }\n]',
+                        '}"\n  }',
+                        '"}\n    }',
+                        '],\n  "',
+                        ')"\n      }',
+                    )
+                    if any(sig in _tail for sig in _leak_sigs) or _tail.endswith(('"}', '],')):
+                        errors.append(
+                            f"[FILE: {fname}] step {step_idx + 1}: code.content ends with "
+                            f"JSON-structure garbage {_tail[-30:]!r}. This means the outer "
+                            "action-file JSON leaked into code.content due to mis-escaped "
+                            "quotes. Rewrite the step — code.content must contain ONLY source "
+                            "code, never JSON braces/brackets from the surrounding file."
+                        )
+
+                    # Reject destructive find→replace: if 'find' is someone
+                    # else's function/class signature and 'code.content'
+                    # defines a DIFFERENT function, the mechanical applier
+                    # would delete the original. Planner should use
+                    # 'insert_after' instead.
+                    _find_text = str(step.get("find", "") or "")
+                    if _find_text.strip() and str(code_content).strip():
+                        import re as _re_plan
+                        _sig_re = _re_plan.compile(
+                            r"(?:^|\n)\s*(?:@\w[\w\.\s()=\"',:]*\n\s*)?"
+                            r"(?:async\s+)?(?:def|class|function)\s+(\w+)",
+                        )
+                        _find_sigs = [m.group(1) for m in _sig_re.finditer(_find_text)]
+                        _replace_sigs = [m.group(1) for m in _sig_re.finditer(str(code_content))]
+                        if (
+                            _find_sigs
+                            and _replace_sigs
+                            and set(_find_sigs).isdisjoint(_replace_sigs)
+                        ):
+                            errors.append(
+                                f"[FILE: {fname}] step {step_idx + 1}: destructive "
+                                f"find→replace — 'find' matches existing function "
+                                f"'{_find_sigs[0]}' but code.content defines a different "
+                                f"function '{_replace_sigs[0]}'. This would DELETE "
+                                f"'{_find_sigs[0]}'. Use 'insert_after' (to add the new "
+                                f"function near the old one) instead of 'find'."
+                            )
+
             for rel_path in modifies:
                 if not os.path.isfile(os.path.join(project_path, rel_path)):
                     errors.append(
