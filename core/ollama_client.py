@@ -897,11 +897,16 @@ class OllamaClient:
             _payload_bytes = sum(len(str(m.get("content") or "")) for m in final_messages)
             _adaptive = max(60, min(self.read_timeout, 30 + _payload_bytes // 2048))
 
-            # Retry loop: smart backoff for 429 (rate-limit), ReadTimeout, 5xx.
-            # 429 schedule: 2, 5, 15, 30, 60, 90 seconds (server-hint takes precedence, cap 90s).
-            # Timeout/5xx schedule: 2, 5, 15, 30, 60, 90.
-            _max_attempts = 5
-            _backoff_schedule = [2.0, 5.0, 15.0, 30.0, 60.0, 90.0]
+            # Retry loop with per-error-type budget.
+            # Max attempts tuned by error class: 429 gets the long schedule
+            # (server may want 30-60s cool-down); network/timeout errors get
+            # a short, sharp schedule because each attempt already burns ≥
+            # connect_timeout + read_timeout before failing. With 5× long
+            # retries we could easily spend 5-10 min on a flaky network.
+            _max_attempts = 5                                       # ceiling for 429
+            _net_max_attempts = 2                                   # network / timeout
+            _backoff_schedule_429 = [2.0, 5.0, 15.0, 30.0, 60.0]    # up to 112s total
+            _backoff_schedule_net = [3.0, 8.0]                      # 1 retry only
             _backoff_cap = 90.0
             _last_exc: Optional[BaseException] = None
             resp = None
@@ -939,19 +944,21 @@ class OllamaClient:
                         raise RuntimeError(f"Ollama 500 error - {error_msg}") from e
                     if status == 429:
                         self._rl_note_429(log_fn=log_fn)
-                    if status in (429, 502, 503, 504) and _attempt < _max_attempts:
+                    # 5xx uses the 429 schedule but caps at 4 attempts (less urgent).
+                    _this_max = _max_attempts if status == 429 else min(_max_attempts, 4)
+                    if status in (429, 502, 503, 504) and _attempt < _this_max:
                         import random as _rnd, time as _time
                         server_delay = self._rl_parse_server_delay(e) if status == 429 else None
                         if server_delay is not None:
                             backoff = min(max(server_delay, 1.0), _backoff_cap)
                             src = "server-requested"
                         else:
-                            base = _backoff_schedule[min(_attempt - 1, len(_backoff_schedule) - 1)]
+                            base = _backoff_schedule_429[min(_attempt - 1, len(_backoff_schedule_429) - 1)]
                             backoff = min(base * _rnd.uniform(0.8, 1.2), _backoff_cap)
                             src = "backoff"
                         if log_fn:
                             log_fn(
-                                f"[Ollama] HTTP {status} (attempt {_attempt}/{_max_attempts}) — "
+                                f"[Ollama] HTTP {status} (attempt {_attempt}/{_this_max}) — "
                                 f"retrying in {backoff:.1f}s ({src})",
                                 "warn",
                             )
@@ -962,20 +969,22 @@ class OllamaClient:
                     import time as _time, random as _rnd
                     _elapsed = _time.monotonic() - _t0
                     _last_exc = e
-                    if _attempt < _max_attempts:
-                        base = _backoff_schedule[min(_attempt - 1, len(_backoff_schedule) - 1)]
+                    # Short schedule for timeouts — waiting longer after a hang
+                    # almost never helps; just retry promptly a few times.
+                    if _attempt < _net_max_attempts:
+                        base = _backoff_schedule_net[min(_attempt - 1, len(_backoff_schedule_net) - 1)]
                         backoff = min(base * _rnd.uniform(0.8, 1.2), _backoff_cap)
                         if log_fn:
                             log_fn(
                                 f"[Ollama] Timeout after {_elapsed:.0f}s "
-                                f"(attempt {_attempt}/{_max_attempts}) — retrying in {backoff:.1f}s",
+                                f"(attempt {_attempt}/{_net_max_attempts}) — retrying in {backoff:.1f}s",
                                 "warn",
                             )
                         _time.sleep(backoff)
                         continue
                     msg = (
                         f"Request timed out after {_elapsed:.0f}s (timeout={_adaptive}s) "
-                        f"on attempt {_attempt}/{_max_attempts}. Cloud provider overloaded or "
+                        f"on attempt {_attempt}/{_net_max_attempts}. Cloud provider overloaded or "
                         "context too large."
                     )
                     print(f"\n[Ollama] {msg}", flush=True)
@@ -1006,23 +1015,25 @@ class OllamaClient:
                         raise RuntimeError(f"FATAL: Channel Error - {fatal_msg}") from e
 
                     # Network/timeout errors from urllib (Gemini native path):
-                    # retry with smart backoff, same schedule as ReadTimeout.
+                    # retry with the SHORT network schedule (not the long 429 one) —
+                    # waiting 30-60s after a TCP reset almost never helps, and each
+                    # attempt already burns ≥ connect+read timeout before failing.
                     if isinstance(e, (TimeoutError, OSError, ConnectionError, EOFError)):
                         _last_exc = e
-                        if _attempt < _max_attempts:
+                        if _attempt < _net_max_attempts:
                             import random as _rnd, time as _time
-                            base = _backoff_schedule[min(_attempt - 1, len(_backoff_schedule) - 1)]
+                            base = _backoff_schedule_net[min(_attempt - 1, len(_backoff_schedule_net) - 1)]
                             backoff = min(base * _rnd.uniform(0.8, 1.2), _backoff_cap)
                             if log_fn:
                                 log_fn(
                                     f"[Ollama] Network error ({type(e).__name__}) "
-                                    f"(attempt {_attempt}/{_max_attempts}) — retrying in {backoff:.1f}s",
+                                    f"(attempt {_attempt}/{_net_max_attempts}) — retrying in {backoff:.1f}s",
                                     "warn",
                                 )
                             _time.sleep(backoff)
                             continue
                         msg = (
-                            f"Network error after {_max_attempts} attempts "
+                            f"Network error after {_net_max_attempts} attempts "
                             f"({type(e).__name__}: {e})."
                         )
                         print(f"\n[Ollama] {msg}", flush=True)

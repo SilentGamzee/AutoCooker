@@ -36,6 +36,8 @@ PLANNING_ALLOWED_FILES = {
     'critic_simplicity.json',
     'implementation_plan.json',
     'scored_files.json',
+    # dependency-closure critic output (p5b)
+    'dependency_report.json',
 }
 
 class Sandbox:

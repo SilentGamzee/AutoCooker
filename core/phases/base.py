@@ -987,12 +987,32 @@ Token count: {token_count} / {config['max_total_tokens']}
                     self.state.abort_requested.discard(self.task.id)
                     raise TaskAbortedError(self.task.id)
                 self.log(f"  [ERROR] Ollama: {e}", "error")
-                # Brief pause after network errors to avoid hammering the API
+                # Network errors get a short outer retry with a small circuit-
+                # breaker: after 2 consecutive network failures the whole step
+                # fails instead of spinning through max_outer_iterations (which
+                # would multiply 2×120s attempts across every iteration and
+                # stretch a single dead call into tens of minutes).
                 err_str = str(e)
-                if any(kw in err_str for kw in ("Network error", "timed out", "connection", "TimeoutError")):
+                is_network = any(kw in err_str for kw in (
+                    "Network error", "timed out", "connection", "TimeoutError"
+                ))
+                if is_network:
+                    _consec_net = getattr(self, "_consec_net_errors", 0) + 1
+                    self._consec_net_errors = _consec_net
+                    if _consec_net >= 2:
+                        self.log(
+                            f"  [FAIL] Step '{step_name}' — {_consec_net} consecutive "
+                            "network failures; aborting step instead of retrying.",
+                            "error",
+                        )
+                        return False
                     import time as _time
-                    self.log("  [RETRY] Network error — waiting 5s before retry…", "warn")
-                    _time.sleep(5)
+                    self.log("  [RETRY] Network error — waiting 3s before retry…", "warn")
+                    _time.sleep(3)
+                else:
+                    # Non-network RuntimeError: clear the counter so a later
+                    # genuine network error starts fresh.
+                    self._consec_net_errors = 0
                 continue
             except Exception as e:
                 # Логирование неожиданных ошибок
@@ -1001,6 +1021,9 @@ Token count: {token_count} / {config['max_total_tokens']}
                 traceback.print_exc()
                 self.log(f"  [ERROR] Unexpected error: {type(e).__name__}: {e}", "error")
                 raise
+
+            # Successful LLM call — reset the consecutive-network-error counter.
+            self._consec_net_errors = 0
 
             if _DEBUG: print(f"[RUN_LOOP] Starting validation for {step_name}", flush=True)
             ok, reason = validate_fn()
