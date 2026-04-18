@@ -827,9 +827,31 @@ class CodingPhase(BasePhase):
         workdir = os.path.join(self.task.task_dir, WORKDIR_NAME)
         project_path = self.task.project_path or self.state.working_dir
 
+        # Collect files legitimately touched by prior DONE subtasks so the
+        # scope check doesn't flag their changes as out-of-scope for this
+        # one. A subtask that has status != 'done' shouldn't contribute —
+        # its files may be half-written and we still want to catch stray
+        # edits caused by the current subtask.
+        current_sid = subtask_dict.get("id", "")
+        prior_scope: set[str] = set()
+        for s in self.task.subtasks:
+            if s.get("id") == current_sid:
+                continue
+            if s.get("status") != "done":
+                continue
+            for f in (s.get("files_to_create") or []):
+                if f:
+                    prior_scope.add(f.replace("\\", "/"))
+            for f in (s.get("files_to_modify") or []):
+                if f:
+                    prior_scope.add(f.replace("\\", "/"))
+
         critic = RuleCritic()
         try:
-            rule_issues_obj = critic.run(subtask_dict, workdir, project_path)
+            rule_issues_obj = critic.run(
+                subtask_dict, workdir, project_path,
+                prior_scope_files=prior_scope,
+            )
         except Exception as e:
             self.log(f"  [WARN] RuleCritic crashed: {e}", "warn")
             rule_issues_obj = []

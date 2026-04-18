@@ -23,14 +23,25 @@ class CriticIssue:
 class RuleCritic:
     """Rule-based critic that checks subtask implementation for common problems."""
 
-    def run(self, subtask_dict: dict, workdir: str, project_path: str) -> list[CriticIssue]:
+    def run(
+        self,
+        subtask_dict: dict,
+        workdir: str,
+        project_path: str,
+        prior_scope_files: set[str] | None = None,
+    ) -> list[CriticIssue]:
         """
         Main entry point.  Runs all rule-based checks and returns a combined list.
 
-        :param subtask_dict:  The subtask definition dict (from the task's subtasks list).
-        :param workdir:       Absolute path to the task workdir (where files were written).
-        :param project_path:  Absolute path to the original project root (baseline).
-        :returns:             List of CriticIssue objects (may be empty if everything is fine).
+        :param subtask_dict:      The subtask definition dict (from the task's subtasks list).
+        :param workdir:           Absolute path to the task workdir (where files were written).
+        :param project_path:      Absolute path to the original project root (baseline).
+        :param prior_scope_files: Relative paths of files already legitimately changed by
+                                  previously completed subtasks in the same task. These are
+                                  treated as allowed during the scope check so that the
+                                  cumulative workdir-vs-project diff does not flag earlier
+                                  subtasks' changes as "out-of-scope" for the current one.
+        :returns:                 List of CriticIssue objects (may be empty if everything is fine).
         """
         issues: list[CriticIssue] = []
 
@@ -60,7 +71,13 @@ class RuleCritic:
 
         # --- 5. Scope ---
         issues.extend(
-            self._check_scope(files_to_create, files_to_modify, workdir, project_path)
+            self._check_scope(
+                files_to_create,
+                files_to_modify,
+                workdir,
+                project_path,
+                extra_allowed=prior_scope_files or set(),
+            )
         )
 
         # --- 6. Cross-language calls ---
@@ -397,14 +414,24 @@ class RuleCritic:
         files_to_modify: list[str],
         workdir: str,
         project_path: str,
+        extra_allowed: set[str] | None = None,
     ) -> list[CriticIssue]:
         """
         Find files in workdir that differ from project_path but were NOT
         listed in files_to_create or files_to_modify.
         Uses MD5 hash comparison to detect changes.
+
+        `extra_allowed` is a set of relative paths that should not be
+        flagged — typically files touched by *previously completed*
+        subtasks in the same task, whose changes are legitimately
+        present in the workdir but are out of scope for the current
+        subtask.
         """
         issues: list[CriticIssue] = []
         allowed = set(files_to_create) | set(files_to_modify)
+        if extra_allowed:
+            # Normalize separators to match the rel paths emitted below.
+            allowed |= {p.replace("\\", "/") for p in extra_allowed}
 
         def _md5(path: str) -> str:
             try:
