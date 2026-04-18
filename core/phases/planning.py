@@ -996,11 +996,14 @@ class PlanningPhase(BasePhase):
         # User requirement: up to 5 cycles of p5 ⇄ p5b. If dep closure still
         # reports missing_deps on the 5th pass, planning hard-fails.
         critique_feedback = ""
+        critique_issues: list[dict] = []
         max_iterations = 5
 
         for iteration in range(max_iterations):
             self.log(f"─── Step 2: Write Actions (iter {iteration+1}/{max_iterations}) ───")
-            if not self._new_step2_write_actions(model, critique_feedback):
+            if not self._new_step2_write_actions(
+                model, critique_feedback, issues=critique_issues or None
+            ):
                 self.log("[FAIL] Step 2 Write Actions failed – aborting planning", "error")
                 return False
 
@@ -1009,6 +1012,7 @@ class PlanningPhase(BasePhase):
 
             if not passed:
                 critique_feedback = self._format_action_critique(issues)
+                critique_issues = issues
                 if iteration == max_iterations - 1:
                     self.log(
                         f"[FAIL] Critique still failing at iter {max_iterations} with "
@@ -1025,6 +1029,11 @@ class PlanningPhase(BasePhase):
                 break
 
             critique_feedback = dep_feedback
+            # Dep-closure feedback is cross-plan (missing_deps are about
+            # action inter-dependencies, not specific file JSON defects).
+            # Clear per-file issues so Step 2 does a full rewrite, not a
+            # targeted patch based on stale critic output.
+            critique_issues = []
             if iteration == max_iterations - 1:
                 self.log(
                     f"[FAIL] Dependency closure still reporting missing_deps at iter "
@@ -1079,7 +1088,9 @@ class PlanningPhase(BasePhase):
             corrections_ctx = ""  # only inject full context on first iteration
 
             self.log(f"─── Patch Step 2: Write Actions (iter {iteration+1}/3) ───")
-            if not self._new_step2_write_actions(model, feedback):
+            if not self._new_step2_write_actions(
+                model, feedback, issues=issues or None
+            ):
                 return False
 
             self.log(f"─── Patch Step 3: Critique (iter {iteration+1}/3) ───")
@@ -1141,13 +1152,23 @@ class PlanningPhase(BasePhase):
         )
 
     # ── New Step 2: Write Action Files ────────────────────────────
-    def _new_step2_write_actions(self, model: str, critique_feedback: str = "") -> bool:
+    def _new_step2_write_actions(
+        self,
+        model: str,
+        critique_feedback: str = "",
+        issues: list[dict] | None = None,
+    ) -> bool:
         """
         Read spec.json + project files, write one action file per subtask.
         Action files: .tasks/task_NNN/actions/T001.json, T002.json, …
         Auto-removes orphaned action files from previous iterations.
         Pre-loads top relevant source file contents so the LLM has real code
         to reference without needing to call read_file first.
+
+        If `issues` is supplied (retry after critic FAIL), the call enters
+        TARGETED MODE: only the action files named in `issue.file` are
+        regenerated; the passing files are preserved verbatim and their
+        current content is shown to the LLM as reference.
         """
         wd = self.task.project_path or self.state.working_dir
         actions_dir = os.path.join(self.task.task_dir, "actions")
@@ -1163,6 +1184,19 @@ class PlanningPhase(BasePhase):
 
         # Pre-load top relevant file contents so LLM can write accurate code
         file_contents_section = self._load_top_file_contents(wd, top_n=5, max_lines=300)
+
+        # ── Targeted-fix mode detection ──────────────────────────────
+        # Extract filenames the critic flagged; only those get rewritten.
+        # Orphan-cleanup is disabled in this mode so passing files survive.
+        failing_basenames: set[str] = set()
+        if issues:
+            for iss in issues:
+                fn = iss.get("file") or ""
+                fn = os.path.basename(str(fn).replace("\\", "/")).strip()
+                if fn.endswith(".json"):
+                    failing_basenames.add(fn)
+
+        targeted_mode = bool(failing_basenames)
 
         # Track which action files are written in this run for cleanup
         written_basenames: set[str] = set()
@@ -1180,17 +1214,58 @@ class PlanningPhase(BasePhase):
             if critique_feedback else ""
         )
 
+        # ── Targeted-fix section: show current content of failing files
+        # and list passing files that MUST NOT be touched. ──
+        targeted_section = ""
+        if targeted_mode:
+            all_on_disk = sorted(
+                f for f in os.listdir(actions_dir) if f.endswith(".json")
+            )
+            passing_files = [f for f in all_on_disk if f not in failing_basenames]
+
+            failing_contents: list[str] = []
+            for fn in sorted(failing_basenames):
+                p = os.path.join(actions_dir, fn)
+                try:
+                    with open(p, "r", encoding="utf-8") as fh:
+                        failing_contents.append(f"=== {fn} (CURRENT — FIX THIS) ===\n{fh.read()}")
+                except Exception:
+                    failing_contents.append(f"=== {fn} (CURRENT — MISSING / UNREADABLE — RECREATE) ===")
+
+            targeted_section = (
+                "TARGETED FIX MODE — only rewrite the files listed below.\n"
+                f"FILES TO FIX ({len(failing_basenames)}): "
+                + ", ".join(sorted(failing_basenames)) + "\n"
+                f"FILES TO LEAVE ALONE ({len(passing_files)}): "
+                + (", ".join(passing_files) if passing_files else "(none)") + "\n"
+                "RULES:\n"
+                "  1. Call write_file ONLY for the files in 'FILES TO FIX'.\n"
+                "  2. Do NOT call write_file for any file in 'FILES TO LEAVE ALONE' — "
+                "they already passed review.\n"
+                "  3. When you are done, call confirm_phase_done.\n\n"
+                + "\n\n".join(failing_contents)
+                + "\n\n"
+            )
+            self.log(
+                f"  Targeted fix: {len(failing_basenames)} file(s) to fix, "
+                f"{len(passing_files)} preserved",
+                "info",
+            )
+
         msg = (
             f"Task: {self.task.title}\n"
             f"Description: {self.task.description}\n\n"
             f"SPECIFICATION:\n{spec_content}\n\n"
             f"{critique_section}"
+            f"{targeted_section}"
             f"{file_contents_section}"
             f"Project files available for files_to_modify:\n{existing_files}\n\n"
-            f"Write one action file per implementation subtask to: {rel_actions}/\n"
+            f"{'Action files directory: ' + rel_actions + '/' if targeted_mode else 'Write one action file per implementation subtask to: ' + rel_actions + '/'}\n"
             "Name files: T001.json, T002.json, T003.json, …\n"
             "Each file is a single JSON subtask object with implementation_steps.\n"
-            "After writing ALL action files, call confirm_phase_done."
+            + ("After writing the FIXED files only, call confirm_phase_done."
+               if targeted_mode else
+               "After writing ALL action files, call confirm_phase_done.")
         )
 
         def validate():
@@ -1204,10 +1279,16 @@ class PlanningPhase(BasePhase):
             max_tool_rounds=40,
         )
 
-        if ok and written_basenames:
+        # Orphan cleanup: in targeted-fix mode we MUST preserve the
+        # passing files (the LLM was told not to rewrite them), so skip
+        # cleanup entirely. Full-rewrite mode keeps the old behaviour.
+        if ok and written_basenames and not targeted_mode:
             self._cleanup_orphaned_actions(actions_dir, written_basenames)
 
-        if ok:
+        # Renumbering also only makes sense when we regenerated everything —
+        # renaming passing files in targeted mode would invalidate the
+        # critic's prior verdict on them.
+        if ok and not targeted_mode:
             self._renumber_action_files(actions_dir)
 
         return ok
