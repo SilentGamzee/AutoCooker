@@ -3,6 +3,7 @@ from __future__ import annotations
 import difflib
 import os
 import re
+import shutil
 import subprocess
 
 
@@ -167,10 +168,86 @@ class CodingPhase(BasePhase):
         self.log("═══ CODING PHASE COMPLETE ═══")
         return overall_ok
 
+    # ── Per-subtask baseline snapshot ─────────────────────────────
+    # The critic compares workdir against a "baseline" — a frozen copy
+    # of the workdir taken BEFORE the current subtask started. This
+    # way the critic sees only the current subtask's diff, not the
+    # accumulated diff of every prior subtask (which caused false
+    # "Out-of-scope change" and stale-stub flags when subtasks shared
+    # files).
+    #
+    # Lifecycle:
+    #   - _init_baseline(): once, on phase entry — copies workdir -> baseline
+    #   - _update_baseline_with_subtask(sd): after subtask done — promotes
+    #     its touched files from workdir into baseline
+    #
+    # Baseline dir is stored under .tasks/task_NNN/_baseline/ and is
+    # treated as a throw-away artifact (not versioned).
+    def _baseline_dir(self) -> str:
+        return os.path.join(self.task.task_dir, "_baseline")
+
+    _BASELINE_IGNORE = shutil.ignore_patterns(
+        "__pycache__", "*.pyc", "*.pyo", "*.pyd",
+        ".git", ".claude", ".svn", ".hg",
+        "node_modules", ".egg-info", ".dist-info",
+        ".mypy_cache", ".ruff_cache", ".pytest_cache",
+        "_baseline",
+    )
+
+    def _init_baseline(self) -> None:
+        """Seed _baseline/ from the current workdir contents (idempotent)."""
+        workdir = os.path.join(self.task.task_dir, WORKDIR_NAME)
+        baseline = self._baseline_dir()
+        if os.path.isdir(baseline):
+            return  # already initialized (resume case)
+        if not os.path.isdir(workdir):
+            return
+        try:
+            shutil.copytree(workdir, baseline, ignore=self._BASELINE_IGNORE)
+            self.log("  Baseline snapshot initialized", "info")
+        except Exception as e:
+            self.log(f"  [WARN] baseline init failed: {e}", "warn")
+
+    def _update_baseline_with_subtask(self, subtask_dict: dict) -> None:
+        """Promote subtask's written files from workdir into baseline.
+
+        Called after a subtask passes the critic (status='done'), so the
+        NEXT subtask's critic run sees those changes as part of its own
+        baseline rather than as out-of-scope drift.
+        """
+        workdir = os.path.join(self.task.task_dir, WORKDIR_NAME)
+        baseline = self._baseline_dir()
+        if not os.path.isdir(baseline):
+            # Baseline was never initialized — nothing to update.
+            return
+        touched = list(subtask_dict.get("files_to_create") or []) + \
+                  list(subtask_dict.get("files_to_modify") or [])
+        for rel in touched:
+            rel_norm = rel.replace("\\", "/")
+            src = os.path.join(workdir, rel_norm)
+            dst = os.path.join(baseline, rel_norm)
+            if not os.path.isfile(src):
+                # File was deleted or never created — mirror the deletion.
+                if os.path.isfile(dst):
+                    try:
+                        os.remove(dst)
+                    except Exception:
+                        pass
+                continue
+            try:
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.copy2(src, dst)
+            except Exception as e:
+                self.log(f"  [WARN] baseline sync {rel_norm}: {e}", "warn")
+
     # ── 2.2 Execute subtasks ───────────────────────────────────────
     def _step2_execute_tasks(self, model: str) -> bool:
         self.log("─── Step 2.2: Execute subtasks ───")
         all_ok = True
+
+        # Seed baseline from current workdir BEFORE the first subtask.
+        # Subsequent subtasks will see only their own diff.
+        self._init_baseline()
 
         for i, subtask_dict in enumerate(self.task.subtasks):
             sid = subtask_dict.get("id", f"T-{i+1:03d}")
@@ -293,6 +370,9 @@ class CodingPhase(BasePhase):
                     if all_issues:
                         for mi in all_issues:
                             self.log(f"    [minor] {mi.get('description', '')}", "info")
+                    # Promote this subtask's writes into the baseline so
+                    # the NEXT subtask's critic sees them as already-present.
+                    self._update_baseline_with_subtask(subtask_dict)
                     break
 
                 # Critic found critical issues → retry with feedback
@@ -825,13 +905,19 @@ class CodingPhase(BasePhase):
         from core.critic import RuleCritic
 
         workdir = os.path.join(self.task.task_dir, WORKDIR_NAME)
+        # Baseline is workdir state BEFORE the current subtask started.
+        # When present, it becomes the diff baseline so every critic check
+        # (scope, stubs, verify_methods, cross-language) sees only the
+        # current subtask's changes. Falls back to pristine project_path
+        # only if the baseline never got initialized (shouldn't happen
+        # after the first subtask).
+        baseline = self._baseline_dir()
         project_path = self.task.project_path or self.state.working_dir
+        critic_baseline = baseline if os.path.isdir(baseline) else project_path
 
-        # Collect files legitimately touched by prior DONE subtasks so the
-        # scope check doesn't flag their changes as out-of-scope for this
-        # one. A subtask that has status != 'done' shouldn't contribute —
-        # its files may be half-written and we still want to catch stray
-        # edits caused by the current subtask.
+        # Belt-and-suspenders: even with baseline, keep the prior-scope
+        # allowlist so any write that somehow slipped past the baseline
+        # sync (e.g. a resume scenario) doesn't cascade into false flags.
         current_sid = subtask_dict.get("id", "")
         prior_scope: set[str] = set()
         for s in self.task.subtasks:
@@ -849,7 +935,7 @@ class CodingPhase(BasePhase):
         critic = RuleCritic()
         try:
             rule_issues_obj = critic.run(
-                subtask_dict, workdir, project_path,
+                subtask_dict, workdir, critic_baseline,
                 prior_scope_files=prior_scope,
             )
         except Exception as e:
