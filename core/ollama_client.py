@@ -49,6 +49,12 @@ class OllamaClient:
         # Persistent session — closed on abort() to cancel in-flight requests
         self._session = self._new_session()
         self._session_lock = threading.Lock()
+        # ── 429 circuit breaker ──────────────────────────────────
+        # Free-tier Gemini is 15 RPM; on sustained 429 we cool down all
+        # outbound requests for a grace window. Timestamps of recent 429s in
+        # a sliding 60s window; if >3 hits → enforce 30s cooldown.
+        self._rl_429_times: list[float] = []
+        self._rl_cooldown_until: float = 0.0
 
     @staticmethod
     def _new_session() -> requests.Session:
@@ -63,6 +69,90 @@ class OllamaClient:
         import os as _os
         _os.environ.setdefault("GOOGLE_APPLICATION_CREDENTIALS", "")
         return s
+
+    # ── 429 helpers ──────────────────────────────────────────────
+    def _rl_note_429(self, log_fn=None) -> None:
+        """Record a 429 event; open the circuit breaker if too many in 60s."""
+        import time as _t
+        now = _t.monotonic()
+        self._rl_429_times = [t for t in self._rl_429_times if now - t <= 60.0]
+        self._rl_429_times.append(now)
+        if len(self._rl_429_times) > 3 and self._rl_cooldown_until < now:
+            self._rl_cooldown_until = now + 30.0
+            if log_fn:
+                log_fn(
+                    "[Ollama] circuit open — 4+ rate-limit hits in last 60s; "
+                    "cooling down 30s before next request",
+                    "warn",
+                )
+
+    def _rl_wait_if_circuit_open(self, log_fn=None, is_aborted=None) -> None:
+        """Block until the rate-limit cooldown elapses."""
+        import time as _t
+        now = _t.monotonic()
+        if self._rl_cooldown_until <= now:
+            return
+        remaining = self._rl_cooldown_until - now
+        if log_fn:
+            log_fn(f"[Ollama] rate-limit cooldown active — waiting {remaining:.0f}s", "warn")
+        # Poll abort every 1s so the user can still cancel.
+        end = self._rl_cooldown_until
+        while True:
+            now = _t.monotonic()
+            if now >= end:
+                return
+            if is_aborted and is_aborted():
+                raise RuntimeError("__ABORTED__")
+            _t.sleep(min(1.0, end - now))
+
+    @staticmethod
+    def _rl_parse_server_delay(exc) -> float | None:
+        """
+        Extract server-suggested wait time from an HTTPError, if present.
+        Checks Retry-After header and Gemini's error.details[].retryDelay.
+        Returns seconds to wait, or None if server gave no hint.
+        """
+        resp = getattr(exc, "response", None)
+        if resp is None:
+            return None
+        # 1. Retry-After header (seconds or HTTP-date)
+        try:
+            headers = getattr(resp, "headers", {}) or {}
+            ra = headers.get("Retry-After") or headers.get("retry-after")
+            if ra:
+                try:
+                    return float(ra)
+                except (TypeError, ValueError):
+                    # HTTP-date — parse
+                    try:
+                        from email.utils import parsedate_to_datetime
+                        import datetime as _dt
+                        target = parsedate_to_datetime(ra)
+                        now = _dt.datetime.now(target.tzinfo)
+                        delta = (target - now).total_seconds()
+                        if delta > 0:
+                            return delta
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        # 2. Gemini structured error: body.error.details[].retryDelay = "Ns"
+        try:
+            import json as _json
+            body = getattr(resp, "text", "") or ""
+            if body:
+                data = _json.loads(body)
+                details = ((data.get("error") or {}).get("details") or [])
+                for d in details:
+                    rd = d.get("retryDelay")
+                    if rd and isinstance(rd, str) and rd.endswith("s"):
+                        try:
+                            return float(rd[:-1])
+                        except ValueError:
+                            pass
+        except Exception:
+            pass
+        return None
 
     class _UrllibResponse:
         """Thin wrapper around urllib response that mimics requests.Response."""
@@ -434,20 +524,53 @@ class OllamaClient:
         print(f"[DEBUG complete()] ENTERED model={model} prompt_len={len(prompt)}", flush=True)
         if log_fn:
             log_fn(f"[Ollama] complete() sending — model={model} prompt_len={len(prompt)}")
+        # Respect circuit breaker (opened elsewhere by sustained 429s).
+        self._rl_wait_if_circuit_open(log_fn=log_fn)
         try:
             print(f"[DEBUG complete()] calling self._post() ...", flush=True)
-            resp = self._post(
-                self._chat_completions_url(),
-                {
-                    "model": model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "stream": False,
-                    "max_tokens": max_tokens,
-                },
-                (10, 6000),
-            )
+            # Small retry loop mirroring chat_with_tools for 429/5xx.
+            _max_attempts = 3
+            _backoff_schedule = [2.0, 5.0, 15.0]
+            _backoff_cap = 90.0
+            resp = None
+            for _attempt in range(1, _max_attempts + 1):
+                try:
+                    resp = self._post(
+                        self._chat_completions_url(),
+                        {
+                            "model": model,
+                            "messages": [{"role": "user", "content": prompt}],
+                            "stream": False,
+                            "max_tokens": max_tokens,
+                        },
+                        (10, 300),
+                    )
+                    resp.raise_for_status()
+                    break
+                except requests.exceptions.HTTPError as _e:
+                    status = getattr(getattr(_e, "response", None), "status_code", 0)
+                    if status == 429:
+                        self._rl_note_429(log_fn=log_fn)
+                    if status in (429, 502, 503, 504) and _attempt < _max_attempts:
+                        import random as _rnd, time as _time
+                        hint = self._rl_parse_server_delay(_e) if status == 429 else None
+                        if hint is not None:
+                            backoff = min(max(hint, 1.0), _backoff_cap)
+                        else:
+                            base = _backoff_schedule[min(_attempt - 1, len(_backoff_schedule) - 1)]
+                            backoff = min(base * _rnd.uniform(0.8, 1.2), _backoff_cap)
+                        if log_fn:
+                            log_fn(
+                                f"[Ollama] complete() HTTP {status} "
+                                f"(attempt {_attempt}/{_max_attempts}) — retrying in {backoff:.1f}s",
+                                "warn",
+                            )
+                        _time.sleep(backoff)
+                        continue
+                    raise
+            if resp is None:
+                raise RuntimeError("complete(): no response after retries")
             print(f"[DEBUG complete()] POST returned status={resp.status_code}", flush=True)
-            resp.raise_for_status()
 
             json_data = resp.json()
             print(f"[DEBUG complete()] Full JSON keys: {list(json_data.keys())}", flush=True)
@@ -774,11 +897,17 @@ class OllamaClient:
             _payload_bytes = sum(len(str(m.get("content") or "")) for m in final_messages)
             _adaptive = max(60, min(self.read_timeout, 30 + _payload_bytes // 2048))
 
-            # Retry loop: on ReadTimeout and 5xx, try up to 3 total attempts with backoff.
-            _max_attempts = 3
+            # Retry loop: smart backoff for 429 (rate-limit), ReadTimeout, 5xx.
+            # 429 schedule: 2, 5, 15, 30, 60, 90 seconds (server-hint takes precedence, cap 90s).
+            # Timeout/5xx schedule: 2, 5, 15, 30, 60, 90.
+            _max_attempts = 5
+            _backoff_schedule = [2.0, 5.0, 15.0, 30.0, 60.0, 90.0]
+            _backoff_cap = 90.0
             _last_exc: Optional[BaseException] = None
             resp = None
             _retry_loop_failed = False
+            # Block if client-level 429 circuit breaker is open.
+            self._rl_wait_if_circuit_open(log_fn=log_fn, is_aborted=is_aborted)
             for _attempt in range(1, _max_attempts + 1):
                 if is_aborted and is_aborted():
                     raise RuntimeError("__ABORTED__")
@@ -808,28 +937,38 @@ class OllamaClient:
                         if log_fn:
                             log_fn(f"[ERROR] {error_msg}", "error")
                         raise RuntimeError(f"Ollama 500 error - {error_msg}") from e
+                    if status == 429:
+                        self._rl_note_429(log_fn=log_fn)
                     if status in (429, 502, 503, 504) and _attempt < _max_attempts:
-                        backoff = 2 * _attempt
+                        import random as _rnd, time as _time
+                        server_delay = self._rl_parse_server_delay(e) if status == 429 else None
+                        if server_delay is not None:
+                            backoff = min(max(server_delay, 1.0), _backoff_cap)
+                            src = "server-requested"
+                        else:
+                            base = _backoff_schedule[min(_attempt - 1, len(_backoff_schedule) - 1)]
+                            backoff = min(base * _rnd.uniform(0.8, 1.2), _backoff_cap)
+                            src = "backoff"
                         if log_fn:
                             log_fn(
                                 f"[Ollama] HTTP {status} (attempt {_attempt}/{_max_attempts}) — "
-                                f"retrying in {backoff}s",
+                                f"retrying in {backoff:.1f}s ({src})",
                                 "warn",
                             )
-                        import time as _time
                         _time.sleep(backoff)
                         continue
                     raise RuntimeError(f"Ollama HTTP {status} error: {e}") from e
                 except requests.exceptions.ReadTimeout as e:
-                    import time as _time
+                    import time as _time, random as _rnd
                     _elapsed = _time.monotonic() - _t0
                     _last_exc = e
                     if _attempt < _max_attempts:
-                        backoff = 2 * _attempt
+                        base = _backoff_schedule[min(_attempt - 1, len(_backoff_schedule) - 1)]
+                        backoff = min(base * _rnd.uniform(0.8, 1.2), _backoff_cap)
                         if log_fn:
                             log_fn(
                                 f"[Ollama] Timeout after {_elapsed:.0f}s "
-                                f"(attempt {_attempt}/{_max_attempts}) — retrying in {backoff}s",
+                                f"(attempt {_attempt}/{_max_attempts}) — retrying in {backoff:.1f}s",
                                 "warn",
                             )
                         _time.sleep(backoff)
@@ -867,18 +1006,19 @@ class OllamaClient:
                         raise RuntimeError(f"FATAL: Channel Error - {fatal_msg}") from e
 
                     # Network/timeout errors from urllib (Gemini native path):
-                    # retry with backoff, same as ReadTimeout.
+                    # retry with smart backoff, same schedule as ReadTimeout.
                     if isinstance(e, (TimeoutError, OSError, ConnectionError, EOFError)):
                         _last_exc = e
                         if _attempt < _max_attempts:
-                            backoff = 2 * _attempt
+                            import random as _rnd, time as _time
+                            base = _backoff_schedule[min(_attempt - 1, len(_backoff_schedule) - 1)]
+                            backoff = min(base * _rnd.uniform(0.8, 1.2), _backoff_cap)
                             if log_fn:
                                 log_fn(
                                     f"[Ollama] Network error ({type(e).__name__}) "
-                                    f"(attempt {_attempt}/{_max_attempts}) — retrying in {backoff}s",
+                                    f"(attempt {_attempt}/{_max_attempts}) — retrying in {backoff:.1f}s",
                                     "warn",
                                 )
-                            import time as _time
                             _time.sleep(backoff)
                             continue
                         msg = (

@@ -992,9 +992,11 @@ class PlanningPhase(BasePhase):
             self.log("[FAIL] Step 1 Spec failed – aborting planning", "error")
             return False
 
-        # ── Steps 2+3: Write Actions → Critique (retry loop) ──────
+        # ── Steps 2+3+3b: Write Actions → Critique → Dep Closure (retry loop) ──
+        # User requirement: up to 5 cycles of p5 ⇄ p5b. If dep closure still
+        # reports missing_deps on the 5th pass, planning hard-fails.
         critique_feedback = ""
-        max_iterations = 3
+        max_iterations = 5
 
         for iteration in range(max_iterations):
             self.log(f"─── Step 2: Write Actions (iter {iteration+1}/{max_iterations}) ───")
@@ -1005,15 +1007,35 @@ class PlanningPhase(BasePhase):
             self.log(f"─── Step 3: Critique (iter {iteration+1}/{max_iterations}) ───")
             passed, issues = self._new_step3_critique(model)
 
-            if passed:
+            if not passed:
+                critique_feedback = self._format_action_critique(issues)
+                if iteration == max_iterations - 1:
+                    self.log(
+                        f"[FAIL] Critique still failing at iter {max_iterations} with "
+                        f"{len(issues)} unresolved issue(s) — aborting planning",
+                        "error",
+                    )
+                    return False
+                continue
+
+            # ── Step 3b: Dependency closure critic ──
+            self.log(f"─── Step 3b: Dependency Closure (iter {iteration+1}/{max_iterations}) ───")
+            dep_passed, dep_feedback = self._new_step3b_dep_closure(model)
+            if dep_passed:
                 break
 
-            critique_feedback = self._format_action_critique(issues)
+            critique_feedback = dep_feedback
             if iteration == max_iterations - 1:
                 self.log(
-                    f"  ⚠️ Max iterations reached with {len(issues)} unresolved issue(s) — proceeding",
-                    "warn",
+                    f"[FAIL] Dependency closure still reporting missing_deps at iter "
+                    f"{max_iterations} — aborting planning",
+                    "error",
                 )
+                return False
+            self.log(
+                f"  ↻ Dependency closure reported missing_deps — re-running Step 2 with feedback",
+                "warn",
+            )
 
         # ── Load subtasks + Prepare workdir ───────────────────────
         for name, fn in [
@@ -1467,6 +1489,111 @@ class PlanningPhase(BasePhase):
         else:
             self.log("  [WARN] No critique verdict submitted — treating as PASS", "warn")
             return True, []
+
+    def _new_step3b_dep_closure(self, model: str) -> tuple[bool, str]:
+        """
+        Dependency-closure critic. Reads all action files and verifies every
+        symbol referenced by each subtask is either declared in that subtask's
+        own files OR already exists in the project. Flags missing deps that
+        would make Coding fail (e.g. subtask uses task.attachments but
+        'attachments' is not in KanbanTask and state.py isn't in files_to_modify).
+
+        Returns (passed, feedback_text). On FAIL the feedback is formatted so
+        it can be fed back into Step 2 as corrections.
+
+        IMPORTANT (per user requirement): this critic MUST NOT be skipped due
+        to LLM call errors. run_loop already retries on exceptions and
+        INFRA:-prefixed validation failures, and validate_dependency_report
+        hard-fails if the artifact is missing.
+        """
+        from core.validator import validate_dependency_report
+        wd = self.task.project_path or self.state.working_dir
+        actions_dir = os.path.join(self.task.task_dir, "actions")
+        report_path = os.path.join(self.task.task_dir, "dependency_report.json")
+        spec_path = os.path.join(self.task.task_dir, "spec.json")
+
+        # Remove any stale report from a previous cycle so INFRA:-missing
+        # is detected cleanly if the LLM fails to write a fresh one.
+        try:
+            if os.path.isfile(report_path):
+                os.remove(report_path)
+        except OSError:
+            pass
+
+        spec_content = self._read_file_safe(spec_path)
+
+        actions_content = ""
+        if os.path.isdir(actions_dir):
+            for fname in sorted(f for f in os.listdir(actions_dir) if f.endswith(".json")):
+                path = os.path.join(actions_dir, fname)
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        actions_content += f"=== {fname} ===\n{f.read()}\n\n"
+                except Exception:
+                    pass
+
+        existing_files = "\n".join(
+            f"  {p}" for p in self.state.cache.file_paths[:80]
+            if not p.startswith(".tasks") and not p.startswith(".git")
+        )
+
+        executor = self._make_planning_executor(wd)
+
+        msg = (
+            f"Task: {self.task.title}\n\n"
+            f"SPECIFICATION:\n{spec_content}\n\n"
+            f"ACTION FILES (the full plan — one subtask per file):\n{actions_content}\n"
+            f"PROJECT FILES (use these paths when suggesting files_to_modify additions):\n"
+            f"{existing_files}\n\n"
+            f"Write dependency_report.json to: {self._rel(report_path)}\n\n"
+            "For each subtask, determine whether all referenced symbols "
+            "(methods, fields, classes, imports) are reachable. Flag ONLY "
+            "symbols that should live inside the project workspace — do not "
+            "flag stdlib/pip/engine imports. If a referenced symbol is "
+            "missing, set verdict='missing_deps' and list the exact files "
+            "that need to be added to that subtask's files_to_modify."
+        )
+
+        def validate():
+            return validate_dependency_report(report_path)
+
+        self.run_loop(
+            "3b Dep Closure", "p5b_dependency_closure.md",
+            PLANNING_TOOLS, executor, msg, validate, model,
+            max_outer_iterations=2,
+            max_tool_rounds=12,
+            reconstruct_after=None,
+        )
+
+        # Final read: validate again to return feedback regardless of run_loop outcome
+        ok, reason = validate()
+        if ok:
+            self.log("  ✓ Dependency closure PASSED — plan complete", "ok")
+            return True, ""
+
+        # FAIL path — build feedback for next Step 2 iteration
+        self.log(f"  ✗ Dependency closure FAILED: {reason[:300]}", "warn")
+        feedback_lines = [
+            "DEPENDENCY CLOSURE ISSUES (fix these — add the listed files to "
+            "the subtask's files_to_modify, or split into separate subtasks):",
+            reason,
+        ]
+        # Also surface the raw report if we have it — it has per-subtask detail.
+        try:
+            import json as _json
+            with open(report_path, "r", encoding="utf-8") as f:
+                report = _json.load(f)
+            for s in report.get("subtasks", []):
+                if s.get("verdict") == "missing_deps":
+                    sid = s.get("id", "?")
+                    for u in (s.get("unresolved") or [])[:6]:
+                        feedback_lines.append(f"  [{sid}] {u}")
+                    sug = s.get("suggested_files") or []
+                    if sug:
+                        feedback_lines.append(f"  [{sid}] → add to files_to_modify: {', '.join(sug)}")
+        except Exception:
+            pass
+        return False, "\n".join(feedback_lines)
 
     def _format_action_critique(self, issues: list[dict]) -> str:
         """Format critique issues as text for the next action writer iteration."""

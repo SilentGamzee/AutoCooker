@@ -123,6 +123,44 @@ def validate_xml_like(content: str) -> Tuple[bool, str]:
         return False, f"XML parse error: {e}"
 
 
+def validate_dependency_report(path: str) -> Tuple[bool, str]:
+    """Validate dependency_report.json produced by p5b_dependency_closure.
+
+    Succeeds only when every subtask has verdict=='ok'. Any missing_deps
+    entry must surface back to the planning loop with detailed feedback so
+    the plan can be rewritten.
+    """
+    ok, data, err = _load_json(path)
+    if not ok:
+        return False, err
+    if not isinstance(data, dict):
+        return False, "dependency_report.json must be a JSON object with 'subtasks' array"
+    subtasks = data.get("subtasks")
+    if not isinstance(subtasks, list):
+        return False, "Field 'subtasks' must be a list"
+    if not subtasks:
+        return False, "Field 'subtasks' is empty — critic must report on every subtask"
+    problems: list[str] = []
+    for i, s in enumerate(subtasks):
+        if not isinstance(s, dict):
+            problems.append(f"subtasks[{i}] is not an object")
+            continue
+        sid = s.get("id", f"index_{i}")
+        verdict = s.get("verdict")
+        if verdict not in ("ok", "missing_deps"):
+            problems.append(f"{sid}: verdict must be 'ok' or 'missing_deps', got {verdict!r}")
+            continue
+        if verdict == "missing_deps":
+            unresolved = s.get("unresolved") or []
+            detail = "; ".join(str(u)[:120] for u in unresolved[:5]) or "(no detail)"
+            suggested = s.get("suggested_files") or []
+            sug = (" add to files_to_modify: " + ", ".join(suggested)) if suggested else ""
+            problems.append(f"{sid} missing_deps — {detail}.{sug}")
+    if problems:
+        return False, "Plan incomplete — " + " | ".join(problems)
+    return True, "OK"
+
+
 def validate_readme(path: str) -> Tuple[bool, str]:
     """Check README.md exists and has minimal content."""
     ok, msg = validate_file_exists(path)
