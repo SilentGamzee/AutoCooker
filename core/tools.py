@@ -820,6 +820,30 @@ class ToolExecutor:
         verdict = args.get("verdict", "FAIL")
         issues  = args.get("issues", [])
         summary = args.get("summary", "")
+
+        # Reject verdicts where any FAIL issue is missing 'file'. Without
+        # a filename the targeted-fix retry has no way to know which
+        # action file to reopen, and the operator log becomes cryptic
+        # ("Step 2 is truncated" — in which file?). Force the critic to
+        # resubmit.
+        if verdict == "FAIL" and isinstance(issues, list):
+            missing: list[int] = []
+            for idx, issue in enumerate(issues, start=1):
+                if not isinstance(issue, dict):
+                    continue
+                fname = str(issue.get("file") or "").strip()
+                if not fname:
+                    missing.append(idx)
+            if missing:
+                nums = ", ".join(f"#{n}" for n in missing[:5])
+                return (
+                    f"REJECTED: issues {nums} are missing the required "
+                    f"'file' field. Every issue MUST name the action file "
+                    f"it refers to (e.g. \"file\": \"T002.json\"). Resubmit "
+                    f"submit_critic_verdict with the file field populated "
+                    f"for every issue."
+                )
+
         # Store on executor for retrieval by _run_llm_critic
         self.critic_verdict         = verdict
         self.critic_verdict_issues  = issues

@@ -1554,7 +1554,8 @@ class PlanningPhase(BasePhase):
             for i, issue in enumerate(issues[:5], 1):
                 desc = issue.get("description", str(issue))[:100]
                 sev = issue.get("severity", "?")
-                self.log(f"    {i}. [{sev}] {desc}", "warn")
+                fname = (issue.get("file") or "").strip() or "(file unknown)"
+                self.log(f"    {i}. [{sev}] {fname}: {desc}", "warn")
             return False, issues
         else:
             self.log("  [WARN] No critique verdict submitted — treating as PASS", "warn")
