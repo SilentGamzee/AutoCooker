@@ -1353,107 +1353,50 @@ class PlanningPhase(BasePhase):
                     f"[FILE: {fname}] 'implementation_steps' must be a non-empty array"
                 )
             else:
+                from core.patcher import (
+                    legacy_step_to_blocks,
+                    validate_block_shape,
+                    validate_block_quality,
+                )
                 for step_idx, step in enumerate(steps):
                     if not isinstance(step, dict):
                         continue
-                    code_val = step.get("code")
-                    if code_val is None:
+
+                    # Convert to the unified blocks schema. This accepts
+                    # new format {file, blocks:[...]}, new-file {file, create:"..."}
+                    # and legacy {find, code:{file,line,content}, insert_after}.
+                    blocks, step_file, _action = legacy_step_to_blocks(step)
+
+                    if not blocks:
                         errors.append(
-                            f"[FILE: {fname}] step {step_idx + 1}: missing 'code' field. "
-                            "Every step must have a 'code' dict with file, line, content."
+                            f"[FILE: {fname}] step {step_idx + 1}: no usable content. "
+                            "A step must be ONE of:\n"
+                            "  A) {\"file\":\"path\", \"blocks\":[{\"search\":\"...\",\"replace\":\"...\"}]}\n"
+                            "  B) {\"file\":\"path\", \"create\":\"<full new file content>\"}\n"
+                            "  C) legacy {\"find\":\"...\", \"code\":{\"file\":\"path\",\"content\":\"...\"}}"
                         )
                         continue
-                    # code must be a dict (not a plain string)
-                    if not isinstance(code_val, dict):
+
+                    # File must be resolvable
+                    if not step_file and len(creates) + len(modifies) != 1:
                         errors.append(
-                            f"[FILE: {fname}] step {step_idx + 1}: 'code' must be a JSON object "
-                            f"{{\"file\": \"...\", \"line\": N, \"content\": \"...\"}}, "
-                            f"got {type(code_val).__name__}: {str(code_val)[:60]!r}. "
-                            "WRONG: \"code\": \"some string\". "
-                            "CORRECT: \"code\": {\"file\": \"web/js/app.js\", \"line\": 42, \"content\": \"...\"}"
-                        )
-                        continue
-                    # Validate required dict fields
-                    code_file = code_val.get("file", "")
-                    code_line = code_val.get("line")
-                    code_content = code_val.get("content", "")
-                    if not code_file:
-                        errors.append(
-                            f"[FILE: {fname}] step {step_idx + 1}: code.file is missing or empty. "
-                            "Must be the relative path of the file being changed."
-                        )
-                    if code_line is None:
-                        errors.append(
-                            f"[FILE: {fname}] step {step_idx + 1}: code.line is missing. "
-                            "Must be the line number in the current file where this change goes."
-                        )
-                    if not code_content or not str(code_content).strip():
-                        errors.append(
-                            f"[FILE: {fname}] step {step_idx + 1}: code.content is empty. "
-                            "Must contain the actual code to insert or replace."
-                        )
-                    elif len(str(code_content).strip()) < 5:
-                        errors.append(
-                            f"[FILE: {fname}] step {step_idx + 1}: code.content is too short "
-                            f"({len(str(code_content).strip())} chars). Must be real implementation code."
-                        )
-                    # Reject reference-style content: "path/file.py: function_name()"
-                    _first_line = str(code_content).split("\n")[0].strip()
-                    _ref_pattern = (
-                        _first_line.endswith(")") and ": " in _first_line
-                        and "/" in _first_line.split(":")[0]
-                    )
-                    if _ref_pattern:
-                        errors.append(
-                            f"[FILE: {fname}] step {step_idx + 1}: code.content looks like a "
-                            f"file/function reference: {_first_line[:80]!r}. "
-                            "Must be actual source code, not 'path/file.py: func()' references."
+                            f"[FILE: {fname}] step {step_idx + 1}: missing 'file' "
+                            "and files_to_create/files_to_modify has multiple candidates — "
+                            "set step.file (or code.file) explicitly."
                         )
 
-                    # Reject JSON-leak tails: when the planner mis-escapes its
-                    # own JSON, closing braces/brackets of the outer action
-                    # file leak into code.content. Classic fingerprint seen
-                    # in task_029 T-002: content ends with `"}\n}\n  ],`.
-                    _tail = str(code_content).rstrip()[-40:]
-                    _leak_sigs = (
-                        '"\n    }\n  ],',
-                        '"\n  }\n]',
-                        '}"\n  }',
-                        '"}\n    }',
-                        '],\n  "',
-                        ')"\n      }',
-                    )
-                    if any(sig in _tail for sig in _leak_sigs) or _tail.endswith(('"}', '],')):
-                        errors.append(
-                            f"[FILE: {fname}] step {step_idx + 1}: code.content ends with "
-                            f"JSON-structure garbage {_tail[-30:]!r}. This means the outer "
-                            "action-file JSON leaked into code.content due to mis-escaped "
-                            "quotes. Rewrite the step — code.content must contain ONLY source "
-                            "code, never JSON braces/brackets from the surrounding file."
-                        )
-
-                    # Reject destructive find→replace: if 'find' declares a
-                    # function/class/method (any mainstream language) and
-                    # 'code.content' declares a DIFFERENT one, the mechanical
-                    # applier would delete the original. Planner must use
-                    # 'insert_after' instead.
-                    _find_text = str(step.get("find", "") or "")
-                    if _find_text.strip() and str(code_content).strip():
-                        from core.phases.coding import _extract_decl_names
-                        _find_sigs = _extract_decl_names(_find_text)
-                        _replace_sigs = _extract_decl_names(str(code_content))
-                        if (
-                            _find_sigs
-                            and _replace_sigs
-                            and set(_find_sigs).isdisjoint(_replace_sigs)
-                        ):
+                    # Validate each block via the shared patcher rules.
+                    for b_idx, blk in enumerate(blocks, start=1):
+                        ok, msg = validate_block_shape(blk)
+                        if not ok:
                             errors.append(
-                                f"[FILE: {fname}] step {step_idx + 1}: destructive "
-                                f"find→replace — 'find' matches existing declaration "
-                                f"'{_find_sigs[0]}' but code.content defines a different "
-                                f"one '{_replace_sigs[0]}'. This would DELETE "
-                                f"'{_find_sigs[0]}'. Use 'insert_after' (to add the new "
-                                f"declaration near the old one) instead of 'find'."
+                                f"[FILE: {fname}] step {step_idx + 1} block {b_idx}: {msg}"
+                            )
+                            continue
+                        ok, msg = validate_block_quality(blk)
+                        if not ok:
+                            errors.append(
+                                f"[FILE: {fname}] step {step_idx + 1} block {b_idx}: {msg}"
                             )
 
             for rel_path in modifies:

@@ -1,138 +1,159 @@
 # Action Writer (Step 2)
 
-Write one action file per implementation subtask to `actions/`.
+Write one action file per implementation subtask into the `actions/` directory.
 
 ## YOUR JOB
 
-1. Read `spec.json` to understand what needs to be done
-2. Use the KEY SOURCE FILES provided in the message (call `read_file` if you need something not provided)
-3. Write one JSON file per subtask into the `actions/` directory
-4. Call `confirm_phase_done` when all action files are written
+1. Read `spec.json`.
+2. Use the KEY SOURCE FILES provided in the message (call `read_file` if you need something not provided).
+3. Write one JSON file per subtask into `actions/` (e.g. `T001.json`).
+4. Call `confirm_phase_done` when all action files are written.
 
-## ⛔ HARD RULES — VIOLATIONS CAUSE IMMEDIATE REJECTION
+---
 
-**RULE 1 — files_to_modify or files_to_create is MANDATORY**
-Every action file MUST have at least one real project file in `files_to_modify` OR `files_to_create`.
-An action file with neither field (or both empty) is REJECTED.
-Example: `"files_to_modify": ["web/js/app.js"]`
+## THE STEP FORMAT — SEARCH/REPLACE BLOCKS
 
-**RULE 2 — `code` must be a dict with `file`, `line`, `content`**
-Every step's `code` field must be an object — NOT a plain string.
+Every modification is an ordered list of **SEARCH/REPLACE blocks**, Aider-style.
+Each block has two fields: `search` (exact existing text from the file) and
+`replace` (what it becomes). The applier finds `search` VERBATIM in the file
+and substitutes `replace`. This is the ONLY mechanism — no line numbers,
+no `insert_after`, no "insert at line 42".
+
+### Three step shapes
+
+**A) Modify existing file — one or more SEARCH/REPLACE blocks:**
 ```json
-WRONG: "code": "btn.textContent = 'Run';"
-WRONG: "code": "web/js/app.js: updateButtons()"
-CORRECT: "code": {"file": "web/js/app.js", "line": 346, "content": "btn.textContent = 'Run';"}
+{
+  "step": 1,
+  "action": "Add upload_attachment endpoint near delete_task",
+  "file": "main.py",
+  "blocks": [
+    {
+      "search": "@eel.expose\ndef delete_task(task_id: str) -> dict:\n    \"\"\"Delete a task by id.\"\"\"\n    return STATE.delete_task(task_id)",
+      "replace": "@eel.expose\ndef delete_task(task_id: str) -> dict:\n    \"\"\"Delete a task by id.\"\"\"\n    return STATE.delete_task(task_id)\n\n\n@eel.expose\ndef upload_attachment(task_id: str, filename: str, content_b64: str) -> dict:\n    \"\"\"Save a base64-encoded file into the task's attachments dir.\"\"\"\n    # … full implementation …\n    return {\"ok\": True}"
+    }
+  ]
+}
 ```
-- `file`: exact relative path of the file being changed (from project root)
-- `line`: line number in the CURRENT file where this change goes (copy from KEY SOURCE FILES)
-- `content`: the actual code to insert/replace — verbatim, copy-paste ready
 
-**RULE 3 — KEY SOURCE FILES are provided in the message**
-Use them to get exact line numbers and verbatim code for `find` and `code.content`.
-If you need a file not yet provided, call `read_file` to fetch it.
-Never invent code that isn't in the source — copy `find` verbatim from the actual file.
+**B) Create a new file — use `create`:**
+```json
+{
+  "step": 1,
+  "action": "Create attachment helper module",
+  "file": "core/attachments.py",
+  "create": "\"\"\"Attachment helper.\"\"\"\nimport os\n\n\ndef save_attachment(task_dir, name, data_bytes):\n    path = os.path.join(task_dir, 'attachments', name)\n    os.makedirs(os.path.dirname(path), exist_ok=True)\n    with open(path, 'wb') as f:\n        f.write(data_bytes)\n    return path\n"
+}
+```
 
-**RULE 4 — No analysis, review, or test subtasks**
-Do NOT create action files titled "Review…", "Analyze…", "Test…", "Verify…".
-Every action file must produce real code changes.
-
----
-
-## PROCEDURE
-
-**Step 1 — Read spec.json**
-Understand what needs to be built.
-
-**Step 2 — Identify which project files need changes**
-Key source files are already provided above in the message. Use line numbers from them.
-If you need a file not yet provided, call `read_file` to fetch it.
-
-**Step 3 — For each file that needs changes, create one action file**
-One file changed = one action file. Group small related changes to the same file together.
-
-**Step 4 — Write action files, then call confirm_phase_done**
+**C) Append to end of file — empty `search`:**
+```json
+{
+  "step": 2,
+  "action": "Register new eel function at bottom",
+  "file": "main.py",
+  "blocks": [
+    {"search": "", "replace": "\n# registered above\n"}
+  ]
+}
+```
 
 ---
 
-## ACTION FILE FORMAT
+## ⛔ HARD RULES
+
+### R1 — `files_to_modify` or `files_to_create` is MANDATORY
+At least one real project file. Rejected if both are empty.
+
+### R2 — Every `search` must be UNIQUE in the target file
+If the applier finds `search` zero times → rejected.
+If it finds `search` ≥ 2 times → rejected (ambiguous).
+**Fix:** include more surrounding context verbatim — aim for ≥ 3 distinctive
+lines before/after the change, or at least 30 characters total.
+
+### R3 — ADDITIVE patches MUST preserve the anchor in `replace`
+This is the #1 failure mode. If you're adding a new function near an
+existing `foo`, the existing `foo` definition MUST appear VERBATIM in
+both `search` AND `replace` (same position). Otherwise the old `foo`
+is silently deleted.
+
+**WRONG — this deletes `delete_task`:**
+```json
+{
+  "search": "def delete_task(...):\n    return STATE.delete_task(id)",
+  "replace": "def upload_attachment(...):\n    ..."
+}
+```
+**RIGHT — `delete_task` preserved, new function ADDED after it:**
+```json
+{
+  "search": "def delete_task(...):\n    return STATE.delete_task(id)",
+  "replace": "def delete_task(...):\n    return STATE.delete_task(id)\n\n\ndef upload_attachment(...):\n    ..."
+}
+```
+The applier rejects the wrong form automatically — the declarations in
+`search` must all still be present in `replace` (rename is allowed if
+both old and new names appear in both fields).
+
+### R4 — `search` must be VERBATIM from the current file
+Copy-paste from the KEY SOURCE FILES provided. Indentation, quotes,
+and every character matter. Only trailing whitespace on each line is
+fuzzy-matched; everything else must be exact.
+
+### R5 — `replace` must be ONLY source code
+No JSON braces/brackets from the outer action file leaking in. If your
+`replace` ends with `}"`, `"}`, `],` etc. you've mis-escaped a quote.
+Re-emit the block.
+
+### R6 — No placeholders, no prose
+No `...`, `# existing code`, `# TODO`, `# rest of function`.
+No `"Review..."`, `"Analyze..."`, `"Test..."` subtasks — every action
+file must produce real code changes.
+
+---
+
+## ACTION FILE TEMPLATE
 
 ```json
 {
   "id": "T-001",
-  "title": "Short imperative title: what this action does",
+  "title": "Short imperative title",
   "description": "1-2 sentences: what changes and why.",
   "files_to_create": [],
-  "files_to_modify": ["web/js/app.js"],
-  "patterns_from": ["web/js/app.js"],
+  "files_to_modify": ["main.py"],
+  "patterns_from": ["main.py"],
   "implementation_steps": [
     {
       "step": 1,
-      "action": "In updateButtons: change button label to Run after restart",
-      "find": "btn.textContent = task.phase === 'qa' ? 'Continue' : 'Start';",
-      "code": {
-        "file": "web/js/app.js",
-        "line": 346,
-        "content": "btn.textContent = task.phase === 'qa' ? 'Run' : 'Start';"
-      }
+      "action": "What this step does in one line",
+      "file": "main.py",
+      "blocks": [
+        {
+          "search": "<≥ 3 lines of the current file, verbatim>",
+          "replace": "<the same anchor (if additive) + new code>"
+        }
+      ]
     }
   ],
   "status": "pending"
 }
 ```
 
-### For modifications (existing code):
-- `find`: exact existing code from the file you read (verbatim, ≥1 distinctive line)
-- `code.content`: the complete replacement code
-- `code.file`: same file as in `files_to_modify`
-- `code.line`: line number of the `find` text in the current file
-
-### For new code insertions:
-- `insert_after`: exact line after which to insert (verbatim from the file)
-- `code.content`: the complete new code block
-- `code.file`: same file as in `files_to_modify`
-- `code.line`: line number of the `insert_after` line
-
-### For new files (`files_to_create`):
-- No `find` needed
-- `code.file`: path of the new file (same as in `files_to_create`)
-- `code.line`: 1
-- `code.content`: the complete file content
+For new files, replace `blocks` with `"create": "<full file content>"`.
 
 ---
 
-## IMPLEMENTATION STEPS QUALITY
+## PROCEDURE
 
-Each step must be **copy-paste ready**. No placeholders:
-- No `...`, `# existing code`, `# TODO`, `# rest of function`
-- No `"code": ""` or `"code": "some string"` — `code` must always be a JSON object `{}`
-- No `"content": "path/file.py: function_name()"` — that is a reference, not code
-- `find`/`insert_after` must be copied verbatim from the actual file you read
-
-**Bad step (rejected — code is a plain string):**
-```json
-{"action": "Update button state", "code": "startBtn.textContent = 'Run';"}
-```
-
-**Good step (accepted — code is a dict with file + line + content):**
-```json
-{
-  "action": "In _updateTaskButtons: show Run after task restart",
-  "find": "  startBtn.textContent = 'Continue';",
-  "code": {
-    "file": "web/js/app.js",
-    "line": 1247,
-    "content": "  startBtn.textContent = task.restarted ? 'Run' : 'Continue';"
-  }
-}
-```
-
----
+1. Read `spec.json`.
+2. For each file that needs changes, drop one action file.
+3. Copy real text from the KEY SOURCE FILES for every `search`.
+4. For any ADD-near-X change, include X's definition VERBATIM in both
+   `search` and `replace`.
+5. Call `confirm_phase_done`.
 
 ## ORDERING
-- Data/state changes first (T001)
+- Data/state changes first
 - Backend/API changes next
 - HTML before JS that references new elements
 - CSS last
-
-## FINISH
-After writing ALL action files, call `confirm_phase_done`.

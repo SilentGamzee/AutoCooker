@@ -92,41 +92,58 @@ def _extract_code_content(code_val) -> tuple[str, str, int]:
 
 
 def _format_implementation_steps(steps: list) -> str:
-    """Format implementation_steps list into a readable section for the coding agent.
+    """Format implementation_steps list as Aider-style SEARCH/REPLACE blocks.
 
-    NEW-25: Steps with empty 'code' that are just "Read..." / "Test..." placeholders
-    are dropped — they provide no implementation guidance and cause the coding agent
-    to skip actually reading files (the file content is already injected via modify_previews).
+    Accepts both new ({file, blocks:[{search,replace}]}) and legacy
+    ({find, code, insert_after}) formats by delegating to
+    `core.patcher.legacy_step_to_blocks`.
     """
     if not steps or not isinstance(steps, list):
         return ""
+    from core.patcher import legacy_step_to_blocks
+
     lines = ["Implementation Steps (follow in order):\n"]
     step_num = 0
     for step in steps:
         if not isinstance(step, dict):
             continue
-        action = step.get("action", "").strip()
-        code_val = step.get("code", "")
-        code_content, code_file, code_line = _extract_code_content(code_val)
-        verify = step.get("verify_methods", [])
-        # Drop placeholder steps: empty code + action that describes reading/testing
-        if not code_content:
+        action = (step.get("action", "") or "").strip()
+        blocks, step_file, _ = legacy_step_to_blocks(step)
+
+        # Drop placeholder steps: no blocks + action like "Read..." / "Test..."
+        if not blocks:
             action_lower = action.lower()
             if any(action_lower.startswith(pfx) for pfx in _PLACEHOLDER_STEP_PREFIXES):
-                continue  # skip "Read current X" / "Test modified X" placeholders
+                continue
+
         step_num += 1
         if action:
             lines.append(f"  Step {step_num}: {action}")
-        if code_file:
-            loc = f"{code_file}:{code_line}" if code_line else code_file
-            lines.append(f"    Target: {loc}")
+        if step_file:
+            lines.append(f"    File: {step_file}")
+        verify = step.get("verify_methods", [])
         if verify:
             lines.append(f"    Verify exist before use: {', '.join(verify)}")
-        find_text = step.get("find", "")
-        if find_text:
-            lines.append(f"    Find:    {find_text[:120]}")
-        if code_content:
-            lines.append(f"    Replace: ```\n    {code_content}\n    ```")
+
+        for b_idx, blk in enumerate(blocks, start=1):
+            if not isinstance(blk, dict):
+                continue
+            search = str(blk.get("search", "") or "")
+            replace = str(blk.get("replace", "") or "")
+            lines.append(f"    --- block {b_idx} ---")
+            if search == "":
+                lines.append("    SEARCH: (empty -> append to end of file OR new-file content)")
+            else:
+                lines.append("    SEARCH:")
+                lines.append("    ```")
+                for ln in search.splitlines():
+                    lines.append(f"    {ln}")
+                lines.append("    ```")
+            lines.append("    REPLACE:")
+            lines.append("    ```")
+            for ln in replace.splitlines():
+                lines.append(f"    {ln}")
+            lines.append("    ```")
     lines.append("")
     return "\n".join(lines) + "\n"
 
@@ -640,32 +657,33 @@ class CodingPhase(BasePhase):
         workdir: str,
         on_write: callable,
     ) -> dict:
-        """Try to mechanically apply find→replace steps from implementation_steps.
+        """Mechanically apply implementation_steps using Aider-style
+        SEARCH/REPLACE blocks (core.patcher).
 
-        For each step that has a non-empty 'find' and 'replace' (or 'code') field:
-          - Locate the target file from files_to_modify
-          - Apply str.replace(find, replace, 1) directly
-          - Write the result back to workdir
+        Each step is converted to `{file, blocks[]}` via
+        `patcher.legacy_step_to_blocks` (handles both the new `blocks`
+        schema and the legacy `{find, code, insert_after}` schema).
 
-        Returns a dict with:
-          all_done       — True if every step was applied (LLM not needed)
-          applied        — count of steps applied
-          pending        — count of steps still needing LLM
-          applied_actions — list of human-readable descriptions of what was applied
+        The patcher enforces:
+          - search must be unique in file (or append-mode if empty)
+          - search must have ≥ 30 chars / ≥ 2 non-blank lines of context
+          - destructive replaces (lost declarations) are rejected
+          - JSON-leak tails are rejected
+          - search ≠ replace (no no-op blocks)
+
+        Returns `{all_done, applied, pending, applied_actions}`.
         """
+        from core.patcher import legacy_step_to_blocks, apply_blocks
+
         steps = subtask_dict.get("implementation_steps") or []
         files_to_modify = subtask_dict.get("files_to_modify") or []
         files_to_create = subtask_dict.get("files_to_create") or []
-
-        # Can only mechanically handle modify steps (not create-from-scratch)
-        if files_to_create and not files_to_modify:
-            return {"all_done": False, "applied": 0, "pending": len(steps), "applied_actions": []}
 
         applied = 0
         pending = 0
         applied_actions: list[str] = []
 
-        # Cache of file contents — read once, write once per file
+        # Cache of file contents — read once, write once per file.
         file_cache: dict[str, str] = {}
         file_modified: set[str] = set()
 
@@ -688,120 +706,99 @@ class CodingPhase(BasePhase):
                 pending += 1
                 continue
 
-            action = step.get("action", "")
-            find_text = step.get("find", "")
-            insert_after = step.get("insert_after", "")
-
-            # Extract code — supports new dict format and legacy string
-            code_val = step.get("code", "")
-            replace_text, code_file, _code_line = _extract_code_content(code_val)
-
-            # P3: Guard against placeholder/stub replacements. If the plan
-            # hands us "pass", "...", "TODO", "# TODO ..." or similarly
-            # empty content, do NOT mechanically write it — the LLM must
-            # produce real code. Otherwise insert_after would drop a bare
-            # `pass` into the file, which critic-C immediately flags.
-            _stripped = replace_text.strip()
-            _STUB_REPLACEMENTS = {"", "pass", "...", "todo", "fixme", "# todo", "# fixme"}
-            if _stripped.lower() in _STUB_REPLACEMENTS or (
-                len(_stripped) < 8 and _stripped.lower().startswith(("pass", "todo", "fixme", "..."))
-            ):
+            blocks, step_file, action = legacy_step_to_blocks(step)
+            if not blocks:
                 pending += 1
                 self.log(
-                    f"  [mech] stub/placeholder code '{_stripped[:20]}' — needs LLM: {action[:60]}",
+                    f"  [mech] step has no usable blocks — needs LLM: "
+                    f"{action[:60]}",
                     "info",
                 )
                 continue
 
-            # Determine candidate files: prefer code.file, fall back to files_to_modify list
-            if code_file and code_file in files_to_modify:
-                candidate_files = [code_file]
-            elif code_file:
-                # code.file not in files_to_modify — still try it (may be valid)
-                candidate_files = [code_file] if os.path.isfile(os.path.join(workdir, code_file)) else files_to_modify
-            else:
-                candidate_files = files_to_modify
-
-            # Case A: find + replace
-            if find_text and find_text.strip():
-                # GUARD: destructive find→replace — if find_text declares a
-                # function/class/method (Python, JS, TS, Go, Rust, Kotlin,
-                # Swift, C#, Java, C/C++, etc.) and replace_text declares a
-                # DIFFERENT one, a naive .replace() deletes the original.
-                # Route to the LLM instead (it understands "insert before X").
-                _find_sigs = _extract_decl_names(find_text)
-                _replace_sigs = _extract_decl_names(replace_text)
-                if _find_sigs and _replace_sigs and set(_find_sigs).isdisjoint(_replace_sigs):
+            # Pick target file. Priority: step.file → code.file (resolved
+            # inside legacy_step_to_blocks) → unique files_to_modify.
+            target = step_file
+            if not target:
+                if len(files_to_modify) == 1:
+                    target = files_to_modify[0]
+                elif len(files_to_create) == 1 and not files_to_modify:
+                    target = files_to_create[0]
+                else:
                     pending += 1
                     self.log(
-                        f"  [mech] destructive find→replace "
-                        f"(find='{_find_sigs[0]}' → replace='{_replace_sigs[0]}') "
-                        f"— needs LLM: {action[:60]}",
-                        "warn",
+                        f"  [mech] no file resolved for step — needs LLM: "
+                        f"{action[:60]}",
+                        "info",
                     )
                     continue
-                matched_file = None
-                for rel in candidate_files:
-                    content = _load(rel)
-                    if content is None:
-                        continue
-                    if find_text in content:
-                        matched_file = rel
-                        # Duplicate guard: if replace already present elsewhere, skip
-                        rest = content.replace(find_text, "", 1)
-                        if replace_text and replace_text.strip() and replace_text.strip() in rest:
-                            self.log(
-                                f"  [mech] Skipping (replace already present in {rel}): {action[:60]}",
-                                "info",
-                            )
-                            applied += 1
-                            applied_actions.append(f"{action[:80]} [already present in {rel}]")
-                        else:
-                            file_cache[rel] = content.replace(find_text, replace_text, 1)
-                            file_modified.add(rel)
-                            applied += 1
-                            applied_actions.append(f"{action[:80]} → {rel}")
-                            self.log(f"  [mech] Applied find→replace: {action[:60]} → {rel}", "info")
-                        break
-                if matched_file is None:
-                    pending += 1
-                    self.log(f"  [mech] find not matched — needs LLM: {action[:60]}", "info")
+
+            # Create-new-file path: no SEARCH, file doesn't exist yet.
+            abs_p = os.path.join(workdir, target)
+            if not os.path.isfile(abs_p):
+                # Only proceed when every block is an "append" (empty
+                # search) — that's unambiguously a new-file write.
+                if all(b.get("search", "") == "" for b in blocks):
+                    # Concatenate all replaces as initial file content.
+                    new_content = ""
+                    for b in blocks:
+                        sep = "" if new_content.endswith("\n") or not new_content else "\n"
+                        new_content += sep + b["replace"]
+                    file_cache[target] = new_content
+                    file_modified.add(target)
+                    applied += 1
+                    applied_actions.append(f"{action[:80]} [create] → {target}")
+                    self.log(
+                        f"  [mech] Created new file: {target} ({action[:60]})",
+                        "info",
+                    )
+                    continue
+                pending += 1
+                self.log(
+                    f"  [mech] target file missing and blocks aren't pure "
+                    f"append — needs LLM: {action[:60]}",
+                    "info",
+                )
                 continue
 
-            # Case B: insert_after
-            if insert_after and insert_after.strip():
-                matched_file = None
-                for rel in candidate_files:
-                    content = _load(rel)
-                    if content is None:
-                        continue
-                    if insert_after in content:
-                        matched_file = rel
-                        # Insert replace_text after the insert_after line
-                        idx = content.index(insert_after) + len(insert_after)
-                        # Move to end of that line
-                        nl = content.find("\n", idx)
-                        insert_pos = nl + 1 if nl != -1 else len(content)
-                        updated = content[:insert_pos] + replace_text + "\n" + content[insert_pos:]
-                        file_cache[rel] = updated
-                        file_modified.add(rel)
-                        applied += 1
-                        applied_actions.append(f"{action[:80]} [insert_after] → {rel}")
-                        self.log(f"  [mech] Applied insert_after: {action[:60]} → {rel}", "info")
-                        break
-                if matched_file is None:
-                    pending += 1
-                    self.log(f"  [mech] insert_after not matched — needs LLM: {action[:60]}", "info")
+            content = _load(target)
+            if content is None:
+                pending += 1
+                self.log(
+                    f"  [mech] couldn't load {target} — needs LLM: "
+                    f"{action[:60]}",
+                    "warn",
+                )
                 continue
 
-            # No anchor at all — LLM must handle
-            pending += 1
-            self.log(f"  [mech] No find/insert_after anchor — needs LLM: {action[:60]}", "info")
+            ok, new_content, msgs = apply_blocks(content, blocks)
+            if not ok:
+                pending += 1
+                # Show the first rejection reason — it points to the
+                # exact block that failed so the LLM retry can fix it.
+                detail = msgs[-1] if msgs else "unknown reason"
+                self.log(
+                    f"  [mech] blocks rejected on {target} — needs LLM: "
+                    f"{action[:60]}  [{detail[:120]}]",
+                    "info",
+                )
+                continue
 
-        # Write modified files back to workdir
+            file_cache[target] = new_content
+            file_modified.add(target)
+            applied += 1
+            applied_actions.append(f"{action[:80]} → {target}")
+            self.log(
+                f"  [mech] Applied {len(blocks)} block(s): {action[:60]} "
+                f"→ {target}",
+                "info",
+            )
+
+        # Write modified files back to workdir.
         for rel in file_modified:
             abs_p = os.path.join(workdir, rel)
             try:
+                os.makedirs(os.path.dirname(abs_p), exist_ok=True)
                 with open(abs_p, "w", encoding="utf-8") as f:
                     f.write(file_cache[rel])
                 on_write(rel, file_cache[rel])
