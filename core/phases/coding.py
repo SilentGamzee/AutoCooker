@@ -250,6 +250,33 @@ class CodingPhase(BasePhase):
                 self.task.project_path or self.state.working_dir
             )
 
+            # P1: Fail-fast. A failed subtask means remaining subtasks would
+            # build on a broken foundation — stop the pipeline immediately
+            # and route the task to Human Review instead of burning time/
+            # tokens on later subtasks and QA. (main.py pipeline still gets
+            # the "has_errors=True" signal to finalize column placement.)
+            if not success:
+                self.task.column = "human_review"
+                remaining = [
+                    s.get("id", "?")
+                    for s in self.task.subtasks[i + 1:]
+                    if s.get("status", "pending") not in ("done", "skipped", "invalid")
+                ]
+                if remaining:
+                    self.log(
+                        f"  ⛔ Fail-fast: subtask {sid} failed — skipping "
+                        f"{len(remaining)} remaining subtask(s): {', '.join(remaining[:10])}"
+                        + (" …" if len(remaining) > 10 else ""),
+                        "error",
+                    )
+                else:
+                    self.log(
+                        f"  ⛔ Fail-fast: subtask {sid} failed — aborting coding phase.",
+                        "error",
+                    )
+                self.push_task()
+                return False
+
         return all_ok
 
     # ── Execute one subtask ────────────────────────────────────────
@@ -612,6 +639,23 @@ class CodingPhase(BasePhase):
             code_val = step.get("code", "")
             replace_text, code_file, _code_line = _extract_code_content(code_val)
 
+            # P3: Guard against placeholder/stub replacements. If the plan
+            # hands us "pass", "...", "TODO", "# TODO ..." or similarly
+            # empty content, do NOT mechanically write it — the LLM must
+            # produce real code. Otherwise insert_after would drop a bare
+            # `pass` into the file, which critic-C immediately flags.
+            _stripped = replace_text.strip()
+            _STUB_REPLACEMENTS = {"", "pass", "...", "todo", "fixme", "# todo", "# fixme"}
+            if _stripped.lower() in _STUB_REPLACEMENTS or (
+                len(_stripped) < 8 and _stripped.lower().startswith(("pass", "todo", "fixme", "..."))
+            ):
+                pending += 1
+                self.log(
+                    f"  [mech] stub/placeholder code '{_stripped[:20]}' — needs LLM: {action[:60]}",
+                    "info",
+                )
+                continue
+
             # Determine candidate files: prefer code.file, fall back to files_to_modify list
             if code_file and code_file in files_to_modify:
                 candidate_files = [code_file]
@@ -849,7 +893,20 @@ class CodingPhase(BasePhase):
         for step_name, prompt_file, output_filename in sub_phases:
             self.log(f"  ─── {step_name} ───", "info")
             output_path  = os.path.join(self.task.task_dir, output_filename)
+            # P0: Remove any stale report left by a previous subtask so
+            # "INFRA: artifact missing" cleanly signals that the LLM
+            # actually failed to produce a report this round.
+            try:
+                if os.path.isfile(output_path):
+                    os.remove(output_path)
+            except OSError:
+                pass
             executor     = self._make_executor(self.task.task_dir)  # critic пишет в task_dir
+            # P2: Read fallback must point at the workdir (which reflects changes
+            # from prior subtasks), NOT the pristine project_path. Otherwise
+            # critic-B reads stale code and raises false "symbol not defined"
+            # flags for fields added earlier in the same coding run.
+            executor.fallback_read_root = os.path.realpath(workdir)
             if executor.sandbox is not None:
                 executor.sandbox.new_files_allowed = True  # critic создаёт новые JSON-файлы
 
@@ -895,8 +952,13 @@ class CodingPhase(BasePhase):
                 CRITIC_SUBPHASE_TOOLS, executor, msg, _make_validator(),
                 model,
                 max_outer_iterations=2,
-                max_tool_rounds=6,
-                disable_write_nudge=True,
+                max_tool_rounds=8,
+                # P0: MUST be False — critic phases are required to write their
+                # output JSON. disable_write_nudge=True used to trigger the
+                # "all reads cached → exit early" path in ollama_client and
+                # suppress write nudges, so critic-A completeness regularly
+                # exited without ever calling write_file.
+                disable_write_nudge=False,
             )
 
             if not ok:

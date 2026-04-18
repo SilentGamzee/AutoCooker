@@ -591,12 +591,32 @@ def start_task(task_id: str) -> dict:
                         _push_task(task)
                         
                         coding_ok = CodingPhase(STATE, task).run()
-                        
+
+                        # ══════════════════════════════════════════════════
+                        # FAIL-FAST: CodingPhase.run() sets task.column
+                        # to "human_review" when a subtask fails — skip
+                        # patch retries and QA entirely, route straight to
+                        # Human Review so a human can review the log.
+                        # ══════════════════════════════════════════════════
+                        if task.column == "human_review":
+                            task.has_errors = True
+                            task.tags = list(set(task.tags + ["Needs Review"]))
+                            task.update_phase_status("coding", "needs_analysis")
+                            task.add_log(
+                                "  ⛔ Fail-fast: subtask failed — routing "
+                                "task to Human Review without running QA.",
+                                "system", "error"
+                            )
+                            _push_task(task)
+                            _push_board()
+                            STATE.active_task_id = ""
+                            return
+
                         # ══════════════════════════════════════════════════
                         # НОВОЕ: Проверка needs_analysis и патчинг
                         # ══════════════════════════════════════════════════
                         needs_analysis = any(
-                            st.get("status") == "needs_analysis" 
+                            st.get("status") == "needs_analysis"
                             for st in task.subtasks
                         )
                         
