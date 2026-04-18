@@ -1432,20 +1432,16 @@ class PlanningPhase(BasePhase):
                             "code, never JSON braces/brackets from the surrounding file."
                         )
 
-                    # Reject destructive find→replace: if 'find' is someone
-                    # else's function/class signature and 'code.content'
-                    # defines a DIFFERENT function, the mechanical applier
-                    # would delete the original. Planner should use
+                    # Reject destructive find→replace: if 'find' declares a
+                    # function/class/method (any mainstream language) and
+                    # 'code.content' declares a DIFFERENT one, the mechanical
+                    # applier would delete the original. Planner must use
                     # 'insert_after' instead.
                     _find_text = str(step.get("find", "") or "")
                     if _find_text.strip() and str(code_content).strip():
-                        import re as _re_plan
-                        _sig_re = _re_plan.compile(
-                            r"(?:^|\n)\s*(?:@\w[\w\.\s()=\"',:]*\n\s*)?"
-                            r"(?:async\s+)?(?:def|class|function)\s+(\w+)",
-                        )
-                        _find_sigs = [m.group(1) for m in _sig_re.finditer(_find_text)]
-                        _replace_sigs = [m.group(1) for m in _sig_re.finditer(str(code_content))]
+                        from core.phases.coding import _extract_decl_names
+                        _find_sigs = _extract_decl_names(_find_text)
+                        _replace_sigs = _extract_decl_names(str(code_content))
                         if (
                             _find_sigs
                             and _replace_sigs
@@ -1453,11 +1449,11 @@ class PlanningPhase(BasePhase):
                         ):
                             errors.append(
                                 f"[FILE: {fname}] step {step_idx + 1}: destructive "
-                                f"find→replace — 'find' matches existing function "
+                                f"find→replace — 'find' matches existing declaration "
                                 f"'{_find_sigs[0]}' but code.content defines a different "
-                                f"function '{_replace_sigs[0]}'. This would DELETE "
+                                f"one '{_replace_sigs[0]}'. This would DELETE "
                                 f"'{_find_sigs[0]}'. Use 'insert_after' (to add the new "
-                                f"function near the old one) instead of 'find'."
+                                f"declaration near the old one) instead of 'find'."
                             )
 
             for rel_path in modifies:

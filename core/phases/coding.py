@@ -2,7 +2,64 @@
 from __future__ import annotations
 import difflib
 import os
+import re
 import subprocess
+
+
+# ── Destructive find→replace detection ─────────────────────────────────
+# Extracts the NAME of a function/method/class/struct/etc. being declared
+# inside a block of source code. Covers a broad set of mainstream
+# languages so the mechanical applier won't silently delete an unrelated
+# function just because its signature matched 'find'.
+#
+# Pattern 1: KEYWORD NAME        — Python / JS / TS / Go / Rust / Kotlin /
+#                                  Swift / Ruby / PHP / Scala / Dart / Lua
+# Pattern 2: [modifiers]+ TYPE NAME(…)  — C# / Java / C / C++ / Objective-C /
+#                                        Dart / TypeScript class methods
+_DECL_KW = (
+    r"def|class|function|func|fn|fun|interface|struct|enum|trait|impl|"
+    r"module|record|type|proc|procedure|sub|package|namespace|protocol|"
+    r"object|extension|actor"
+)
+_MODIFIERS = (
+    r"public|private|protected|internal|static|final|abstract|async|"
+    r"override|virtual|sealed|partial|readonly|export|default|open|"
+    r"suspend|unsafe|extern|inline|const|constexpr|noexcept|synchronized|"
+    r"transient|volatile|native|strictfp"
+)
+# Flow keywords that can look like C-style method calls but aren't declarations.
+_FLOW_KEYWORDS = {
+    "if", "for", "while", "switch", "return", "catch", "do", "else",
+    "foreach", "when", "case", "using", "lock", "yield", "await",
+    "throw", "new", "delete", "sizeof", "typeof",
+}
+
+_KW_DECL_RE = re.compile(
+    rf"(?<![A-Za-z0-9_])(?:@[\w\.]+[^\n]*\n\s*)?"
+    rf"(?:(?:{_MODIFIERS})\s+)*"
+    rf"(?:{_DECL_KW})\s+(\w+)",
+)
+# C-style: [modifier]+ ReturnType [generics] NAME( — covers C#/Java/C++.
+# Require at least one modifier to avoid matching local variables like
+# `int count = 0`. Name must be a real identifier (not a flow keyword).
+_CSTYLE_DECL_RE = re.compile(
+    r"(?:^|\n)[ \t]*"
+    r"(?:(?:" + _MODIFIERS + r")\s+){1,}"
+    r"[\w<>\[\],\s\*&:\.]+?\s+"
+    r"(\w+)\s*\("
+)
+
+
+def _extract_decl_names(text: str) -> list[str]:
+    """Return all function/class/method names declared in `text`."""
+    names: list[str] = []
+    for m in _KW_DECL_RE.finditer(text):
+        names.append(m.group(1))
+    for m in _CSTYLE_DECL_RE.finditer(text):
+        name = m.group(1)
+        if name not in _FLOW_KEYWORDS:
+            names.append(name)
+    return names
 
 from core.dumb_util import get_dumb_task_workdir_diff
 from core.state import AppState, KanbanTask
@@ -667,19 +724,13 @@ class CodingPhase(BasePhase):
 
             # Case A: find + replace
             if find_text and find_text.strip():
-                # GUARD: destructive find→replace — if find_text is somebody
-                # else's function/class signature (e.g. `@eel.expose\ndef
-                # delete_task(...)`) and replace_text defines a DIFFERENT
-                # function, a naive .replace() deletes the original function.
-                # Reject and force the LLM to handle it (which understands
-                # "insert before X" vs "replace X").
-                import re as _re
-                _sig_re = _re.compile(
-                    r"(?:^|\n)\s*(?:@\w[\w\.\s()=\"',:]*\n\s*)?"
-                    r"(?:async\s+)?(?:def|class|function)\s+(\w+)",
-                )
-                _find_sigs = [m.group(1) for m in _sig_re.finditer(find_text)]
-                _replace_sigs = [m.group(1) for m in _sig_re.finditer(replace_text)]
+                # GUARD: destructive find→replace — if find_text declares a
+                # function/class/method (Python, JS, TS, Go, Rust, Kotlin,
+                # Swift, C#, Java, C/C++, etc.) and replace_text declares a
+                # DIFFERENT one, a naive .replace() deletes the original.
+                # Route to the LLM instead (it understands "insert before X").
+                _find_sigs = _extract_decl_names(find_text)
+                _replace_sigs = _extract_decl_names(replace_text)
                 if _find_sigs and _replace_sigs and set(_find_sigs).isdisjoint(_replace_sigs):
                     pending += 1
                     self.log(
