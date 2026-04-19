@@ -1551,7 +1551,8 @@ function toggleCol(btn) {
 // ─── Keyboard shortcuts ──────────────────────────────────────────
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape') {
-    if (document.getElementById('overlay-task').classList.contains('open')) closeTaskModal();
+    if (document.getElementById('overlay-msg')?.classList.contains('open')) closeMessageModal();
+    else if (document.getElementById('overlay-task').classList.contains('open')) closeTaskModal();
     else if (document.getElementById('overlay-new').classList.contains('open')) closeNewTaskModal();
     else if (document.getElementById('overlay-dir').classList.contains('open')) closeDirModal();
     else if (document.getElementById('overlay-providers').classList.contains('open')) closeProvidersModal();
@@ -1628,6 +1629,23 @@ function closeDiffModal() {
   document.getElementById('overlay-diff').classList.remove('open');
 }
 
+function showMessageModal(title, body, tone) {
+  const t = document.getElementById('msg-modal-title');
+  const b = document.getElementById('msg-modal-body');
+  if (t) t.textContent = title || 'Notice';
+  if (b) {
+    b.textContent = body || '';
+    b.style.color = tone === 'error'
+      ? 'var(--danger, #ff6b6b)'
+      : (tone === 'success' ? 'var(--accent, #4ade80)' : 'var(--text1)');
+  }
+  document.getElementById('overlay-msg').classList.add('open');
+}
+
+function closeMessageModal() {
+  document.getElementById('overlay-msg').classList.remove('open');
+}
+
 async function mergeWorkdir() {
   if (!activeTaskId) return;
   const task = await eel.get_task(activeTaskId)();
@@ -1636,8 +1654,12 @@ async function mergeWorkdir() {
 
   const res = await eel.merge_workdir(activeTaskId)();
   if (res.ok) {
-    alert(`✓ Merged ${res.files.length} file(s) into branch "${res.branch}"`);
+    showMessageModal(
+      'Merge successful',
+      `✓ Merged ${res.files.length} file(s) into branch "${res.branch}"`,
+      'success'
+    );
   } else {
-    alert('Merge failed: ' + res.error);
+    showMessageModal('Merge failed', res.error || 'Unknown error', 'error');
   }
 }

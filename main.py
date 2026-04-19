@@ -1179,19 +1179,57 @@ def merge_workdir(task_id: str) -> dict:
         err = e.stderr.decode(errors="replace") if e.stderr else str(e)
         return {"ok": False, "error": f"git checkout {branch} failed: {err.strip()}"}
 
-    # Copy files
-    copied = []
-    for dirpath, _, files in os.walk(workdir):
+    # Collect candidate files from the workdir (skip obvious cruft + any
+    # path already ignored by the target repo's .gitignore rules).
+    _SKIP_DIRS = {".git", "__pycache__", ".pytest_cache", ".mypy_cache",
+                  ".ruff_cache", "node_modules", ".venv", "venv"}
+    candidates: list[str] = []
+    for dirpath, dirs, files in os.walk(workdir):
+        # prune ignored directories in-place so os.walk doesn't descend
+        dirs[:] = [d for d in dirs if d not in _SKIP_DIRS]
         for fname in files:
             wfile = os.path.join(dirpath, fname)
-            rel   = os.path.relpath(wfile, workdir)
-            dest  = os.path.join(project, rel)
-            os.makedirs(os.path.dirname(dest), exist_ok=True)
-            shutil.copy2(wfile, dest)
-            copied.append(rel.replace("\\", "/"))
+            rel = os.path.relpath(wfile, workdir).replace("\\", "/")
+            candidates.append(rel)
 
-    if not copied:
+    # Ask git which of those candidates are ignored in the TARGET repo,
+    # and drop them. `git check-ignore --stdin -v` prints one line per
+    # ignored path; non-ignored paths produce no output.
+    ignored: set[str] = set()
+    if candidates:
+        try:
+            res = subprocess.run(
+                ["git", "check-ignore", "--stdin"],
+                cwd=project,
+                input="\n".join(candidates).encode("utf-8"),
+                capture_output=True,
+                timeout=15,
+            )
+            # rc 0 = some ignored, 1 = none ignored, other = error
+            if res.returncode in (0, 1) and res.stdout:
+                for line in res.stdout.decode("utf-8", errors="replace").splitlines():
+                    line = line.strip().replace("\\", "/")
+                    if line:
+                        ignored.add(line)
+        except Exception:
+            # If check-ignore isn't available, fall back to unfiltered
+            # list — the later `git add` will still refuse ignored
+            # paths, but we've at least skipped the obvious cruft dirs.
+            pass
+
+    files_to_merge = [p for p in candidates if p not in ignored]
+
+    if not files_to_merge:
         return {"ok": False, "error": "No files to merge"}
+
+    # Copy only the non-ignored files
+    copied: list[str] = []
+    for rel in files_to_merge:
+        src = os.path.join(workdir, rel)
+        dest = os.path.join(project, rel)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        shutil.copy2(src, dest)
+        copied.append(rel)
 
     # Stage and commit
     try:
