@@ -982,6 +982,14 @@ class PlanningPhase(BasePhase):
         else:
             self.log("  Index scan complete", "info")
 
+        # ── Coding-failure replan (targeted) ──────────────────────
+        # Coding writes this file when a subtask fails mechanically. We
+        # regenerate ONLY the failing action file and keep every passing
+        # one intact, then re-enter Coding from the failed subtask.
+        cf_path = os.path.join(self.task.task_dir, "coding_failures.json")
+        if os.path.isfile(cf_path) and self.task.subtasks:
+            return self._run_coding_failure_replan(model, cf_path)
+
         # ── Patch mode ────────────────────────────────────────────
         if self.task.corrections and self.task.subtasks:
             return self._run_patch_mode(model)
@@ -1108,6 +1116,117 @@ class PlanningPhase(BasePhase):
                 return False
 
         self.log("═══ PLANNING PHASE COMPLETE (PATCH) ═══")
+        return True
+
+    # ── Coding-failure replan mode ────────────────────────────────
+    def _run_coding_failure_replan(self, model: str, cf_path: str) -> bool:
+        """Targeted action-file regeneration after a Coding-phase apply failure.
+
+        Loads `coding_failures.json` (written by CodingPhase on rollback),
+        maps the failure into an action-critic-shaped issue, and invokes
+        `_new_step2_write_actions` in targeted mode so ONLY the failing
+        action file is rewritten. Passing subtasks (status='done') and
+        their files remain untouched.
+        """
+        self.log("  Coding-failure replan: regenerating ONLY the failing action file", "info")
+
+        try:
+            with open(cf_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except Exception as e:
+            self.log(f"[FAIL] Could not read coding_failures.json: {e}", "error")
+            # Remove the poisoned artefact so the next planning run doesn't loop.
+            try:
+                os.remove(cf_path)
+            except OSError:
+                pass
+            return False
+
+        action_file = (payload.get("action_file") or "").strip()
+        failed_sid = (payload.get("failed_subtask_id") or "").strip()
+        details = payload.get("details") or {}
+        if not action_file:
+            # Fall back to T<ID>.json when the caller didn't include it.
+            action_file = f"{failed_sid}.json" if failed_sid else ""
+        if not action_file:
+            self.log("[FAIL] coding_failures.json has no failing action file name", "error")
+            try:
+                os.remove(cf_path)
+            except OSError:
+                pass
+            return False
+
+        # Build a single issue in the action-critic shape so Step 2 targeted
+        # mode treats it exactly like a critic FAIL.
+        step_idx = details.get("step_index")
+        block_idx = details.get("block_index")
+        loc = []
+        if step_idx is not None:
+            loc.append(f"step {step_idx}")
+        if block_idx is not None:
+            loc.append(f"block {block_idx}")
+        loc_str = (" ".join(loc) + ": ") if loc else ""
+        issue_desc = (
+            f"Coding phase rolled this action back ({details.get('category', 'apply')}). "
+            f"{loc_str}{details.get('message', '(no message)')} "
+            "Rewrite the failing step so the SEARCH text exists verbatim in the "
+            "target file (or use an empty SEARCH when creating a new file)."
+        )
+        issues = [{
+            "severity": "critical",
+            "file": action_file,
+            "description": issue_desc,
+        }]
+        feedback = self._format_action_critique(issues)
+
+        self.log(
+            f"  Targeted regeneration: {action_file} "
+            f"(failed subtask {failed_sid or '?'})",
+            "info",
+        )
+
+        # One targeted rewrite + critique. If the critic passes we move on;
+        # if it fails, the orchestrator's next patch iteration will re-enter
+        # this branch with a fresh failure payload.
+        self.log("─── Replan Step 2: Write Actions (targeted) ───")
+        if not self._new_step2_write_actions(model, feedback, issues=issues):
+            self.log("[FAIL] Replan Step 2 failed", "error")
+            return False
+
+        self.log("─── Replan Step 3: Critique ───")
+        passed, crit_issues = self._new_step3_critique(model)
+        if not passed:
+            self.log(
+                f"[WARN] Replan critique raised {len(crit_issues)} issue(s); "
+                "continuing — mechanical apply will be the final check.",
+                "warn",
+            )
+
+        # Reset the failed subtask (and any later pending ones) so Coding
+        # re-enters them, while leaving status='done' subtasks untouched.
+        for st in self.task.subtasks:
+            if st.get("id") == failed_sid:
+                st["status"] = "pending"
+                st["failure_reason"] = ""
+                st.pop("failure_details", None)
+
+        # Re-synthesize plan + re-prepare workdir.
+        for name, fn in [
+            ("1.6 Load Subtasks",   self._step6_load_subtasks),
+            ("1.7 Prepare Workdir", self._step7_prepare_workdir),
+        ]:
+            self.log(f"─── Step {name} ───")
+            if not fn(model):
+                self.log(f"[FAIL] Step {name} failed", "error")
+                return False
+
+        # Consume the failure artefact — Coding writes a fresh one on next failure.
+        try:
+            os.remove(cf_path)
+        except OSError:
+            pass
+
+        self.log("═══ PLANNING PHASE COMPLETE (CODING-REPLAN) ═══")
         return True
 
     # ── New Step 1: Spec ──────────────────────────────────────────
