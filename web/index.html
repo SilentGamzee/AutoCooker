@@ -441,6 +441,22 @@
   </div>
 </div>
 
+<!-- ═══════════════ GENERIC MESSAGE MODAL ════════════════════════ -->
+<div class="overlay" id="overlay-msg" onclick="if(event.target===this)closeMessageModal()">
+  <div class="modal-new" style="max-width:520px">
+    <div class="modal-new-header">
+      <h2 id="msg-modal-title">Notice</h2>
+      <button class="modal-close" onclick="closeMessageModal()">✕</button>
+    </div>
+    <div class="modal-new-body">
+      <div id="msg-modal-body" style="white-space:pre-wrap;word-break:break-word;font-size:13px;line-height:1.5;color:var(--text1)"></div>
+    </div>
+    <div class="modal-new-footer">
+      <button class="btn-primary" onclick="closeMessageModal()">OK</button>
+    </div>
+  </div>
+</div>
+
 <!-- ═══════════════ PROVIDERS MODAL ══════════════════════════════ -->
 <div class="overlay" id="overlay-providers" onclick="if(event.target===this)closeProvidersModal()">
   <div class="modal-providers">
