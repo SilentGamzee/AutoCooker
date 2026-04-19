@@ -6,3 +6,4 @@ autocooker.log
 AUTOCOOKER_FIXES.md
 FIXED_BUGS.md
 providers.json
+__pycache__/
