@@ -23,10 +23,15 @@ Every action file MUST have at least one entry. An action file with both empty (
 
 Any step that fits none of the above → FAIL.
 
-**3. `search` blocks must not be empty (except for append) and must not be truncated**
+**3. `search` blocks must not contain literal truncation markers**
 - Empty `search` is only allowed when the intent is "append to end of file" OR the file is being created via `create`.
-- `search` must have ≥ 3 distinctive lines (or ≥ 30 chars) of context copied VERBATIM from the file.
-- Obvious truncation (`…`, `...`, mid-word cuts, mismatched quotes) → FAIL.
+- Flag as truncated ONLY when you can see a LITERAL marker in the string:
+  - `...` or `…` inside the search text
+  - an identifier cut mid-word (e.g. `def delete_ta`)
+  - unbalanced quotes/brackets (`"foo` with no closing quote, `{` with no `}`)
+  - a stray ellipsis where code should be (`def foo(...):\n    ...`)
+- **Do NOT** flag as truncated just because `search` looks "short" or has few lines. Length/context-sufficiency is checked mechanically by the patch applier — it is NOT your job. A 2-line, 35-char search that matches uniquely in the file is perfectly valid.
+- When in doubt about length, PASS it. The applier will reject it with a precise "search not found" or "matches N times" error if it's actually unusable.
 
 **4. Additive patches must preserve their anchor**
 If `search` declares a function/class and `replace` drops that declaration and introduces a DIFFERENT one, the applier will silently DELETE the original. For ADD-near-X changes, X's definition MUST appear verbatim in both `search` and `replace`.
@@ -84,7 +89,7 @@ Any issue missing `file` will be REJECTED and you'll have to resubmit.
     {
       "severity": "critical",
       "file": "T002.json",
-      "description": "Step 2 block 1: search is truncated ('def delete_task…'). Copy the full existing function body verbatim, with ≥3 lines of context so the match is unique."
+      "description": "Step 2 block 1: search contains a literal ellipsis ('def delete_task(self, ...):'). Replace the '...' with the real parameter list and body copied verbatim from the file."
     },
     {
       "severity": "critical",
@@ -92,7 +97,7 @@ Any issue missing `file` will be REJECTED and you'll have to resubmit.
       "description": "Step 4 block 1: destructive replace — search declares 'delete_task' but replace drops it and introduces 'upload_attachment'. Include 'def delete_task' verbatim in replace before the new function."
     }
   ],
-  "summary": "T001 missing file targets; T002 has truncated search and a destructive replace."
+  "summary": "T001 missing file targets; T002 has a literal ellipsis in search and a destructive replace."
 }
 ```
 
