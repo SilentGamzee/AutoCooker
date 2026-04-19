@@ -34,24 +34,37 @@ from core.patcher import (
     _find_with_fuzz,
 )
 
-# Literal truncation-marker patterns that unambiguously mean "LLM elided code"
-_TRUNC_MARKERS = [
-    re.compile(r"\.\.\.\s*\n\s*\.\.\."),          # "...\n..."
-    re.compile(r"…"),                             # unicode ellipsis
-    re.compile(r"#\s*\.\.\."),                    # Python "# ..."
-    re.compile(r"//\s*\.\.\."),                   # C/JS "// ..."
-    re.compile(r"/\*\s*\.\.\.\s*\*/"),            # /* ... */
-    re.compile(r"<\s*\.\.\.\s*>"),                # <...>
-    re.compile(r"\b(?:omitted|elided|redacted|truncated)\b", re.IGNORECASE),
-]
+# Literal truncation-marker patterns that unambiguously mean "LLM stopped
+# emitting code and left a placeholder at the END". We ONLY flag these
+# when they appear as a trailing marker — mid-text ellipses are common
+# in legitimate comments/docstrings/UI copy and must not trigger FAIL.
+_TRAILING_TRUNC_RE = re.compile(
+    r"(?:"
+    r"\.\.\.|…"                       # bare ... or …
+    r"|#\s*\.\.\.|#\s*…"              # Python "# ..." / "# …"
+    r"|//\s*\.\.\.|//\s*…"            # C/JS "// ..." / "// …"
+    r"|/\*\s*(?:\.\.\.|…)\s*\*/"      # /* ... */
+    r"|<\s*(?:\.\.\.|…)\s*>"          # <...>
+    r"|\b(?:omitted|elided|redacted|truncated)\b\s*"
+    r")\s*$",
+    re.IGNORECASE,
+)
 
 
 def _detect_literal_truncation(text: str) -> str | None:
-    """Return the fingerprint if `text` contains an obvious truncation marker."""
-    for rx in _TRUNC_MARKERS:
-        m = rx.search(text)
-        if m:
-            return m.group(0)
+    """Return the fingerprint if `text` ENDS with an obvious truncation marker.
+
+    Only trailing markers count — a `…` mid-string (e.g. in a UI label or
+    docstring example) is legitimate and must not false-positive.
+    """
+    if not text:
+        return None
+    # Strip trailing whitespace/newlines before checking so markers at the
+    # very end of a multi-line block still count.
+    stripped = text.rstrip()
+    m = _TRAILING_TRUNC_RE.search(stripped)
+    if m:
+        return m.group(0).strip()
     return None
 
 

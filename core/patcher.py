@@ -77,10 +77,33 @@ def extract_decl_names(text: str) -> list[str]:
 # ── Fuzzy match helpers ──────────────────────────────────────────────
 _TRAILING_WS_RE = re.compile(r"[ \t]+(\n|$)")
 
+# LLM over-escape: it sometimes emits `\"` (literal backslash + quote) or
+# `\n`/`\t`/`\r` (literal backslash + letter) inside a JSON string, so
+# after json.load the search text contains a spurious backslash that
+# never appears in the real source file. We unescape those conservatively.
+_OVER_ESCAPE_RE = re.compile(r'\\(["ntr\\/\'])')
+_UNESCAPE_MAP = {
+    '"': '"', "'": "'", "/": "/",
+    "n": "\n", "t": "\t", "r": "\r", "\\": "\\",
+}
+
 
 def _normalize_trailing_ws(s: str) -> str:
     """Strip trailing whitespace on each line — tolerant of editor drift."""
     return _TRAILING_WS_RE.sub(r"\1", s)
+
+
+def _try_unescape_over(s: str) -> str:
+    """
+    Best-effort reversal of LLM over-escaping. Only touches the specific
+    sequences `\\"`, `\\n`, `\\t`, `\\r`, `\\\\`, `\\/`, `\\'` — so it
+    can't accidentally mangle legitimate backslashes in code. A Python
+    raw string literal like ``r"\\w+"`` doesn't match our map (w is not
+    in the set) and is therefore untouched; the sequences that DO match
+    (n, t, r) are ones LLMs normally emit as real whitespace characters
+    in search/replace anyway, so collapsing a stray over-escape is safe.
+    """
+    return _OVER_ESCAPE_RE.sub(lambda m: _UNESCAPE_MAP[m.group(1)], s)
 
 
 def _count_matches(haystack: str, needle: str) -> int:
@@ -93,18 +116,35 @@ def _count_matches(haystack: str, needle: str) -> int:
 def _find_with_fuzz(haystack: str, needle: str) -> tuple[int, str, str]:
     """
     Find `needle` in `haystack`. Returns (match_count, effective_haystack,
-    effective_needle). If exact match exists use it, otherwise try the
-    whitespace-normalized version. Only whitespace-fuzzy matching is done
-    — indentation and content must still be byte-exact to avoid silently
+    effective_needle). Tries in order:
+      1. exact match
+      2. whitespace-fuzzy (trailing whitespace per line)
+      3. over-escape unescape (collapse LLM `\"`/`\n`/`\t`/`\r` typos)
+      4. whitespace-fuzzy over the unescaped version
+    Indentation and content must still be byte-exact to avoid silently
     patching the wrong location.
     """
     if needle in haystack:
         return _count_matches(haystack, needle), haystack, needle
-    # Fallback: normalize trailing whitespace on both sides.
-    h = _normalize_trailing_ws(haystack)
-    n = _normalize_trailing_ws(needle)
-    if n in h:
-        return _count_matches(h, n), h, n
+
+    # 2. Trailing-ws normalization
+    h_ws = _normalize_trailing_ws(haystack)
+    n_ws = _normalize_trailing_ws(needle)
+    if n_ws in h_ws:
+        return _count_matches(h_ws, n_ws), h_ws, n_ws
+
+    # 3. Over-escape fallback (only when the needle actually has backslash
+    # sequences we know how to strip — otherwise skip, nothing to gain).
+    if "\\" in needle:
+        n_un = _try_unescape_over(needle)
+        if n_un != needle:
+            if n_un in haystack:
+                return _count_matches(haystack, n_un), haystack, n_un
+            # 4. Combined: over-escape + trailing-ws
+            n_un_ws = _normalize_trailing_ws(n_un)
+            if n_un_ws in h_ws:
+                return _count_matches(h_ws, n_un_ws), h_ws, n_un_ws
+
     return 0, haystack, needle
 
 
