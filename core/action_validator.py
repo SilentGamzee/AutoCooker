@@ -1,0 +1,279 @@
+"""
+Mechanical pre-check for action files (Step 3).
+
+Replaces the deterministic subset of the LLM action-critic. LLM is left
+to judge only coverage/ordering. Truncation, schema, and match-not-found
+checks are handled here — precisely and without model calls.
+
+Rules (mirror of p_action_critic.md):
+  #1 files_to_modify ∪ files_to_create must be non-empty
+  #2 each step must have a valid shape (blocks / create / legacy)
+  #3 search blocks must not contain literal truncation markers
+     AND every non-empty search must match uniquely in the target file
+  #4 additive patches must preserve their anchor declarations
+  #5 replace must not end with JSON-structure garbage
+  #6 files_to_modify paths must exist in the project file list
+  #7 implementation_steps must be non-empty
+
+All violations are returned as:
+    {severity: "critical", file: "<action_file.json>",
+     description: "Step N block M: <what> — <how to fix>"}
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+from typing import Any
+
+from core.patcher import (
+    extract_decl_names,
+    legacy_step_to_blocks,
+    validate_block_shape,
+    validate_block_quality,
+    _find_with_fuzz,
+)
+
+# Literal truncation-marker patterns that unambiguously mean "LLM elided code"
+_TRUNC_MARKERS = [
+    re.compile(r"\.\.\.\s*\n\s*\.\.\."),          # "...\n..."
+    re.compile(r"…"),                             # unicode ellipsis
+    re.compile(r"#\s*\.\.\."),                    # Python "# ..."
+    re.compile(r"//\s*\.\.\."),                   # C/JS "// ..."
+    re.compile(r"/\*\s*\.\.\.\s*\*/"),            # /* ... */
+    re.compile(r"<\s*\.\.\.\s*>"),                # <...>
+    re.compile(r"\b(?:omitted|elided|redacted|truncated)\b", re.IGNORECASE),
+]
+
+
+def _detect_literal_truncation(text: str) -> str | None:
+    """Return the fingerprint if `text` contains an obvious truncation marker."""
+    for rx in _TRUNC_MARKERS:
+        m = rx.search(text)
+        if m:
+            return m.group(0)
+    return None
+
+
+def _read_target(project_root: str, rel_path: str) -> str | None:
+    full = os.path.join(project_root, rel_path)
+    if not os.path.isfile(full):
+        return None
+    try:
+        with open(full, "r", encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+    except Exception:
+        return None
+
+
+def _issue(fname: str, msg: str) -> dict:
+    return {"severity": "critical", "file": fname, "description": msg}
+
+
+def _resolve_target_file(
+    step: dict, file_rel: str, files_to_modify: list[str], files_to_create: list[str]
+) -> str:
+    """If step didn't declare `file`, fall back to the single declared target."""
+    if file_rel:
+        return file_rel
+    # Single unambiguous candidate?
+    all_files = [*files_to_modify, *files_to_create]
+    if len(all_files) == 1:
+        return all_files[0]
+    return ""
+
+
+def validate_action_file(
+    fname: str,
+    data: Any,
+    project_root: str,
+    project_files: set[str],
+) -> list[dict]:
+    """Validate ONE action-file dict. Return list of issue dicts."""
+    issues: list[dict] = []
+
+    if not isinstance(data, dict):
+        return [_issue(fname, "action file root must be a JSON object")]
+
+    files_to_modify = data.get("files_to_modify") or []
+    files_to_create = data.get("files_to_create") or []
+    steps = data.get("implementation_steps") or []
+
+    # Rule #1 — at least one file target
+    if not files_to_modify and not files_to_create:
+        issues.append(_issue(
+            fname,
+            "files_to_modify and files_to_create are both empty — "
+            "declare the project file(s) this action touches."
+        ))
+
+    # Rule #7 — non-empty implementation_steps
+    if not isinstance(steps, list) or len(steps) == 0:
+        issues.append(_issue(
+            fname,
+            "implementation_steps is empty — add at least one step "
+            "describing the change."
+        ))
+        return issues  # nothing else to check without steps
+
+    # Rule #6 — every files_to_modify path must exist in the project
+    for fp in files_to_modify:
+        if not isinstance(fp, str) or not fp.strip():
+            issues.append(_issue(fname, f"files_to_modify contains invalid entry: {fp!r}"))
+            continue
+        norm = fp.replace("\\", "/").lstrip("./")
+        if norm not in project_files:
+            issues.append(_issue(
+                fname,
+                f"files_to_modify path {fp!r} is not in the project file list. "
+                f"If it's a new file, move it to files_to_create. "
+                f"Otherwise use an existing path (check spelling/case)."
+            ))
+
+    # Per-step / per-block checks
+    for i, step in enumerate(steps, start=1):
+        if not isinstance(step, dict):
+            issues.append(_issue(fname, f"Step {i}: not a JSON object"))
+            continue
+
+        blocks, step_file, _action = legacy_step_to_blocks(step)
+        target_file = _resolve_target_file(step, step_file, files_to_modify, files_to_create)
+
+        # Rule #2 — usable shape
+        if not blocks:
+            issues.append(_issue(
+                fname,
+                f"Step {i}: no usable block. A step must be one of: "
+                f"{{file, blocks:[{{search,replace}}]}}, "
+                f"{{file, create:'<content>'}}, or legacy {{find, code:{{file,content}}}}."
+            ))
+            continue
+
+        is_new_file = target_file and target_file in files_to_create
+        target_content: str | None = None
+        if not is_new_file and target_file:
+            target_content = _read_target(project_root, target_file)
+
+        for j, blk in enumerate(blocks, start=1):
+            # Shape
+            ok, err = validate_block_shape(blk)
+            if not ok:
+                issues.append(_issue(
+                    fname,
+                    f"Step {i} block {j}: invalid block shape — {err}. "
+                    f"Use {{\"search\": \"...\", \"replace\": \"...\"}}."
+                ))
+                continue
+
+            search = blk["search"]
+            replace = blk["replace"]
+
+            # Rule #3a — literal truncation markers
+            marker = _detect_literal_truncation(search)
+            if marker:
+                issues.append(_issue(
+                    fname,
+                    f"Step {i} block {j}: search contains literal truncation "
+                    f"marker {marker!r}. Copy the real code from the file "
+                    f"verbatim — no ellipses, no placeholders."
+                ))
+                continue
+            marker = _detect_literal_truncation(replace)
+            if marker:
+                issues.append(_issue(
+                    fname,
+                    f"Step {i} block {j}: replace contains literal truncation "
+                    f"marker {marker!r}. Emit the full replacement code — "
+                    f"the runtime does not expand '...'."
+                ))
+                continue
+
+            # Rule #4 + #5 via patcher (anchor-preservation + JSON-leak tail + no-op)
+            ok, err = validate_block_quality(blk)
+            if not ok:
+                issues.append(_issue(
+                    fname,
+                    f"Step {i} block {j}: {err}"
+                ))
+                continue
+
+            # Rule #3b — non-empty search must match uniquely in the target file.
+            # Skip if:
+            #  - append mode (empty search)
+            #  - new-file creation
+            #  - target file missing (caught by rule #6 above)
+            if search == "":
+                continue
+            if is_new_file:
+                continue
+            if not target_file:
+                issues.append(_issue(
+                    fname,
+                    f"Step {i} block {j}: step has no 'file' field and "
+                    f"files_to_modify has multiple candidates — specify "
+                    f"which file this block targets."
+                ))
+                continue
+            if target_content is None:
+                # Already reported as files_to_modify path issue (rule #6)
+                continue
+
+            count, _eff_h, _eff_n = _find_with_fuzz(target_content, search)
+            if count == 0:
+                head = search.splitlines()[0][:80] if search.splitlines() else search[:80]
+                issues.append(_issue(
+                    fname,
+                    f"Step {i} block {j}: search not found in {target_file}. "
+                    f"First line: {head!r}. Copy the search verbatim from "
+                    f"the current file content."
+                ))
+            elif count > 1:
+                head = search.splitlines()[0][:80] if search.splitlines() else search[:80]
+                issues.append(_issue(
+                    fname,
+                    f"Step {i} block {j}: search matches {count} times in "
+                    f"{target_file}. First line: {head!r}. Add more "
+                    f"surrounding context so the match is unique."
+                ))
+
+    return issues
+
+
+def validate_actions_dir(
+    actions_dir: str,
+    project_root: str,
+    project_files: list[str] | set[str],
+) -> list[dict]:
+    """
+    Validate every T*.json in `actions_dir`. Returns a flat list of issue
+    dicts. Empty list == all files pass the mechanical checks.
+    """
+    if not os.path.isdir(actions_dir):
+        return []
+
+    proj_set: set[str] = set()
+    for p in project_files:
+        proj_set.add(p.replace("\\", "/").lstrip("./"))
+
+    issues: list[dict] = []
+    for fname in sorted(os.listdir(actions_dir)):
+        if not fname.endswith(".json"):
+            continue
+        path = os.path.join(actions_dir, fname)
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except json.JSONDecodeError as e:
+            issues.append(_issue(
+                fname,
+                f"action file is not valid JSON: {e}. "
+                f"Re-emit the file with properly escaped strings."
+            ))
+            continue
+        except Exception as e:
+            issues.append(_issue(fname, f"could not read action file: {e}"))
+            continue
+
+        issues.extend(validate_action_file(fname, data, project_root, proj_set))
+
+    return issues

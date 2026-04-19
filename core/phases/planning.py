@@ -1606,11 +1606,38 @@ class PlanningPhase(BasePhase):
 
     # ── New Step 3: Critique Action Files ─────────────────────────
     def _new_step3_critique(self, model: str) -> tuple[bool, list[dict]]:
-        """LLM reviews all action files and submits a PASS/FAIL verdict."""
+        """
+        Two-pass critique:
+          1. Mechanical validator (core.action_validator) — catches
+             schema / truncation / search-not-unique / anchor-destruction /
+             invalid-path issues deterministically.
+          2. LLM — judges only coverage and ordering (the subjective parts).
+
+        If the mechanical pass finds anything, we short-circuit and return
+        FAIL without calling the LLM — saves a round-trip and avoids the
+        LLM's false-positive truncation flags.
+        """
         wd = self.task.project_path or self.state.working_dir
         actions_dir = os.path.join(self.task.task_dir, "actions")
         spec_path = os.path.join(self.task.task_dir, "spec.json")
 
+        # ── Pass 1: mechanical validation ─────────────────────────
+        from core.action_validator import validate_actions_dir
+        mech_issues = validate_actions_dir(
+            actions_dir, wd, self.state.cache.file_paths
+        )
+        if mech_issues:
+            self.log(
+                f"  ✗ Critique FAILED ({len(mech_issues)} mechanical issue(s))",
+                "warn",
+            )
+            for i, issue in enumerate(mech_issues[:5], 1):
+                desc = issue.get("description", "")[:120]
+                fname = issue.get("file", "(unknown)")
+                self.log(f"    {i}. [{fname}] {desc}", "warn")
+            return False, mech_issues
+
+        # ── Pass 2: LLM judges coverage + ordering ────────────────
         spec_content = self._read_file_safe(spec_path)
 
         actions_content = ""
