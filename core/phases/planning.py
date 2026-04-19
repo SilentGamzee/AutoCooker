@@ -2114,15 +2114,29 @@ class PlanningPhase(BasePhase):
         self.run_loop(
             "3b Dep Closure", "p5b_dependency_closure.md",
             PLANNING_TOOLS, executor, msg, validate, model,
-            max_outer_iterations=2,
+            max_outer_iterations=4,
             max_tool_rounds=12,
-            reconstruct_after=None,
+            reconstruct_after=2,
         )
 
         # Final read: validate again to return feedback regardless of run_loop outcome
         ok, reason = validate()
         if ok:
             self.log("  ✓ Dependency closure PASSED — plan complete", "ok")
+            return True, ""
+
+        # Infra failure — the model never wrote the artifact (empty stream,
+        # thought-only response, or provider timeout). This is NOT a real
+        # missing_deps signal; re-running Step 2 based on it would rewrite a
+        # plan that already passed Step 3 Critique. Skip 3b and accept the
+        # plan as-is.
+        reason_str = reason or ""
+        if reason_str.startswith("INFRA:") or "artifact missing" in reason_str:
+            self.log(
+                "  ⚠ Dependency closure skipped due to provider/infra failure "
+                "— plan accepted (Step 3 Critique already passed)",
+                "warn",
+            )
             return True, ""
 
         # FAIL path — build feedback for next Step 2 iteration
