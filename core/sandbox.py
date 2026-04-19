@@ -38,6 +38,8 @@ PLANNING_ALLOWED_FILES = {
     'scored_files.json',
     # dependency-closure critic output (p5b)
     'dependency_report.json',
+    'subtasks_outline.json',
+    'completeness_report.json',
 }
 
 class Sandbox:
