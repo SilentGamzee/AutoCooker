@@ -179,6 +179,193 @@ class OllamaClient:
 
     # ── Gemini native API (bypasses OpenAI compat layer entirely) ──────────────
 
+    def _gemini_native_stream(
+        self,
+        json_payload: dict,
+        connect_timeout: float = 10.0,
+        first_byte_timeout: float = 60.0,
+        idle_timeout: float = 60.0,
+        hard_timeout: float = 1800.0,
+        log_fn: Optional[Callable] = None,
+        is_aborted: Optional[Callable[[], bool]] = None,
+    ) -> "OllamaClient._UrllibResponse":
+        """
+        Stream Gemini's native :streamGenerateContent?alt=sse endpoint with
+        the same liveness-based timeouts as _stream_chat.
+
+        Gemini SSE events carry `candidates[0].content.parts[]`, where each
+        part is either {"text": "..."} (incremental text) or a complete
+        {"functionCall": {"name", "args"}} (function calls are not split
+        across events in Gemini's stream).
+
+        Parses events as they arrive, translates them to OpenAI response
+        shape so callers consume the same format as the non-streaming and
+        OpenAI-compat paths.
+        """
+        import time as _t
+        import uuid as _uuid
+        from urllib.parse import urlparse as _up
+
+        model = json_payload.get("model", "gemini-2.0-flash")
+        messages = json_payload.get("messages", [])
+        tools = json_payload.get("tools", [])
+        gemini_req = self._openai_to_gemini(messages, tools)
+
+        parsed = _up(self.base_url)
+        host = parsed.netloc
+        url = f"https://{host}/v1beta/models/{model}:streamGenerateContent?alt=sse"
+
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+            "X-goog-api-key": self.api_key,
+            "User-Agent": "python-httpclient/3",
+        }
+
+        sess = self._sess()
+        req = requests.Request("POST", url, json=gemini_req, headers=headers)
+        prepped = sess.prepare_request(req)
+        # Strip any Authorization header an ADC-patched session might inject.
+        prepped.headers.pop("Authorization", None)
+
+        resp = sess.send(
+            prepped,
+            timeout=(connect_timeout, idle_timeout),
+            stream=True,
+        )
+
+        if not resp.ok:
+            try:
+                body = resp.content
+            finally:
+                resp.close()
+            return self._UrllibResponse(resp.status_code, body, dict(resp.headers))
+
+        text_parts: list[str] = []
+        tool_calls: list[dict] = []
+        finish_reason = "stop"
+        model_name = model
+
+        _start = _t.monotonic()
+        _first_byte_at: Optional[float] = None
+        _total_bytes = 0
+        buffer = b""
+
+        fr_map = {"STOP": "stop", "MAX_TOKENS": "length", "SAFETY": "stop"}
+
+        try:
+            for chunk in resp.iter_content(chunk_size=1024):
+                if is_aborted and is_aborted():
+                    resp.close()
+                    raise RuntimeError("__ABORTED__")
+                now = _t.monotonic()
+                if now - _start > hard_timeout:
+                    resp.close()
+                    raise requests.exceptions.ReadTimeout(
+                        f"Gemini stream exceeded hard ceiling of {hard_timeout:.0f}s"
+                    )
+                if not chunk:
+                    continue
+                if _first_byte_at is None:
+                    _first_byte_at = now
+                    if log_fn:
+                        log_fn(
+                            f"[Gemini] streaming — first bytes after {now - _start:.1f}s",
+                            "info",
+                        )
+                _total_bytes += len(chunk)
+                buffer += chunk
+                while b"\n\n" in buffer:
+                    event, buffer = buffer.split(b"\n\n", 1)
+                    for line in event.split(b"\n"):
+                        line = line.strip()
+                        if not line or not line.startswith(b"data:"):
+                            continue
+                        data_str = line[5:].strip().decode("utf-8", errors="replace")
+                        if not data_str:
+                            continue
+                        try:
+                            evt = json.loads(data_str)
+                        except json.JSONDecodeError:
+                            continue
+                        if evt.get("modelVersion"):
+                            model_name = evt["modelVersion"]
+                        cands = evt.get("candidates") or []
+                        if not cands:
+                            continue
+                        cand = cands[0]
+                        parts = (cand.get("content") or {}).get("parts", []) or []
+                        for p in parts:
+                            if p.get("text"):
+                                text_parts.append(p["text"])
+                            if "functionCall" in p:
+                                fc = p["functionCall"]
+                                tool_calls.append({
+                                    "id": f"call_{_uuid.uuid4().hex[:8]}",
+                                    "type": "function",
+                                    "function": {
+                                        "name": fc.get("name", ""),
+                                        "arguments": json.dumps(
+                                            fc.get("args", {}), ensure_ascii=False
+                                        ),
+                                    },
+                                })
+                        fr_raw = cand.get("finishReason")
+                        if fr_raw:
+                            finish_reason = fr_map.get(fr_raw.upper(), "stop")
+        except requests.exceptions.ReadTimeout as e:
+            try:
+                resp.close()
+            except Exception:
+                pass
+            if _first_byte_at is None:
+                raise requests.exceptions.ReadTimeout(
+                    f"No bytes received within first {idle_timeout:.0f}s of Gemini stream"
+                ) from e
+            raise requests.exceptions.ReadTimeout(
+                f"Gemini stream idle for {idle_timeout:.0f}s "
+                f"(received {_total_bytes} bytes before stall)"
+            ) from e
+        except requests.exceptions.ChunkedEncodingError as e:
+            try:
+                resp.close()
+            except Exception:
+                pass
+            if _first_byte_at is None:
+                raise
+            if log_fn:
+                log_fn(f"[Gemini] stream ended abruptly: {e}", "warn")
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+
+        if tool_calls:
+            finish_reason = "tool_calls"
+        message: dict = {"role": "assistant", "content": "".join(text_parts)}
+        if tool_calls:
+            message["tool_calls"] = tool_calls
+        synth = {
+            "choices": [
+                {"message": message, "finish_reason": finish_reason, "index": 0}
+            ],
+            "model": model_name,
+        }
+        if log_fn:
+            elapsed = _t.monotonic() - _start
+            log_fn(
+                f"[Gemini] stream complete — {_total_bytes}B in {elapsed:.1f}s, "
+                f"content={len(message['content'])} chars, "
+                f"tool_calls={len(tool_calls)}",
+                "info",
+            )
+        return self._UrllibResponse(
+            200,
+            json.dumps(synth, ensure_ascii=False).encode("utf-8"),
+            {},
+        )
+
     def _gemini_native_post(self, json_payload: dict, timeout) -> "_UrllibResponse":
         """
         Call Gemini's native generateContent API with ?key= auth.
@@ -635,12 +822,24 @@ class OllamaClient:
 
         def _do_post():
             try:
+                connect_t = timeout[0] if isinstance(timeout, tuple) else 10.0
                 if self.auth_style == "gemini_native":
-                    # Use Gemini's native generateContent API (bypasses /v1beta/openai/
-                    # compat layer which conflicts with system Google OAuth credentials)
-                    result = self._gemini_native_post(json_payload, timeout)
+                    if stream_liveness:
+                        print(f"[THREAD] POST (gemini-stream) {url[:80]}", flush=True)
+                        result = self._gemini_native_stream(
+                            json_payload,
+                            connect_timeout=connect_t,
+                            first_byte_timeout=first_byte_timeout,
+                            idle_timeout=idle_timeout,
+                            hard_timeout=hard_timeout,
+                            log_fn=log_fn,
+                            is_aborted=is_aborted,
+                        )
+                    else:
+                        # Use Gemini's native generateContent API (bypasses /v1beta/openai/
+                        # compat layer which conflicts with system Google OAuth credentials)
+                        result = self._gemini_native_post(json_payload, timeout)
                 elif stream_liveness:
-                    connect_t = timeout[0] if isinstance(timeout, tuple) else 10.0
                     print(f"[THREAD] POST (stream) {url[:80]}", flush=True)
                     result = self._stream_chat(
                         url,
@@ -1110,9 +1309,9 @@ class OllamaClient:
                 _ctx_chars = sum(len(str(m.get("content") or "")) for m in final_messages)
                 log_fn(f"[Ollama] Sending request (round {_round + 1}, context ~{_ctx_chars:,} chars)…")
 
-            # Streaming liveness timeouts. We use stream=True when the provider
-            # supports OpenAI SSE (everything except gemini_native which has its
-            # own path). Rules:
+            # Streaming liveness timeouts. Every provider now streams:
+            # OpenAI-compat paths use SSE from /v1/chat/completions, and
+            # gemini_native uses :streamGenerateContent?alt=sse. Rules:
             #   - First byte must arrive within FIRST_BYTE_TIMEOUT seconds.
             #   - Every subsequent byte must arrive within IDLE_TIMEOUT seconds
             #     of the previous one (so a silent minute aborts).
@@ -1120,7 +1319,7 @@ class OllamaClient:
             # Replaces the old adaptive read_timeout — streaming makes the
             # "time-to-first-byte" variable irrelevant because any keep-alive
             # chunk resets the idle clock.
-            _stream_liveness = self.auth_style != "gemini_native"
+            _stream_liveness = True
             _FIRST_BYTE_TIMEOUT = 60.0
             _IDLE_TIMEOUT = 60.0
             _HARD_TIMEOUT = 1800.0
