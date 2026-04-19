@@ -226,12 +226,25 @@ def validate_block_quality(block: dict) -> tuple[bool, str]:
         '],\n  "',
         ')"\n      }',
     )
-    if any(s in tail for s in leak_sigs) or tail.endswith(('"}', '],')):
+    # Structural fingerprints are strong signals regardless of balance.
+    if any(s in tail for s in leak_sigs):
         return False, (
             f"replace ends with JSON-structure garbage {tail[-30:]!r} — "
             "the outer action-file JSON leaked into replace because of "
             "mis-escaped quotes. Fix the escaping and re-emit the block."
         )
+    # Bare `"}` / `],` endings are only suspicious when the block has
+    # more closers than openers — otherwise it's legitimate code like
+    # `return {"ok": False, "error": "…"}`.
+    if tail.endswith(('"}', '],')):
+        opens = replace.count('{') + replace.count('[')
+        closes = replace.count('}') + replace.count(']')
+        if closes > opens:
+            return False, (
+                f"replace ends with JSON-structure garbage {tail[-30:]!r} — "
+                "the outer action-file JSON leaked into replace because of "
+                "mis-escaped quotes. Fix the escaping and re-emit the block."
+            )
 
     return True, "OK"
 
