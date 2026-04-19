@@ -239,6 +239,11 @@ class OllamaClient:
                 body = resp.content
             finally:
                 resp.close()
+            print(
+                f"[gemini_stream] HTTP {resp.status_code} error body: "
+                f"{body[:2000].decode('utf-8', errors='replace')}",
+                flush=True,
+            )
             return self._UrllibResponse(resp.status_code, body, dict(resp.headers))
 
         text_parts: list[str] = []
@@ -250,8 +255,13 @@ class OllamaClient:
         _first_byte_at: Optional[float] = None
         _total_bytes = 0
         buffer = b""
+        # Raw capture for debug: keep every SSE event we received so we
+        # can dump the full server response when something goes wrong.
+        raw_events: list[str] = []
+        raw_chunks: list[bytes] = []
 
         fr_map = {"STOP": "stop", "MAX_TOKENS": "length", "SAFETY": "stop"}
+        print(f"[gemini_stream] POST {url[:100]} — waiting for SSE…", flush=True)
 
         try:
             for chunk in resp.iter_content(chunk_size=1024):
@@ -274,6 +284,7 @@ class OllamaClient:
                             "info",
                         )
                 _total_bytes += len(chunk)
+                raw_chunks.append(chunk)
                 buffer += chunk
                 while b"\n\n" in buffer:
                     event, buffer = buffer.split(b"\n\n", 1)
@@ -284,22 +295,49 @@ class OllamaClient:
                         data_str = line[5:].strip().decode("utf-8", errors="replace")
                         if not data_str:
                             continue
+                        raw_events.append(data_str)
+                        print(
+                            f"[gemini_stream] event #{len(raw_events)}: {data_str}",
+                            flush=True,
+                        )
                         try:
                             evt = json.loads(data_str)
-                        except json.JSONDecodeError:
+                        except json.JSONDecodeError as _je:
+                            print(
+                                f"[gemini_stream] JSON decode error: {_je} — "
+                                f"raw: {data_str[:500]!r}",
+                                flush=True,
+                            )
                             continue
                         if evt.get("modelVersion"):
                             model_name = evt["modelVersion"]
                         cands = evt.get("candidates") or []
                         if not cands:
+                            print(
+                                f"[gemini_stream] event has no candidates; "
+                                f"keys={list(evt.keys())}",
+                                flush=True,
+                            )
                             continue
                         cand = cands[0]
                         parts = (cand.get("content") or {}).get("parts", []) or []
+                        if not parts:
+                            print(
+                                f"[gemini_stream] candidate has no parts; "
+                                f"cand_keys={list(cand.keys())} "
+                                f"content_keys={list((cand.get('content') or {}).keys())}",
+                                flush=True,
+                            )
                         for p in parts:
                             if p.get("text"):
                                 text_parts.append(p["text"])
                             if "functionCall" in p:
                                 fc = p["functionCall"]
+                                print(
+                                    f"[gemini_stream] functionCall: name={fc.get('name')!r} "
+                                    f"args={json.dumps(fc.get('args', {}), ensure_ascii=False)[:400]}",
+                                    flush=True,
+                                )
                                 tool_calls.append({
                                     "id": f"call_{_uuid.uuid4().hex[:8]}",
                                     "type": "function",
@@ -352,8 +390,40 @@ class OllamaClient:
             ],
             "model": model_name,
         }
+
+        # DEBUG: full dump of what we're handing back to chat_with_tools.
+        # When Gemini returns "incorrect data" this is the single most useful
+        # thing to see — the synthesized OpenAI-shape response AND the raw
+        # bytes we collected off the wire, so we can tell which side broke.
+        elapsed = _t.monotonic() - _start
+        print(
+            f"[gemini_stream] DONE {_total_bytes}B in {elapsed:.1f}s, "
+            f"{len(raw_events)} events, {len(text_parts)} text parts, "
+            f"{len(tool_calls)} tool_calls, finish_reason={finish_reason!r}",
+            flush=True,
+        )
+        try:
+            print(
+                "[gemini_stream] synthesized response: "
+                + json.dumps(synth, ensure_ascii=False)[:4000],
+                flush=True,
+            )
+        except Exception as _de:
+            print(f"[gemini_stream] could not json-dump synth: {_de}", flush=True)
+        if not text_parts and not tool_calls:
+            # Most likely "incorrect data" case — dump the raw stream so we
+            # can see what Gemini actually sent.
+            try:
+                raw_all = b"".join(raw_chunks).decode("utf-8", errors="replace")
+            except Exception:
+                raw_all = repr(b"".join(raw_chunks))
+            print(
+                "[gemini_stream] EMPTY RESULT — raw stream body follows:\n"
+                + raw_all[:8000],
+                flush=True,
+            )
+
         if log_fn:
-            elapsed = _t.monotonic() - _start
             log_fn(
                 f"[Gemini] stream complete — {_total_bytes}B in {elapsed:.1f}s, "
                 f"content={len(message['content'])} chars, "
