@@ -295,6 +295,11 @@ class OllamaClient:
                     "warn",
                 )
             for p in parts:
+                # Skip Gemini's internal "thought" parts — they're the
+                # model's private chain-of-thought and shouldn't surface
+                # to the caller. Real text/tool parts never have this flag.
+                if p.get("thought"):
+                    continue
                 if p.get("text"):
                     text_parts.append(p["text"])
                 if "functionCall" in p:
@@ -341,7 +346,10 @@ class OllamaClient:
                         )
                 _total_bytes += len(chunk)
                 raw_chunks.append(chunk)
-                buffer += chunk
+                # Gemini's SSE stream uses CRLF line terminators (data: ...\r\n\r\n).
+                # Normalise to LF so a single split pattern (\n\n) handles both
+                # LF and CRLF servers consistently.
+                buffer += chunk.replace(b"\r\n", b"\n")
                 while b"\n\n" in buffer:
                     event, buffer = buffer.split(b"\n\n", 1)
                     for line in event.split(b"\n"):
@@ -801,7 +809,9 @@ class OllamaClient:
                             "info",
                         )
                 _total_bytes += len(chunk)
-                buffer += chunk
+                # Normalise CRLF → LF so \n\n splitting handles both LF and
+                # CRLF servers (SSE spec allows both; Google uses CRLF).
+                buffer += chunk.replace(b"\r\n", b"\n")
                 # SSE events are separated by \n\n. Parse complete events; keep
                 # trailing partial event in buffer for the next chunk.
                 while b"\n\n" in buffer:
