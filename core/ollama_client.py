@@ -213,7 +213,7 @@ class OllamaClient:
 
         parsed = _up(self.base_url)
         host = parsed.netloc
-        url = f"https://{host}/v1beta/models/{model}:streamGenerateContent?alt=sse"
+        url = f"https://{host}/v1beta/models/{model}:streamGenerateContent"
 
         headers = {
             "Content-Type": "application/json",
@@ -223,7 +223,11 @@ class OllamaClient:
         }
 
         sess = self._sess()
-        req = requests.Request("POST", url, json=gemini_req, headers=headers)
+        # Pass alt=sse via params= so it's URL-encoded correctly and survives
+        # session-level proxy rewrites; embedding ?alt=sse in the URL string
+        # has been observed to get stripped in some setups.
+        req = requests.Request("POST", url, json=gemini_req, headers=headers,
+                               params={"alt": "sse"})
         prepped = sess.prepare_request(req)
         # Strip any Authorization header an ADC-patched session might inject.
         prepped.headers.pop("Authorization", None)
@@ -261,7 +265,59 @@ class OllamaClient:
         raw_chunks: list[bytes] = []
 
         fr_map = {"STOP": "stop", "MAX_TOKENS": "length", "SAFETY": "stop"}
-        print(f"[gemini_stream] POST {url[:100]} — waiting for SSE…", flush=True)
+
+        def _dbg(msg: str, level: str = "info") -> None:
+            """Log to both stdout and autocooker.log (when log_fn is set)."""
+            print(f"[gemini_stream] {msg}", flush=True)
+            if log_fn:
+                log_fn(f"[gemini_stream] {msg}", level)
+
+        def _consume_event(evt: dict) -> None:
+            """Mutate text_parts / tool_calls / finish_reason / model_name
+            from one GenerateContentResponse envelope. Used by BOTH the SSE
+            loop and the JSON-array fallback."""
+            nonlocal finish_reason, model_name
+            if evt.get("modelVersion"):
+                model_name = evt["modelVersion"]
+            cands = evt.get("candidates") or []
+            if not cands:
+                _dbg(f"event has no candidates; keys={list(evt.keys())}", "warn")
+                # Gemini sometimes wraps errors: {"error": {...}}
+                if "error" in evt:
+                    _dbg(f"server error payload: {evt.get('error')}", "error")
+                return
+            cand = cands[0]
+            parts = (cand.get("content") or {}).get("parts", []) or []
+            if not parts:
+                _dbg(
+                    f"candidate has no parts; cand_keys={list(cand.keys())} "
+                    f"content_keys={list((cand.get('content') or {}).keys())}",
+                    "warn",
+                )
+            for p in parts:
+                if p.get("text"):
+                    text_parts.append(p["text"])
+                if "functionCall" in p:
+                    fc = p["functionCall"]
+                    _dbg(
+                        f"functionCall: name={fc.get('name')!r} "
+                        f"args={json.dumps(fc.get('args', {}), ensure_ascii=False)[:400]}"
+                    )
+                    tool_calls.append({
+                        "id": f"call_{_uuid.uuid4().hex[:8]}",
+                        "type": "function",
+                        "function": {
+                            "name": fc.get("name", ""),
+                            "arguments": json.dumps(
+                                fc.get("args", {}), ensure_ascii=False
+                            ),
+                        },
+                    })
+            fr_raw = cand.get("finishReason")
+            if fr_raw:
+                finish_reason = fr_map.get(fr_raw.upper(), "stop")
+
+        _dbg(f"POST {url[:140]} — streaming (will auto-detect SSE vs JSON-array)")
 
         try:
             for chunk in resp.iter_content(chunk_size=1024):
@@ -296,61 +352,16 @@ class OllamaClient:
                         if not data_str:
                             continue
                         raw_events.append(data_str)
-                        print(
-                            f"[gemini_stream] event #{len(raw_events)}: {data_str}",
-                            flush=True,
-                        )
+                        _dbg(f"SSE event #{len(raw_events)}: {data_str[:600]}")
                         try:
                             evt = json.loads(data_str)
                         except json.JSONDecodeError as _je:
-                            print(
-                                f"[gemini_stream] JSON decode error: {_je} — "
-                                f"raw: {data_str[:500]!r}",
-                                flush=True,
+                            _dbg(
+                                f"JSON decode error: {_je} — raw: {data_str[:500]!r}",
+                                "warn",
                             )
                             continue
-                        if evt.get("modelVersion"):
-                            model_name = evt["modelVersion"]
-                        cands = evt.get("candidates") or []
-                        if not cands:
-                            print(
-                                f"[gemini_stream] event has no candidates; "
-                                f"keys={list(evt.keys())}",
-                                flush=True,
-                            )
-                            continue
-                        cand = cands[0]
-                        parts = (cand.get("content") or {}).get("parts", []) or []
-                        if not parts:
-                            print(
-                                f"[gemini_stream] candidate has no parts; "
-                                f"cand_keys={list(cand.keys())} "
-                                f"content_keys={list((cand.get('content') or {}).keys())}",
-                                flush=True,
-                            )
-                        for p in parts:
-                            if p.get("text"):
-                                text_parts.append(p["text"])
-                            if "functionCall" in p:
-                                fc = p["functionCall"]
-                                print(
-                                    f"[gemini_stream] functionCall: name={fc.get('name')!r} "
-                                    f"args={json.dumps(fc.get('args', {}), ensure_ascii=False)[:400]}",
-                                    flush=True,
-                                )
-                                tool_calls.append({
-                                    "id": f"call_{_uuid.uuid4().hex[:8]}",
-                                    "type": "function",
-                                    "function": {
-                                        "name": fc.get("name", ""),
-                                        "arguments": json.dumps(
-                                            fc.get("args", {}), ensure_ascii=False
-                                        ),
-                                    },
-                                })
-                        fr_raw = cand.get("finishReason")
-                        if fr_raw:
-                            finish_reason = fr_map.get(fr_raw.upper(), "stop")
+                        _consume_event(evt)
         except requests.exceptions.ReadTimeout as e:
             try:
                 resp.close()
@@ -379,6 +390,61 @@ class OllamaClient:
             except Exception:
                 pass
 
+        # ── Fallback: response wasn't SSE (or ?alt=sse was stripped). Gemini's
+        # default :streamGenerateContent returns a chunked JSON array
+        # [{resp1}, {resp2}, …] — parse the whole body as JSON or NDJSON.
+        if not raw_events and raw_chunks:
+            try:
+                raw_all = b"".join(raw_chunks).decode("utf-8", errors="replace").strip()
+            except Exception as _de:
+                raw_all = ""
+                _dbg(f"could not decode raw body: {_de}", "warn")
+            if raw_all:
+                _dbg(
+                    f"no SSE events found — trying JSON-array fallback on "
+                    f"{len(raw_all)}-char body starting {raw_all[:80]!r}"
+                )
+                parsed_any = False
+                # 1) Single JSON array at top level.
+                try:
+                    data = json.loads(raw_all)
+                    if isinstance(data, list):
+                        for evt in data:
+                            if isinstance(evt, dict):
+                                _consume_event(evt)
+                                parsed_any = True
+                    elif isinstance(data, dict):
+                        _consume_event(data)
+                        parsed_any = True
+                except json.JSONDecodeError:
+                    pass
+                # 2) NDJSON / concatenated JSON objects (one per line).
+                if not parsed_any:
+                    import re as _re
+                    decoder = json.JSONDecoder()
+                    text = raw_all.lstrip("[").rstrip("]").strip()
+                    idx = 0
+                    while idx < len(text):
+                        # Skip separators (commas, whitespace, newlines).
+                        m = _re.match(r"[\s,]+", text[idx:])
+                        if m:
+                            idx += m.end()
+                            continue
+                        try:
+                            evt, end = decoder.raw_decode(text, idx)
+                        except json.JSONDecodeError:
+                            break
+                        if isinstance(evt, dict):
+                            _consume_event(evt)
+                            parsed_any = True
+                        idx = end
+                if not parsed_any:
+                    _dbg(
+                        "fallback parsing failed — body was not SSE, JSON "
+                        "array, or NDJSON. First 1000 chars:\n" + raw_all[:1000],
+                        "error",
+                    )
+
         if tool_calls:
             finish_reason = "tool_calls"
         message: dict = {"role": "assistant", "content": "".join(text_parts)}
@@ -392,35 +458,25 @@ class OllamaClient:
         }
 
         # DEBUG: full dump of what we're handing back to chat_with_tools.
-        # When Gemini returns "incorrect data" this is the single most useful
-        # thing to see — the synthesized OpenAI-shape response AND the raw
-        # bytes we collected off the wire, so we can tell which side broke.
         elapsed = _t.monotonic() - _start
-        print(
-            f"[gemini_stream] DONE {_total_bytes}B in {elapsed:.1f}s, "
-            f"{len(raw_events)} events, {len(text_parts)} text parts, "
-            f"{len(tool_calls)} tool_calls, finish_reason={finish_reason!r}",
-            flush=True,
+        _dbg(
+            f"DONE {_total_bytes}B in {elapsed:.1f}s, "
+            f"{len(raw_events)} SSE events, {len(text_parts)} text parts, "
+            f"{len(tool_calls)} tool_calls, finish_reason={finish_reason!r}"
         )
         try:
-            print(
-                "[gemini_stream] synthesized response: "
-                + json.dumps(synth, ensure_ascii=False)[:4000],
-                flush=True,
-            )
+            _dbg("synthesized: " + json.dumps(synth, ensure_ascii=False)[:4000])
         except Exception as _de:
-            print(f"[gemini_stream] could not json-dump synth: {_de}", flush=True)
+            _dbg(f"could not json-dump synth: {_de}", "warn")
         if not text_parts and not tool_calls:
-            # Most likely "incorrect data" case — dump the raw stream so we
-            # can see what Gemini actually sent.
+            # Fallback-parsing failed too — dump the raw stream.
             try:
                 raw_all = b"".join(raw_chunks).decode("utf-8", errors="replace")
             except Exception:
                 raw_all = repr(b"".join(raw_chunks))
-            print(
-                "[gemini_stream] EMPTY RESULT — raw stream body follows:\n"
-                + raw_all[:8000],
-                flush=True,
+            _dbg(
+                "EMPTY RESULT — raw stream body follows:\n" + raw_all[:8000],
+                "error",
             )
 
         if log_fn:
