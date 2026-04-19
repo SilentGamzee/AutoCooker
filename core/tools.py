@@ -188,19 +188,8 @@ CREATE_TASK = {
                 "id": {"type": "string", "description": "Unique identifier (e.g. T-001)."},
                 "title": {"type": "string"},
                 "description": {"type": "string"},
-                "completion_with_ollama": {
-                    "type": "string",
-                    "description": "Condition checkable only with Ollama (text quality, logic, etc.).",
-                },
-                "completion_without_ollama": {
-                    "type": "string",
-                    "description": "Condition checkable without Ollama (file exists, JSON valid, etc.).",
-                },
             },
-            "required": [
-                "id", "title", "description",
-                "completion_with_ollama", "completion_without_ollama",
-            ],
+            "required": ["id", "title", "description"],
         },
     },
 }

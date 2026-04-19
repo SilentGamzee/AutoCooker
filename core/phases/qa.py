@@ -166,8 +166,7 @@ class QAPhase(BasePhase):
         executor = self._make_executor(workdir)
 
         subtask_detail = "\n".join(
-            f"[{t.get('status','?')}] {t.get('id')}: {t.get('title')}\n"
-            f"  Condition: {t.get('completion_without_ollama','')}"
+            f"[{t.get('status','?')}] {t.get('id')}: {t.get('title')}"
             for t in self.task.subtasks
         )
 

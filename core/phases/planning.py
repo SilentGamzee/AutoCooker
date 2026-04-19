@@ -525,13 +525,6 @@ def _validate_impl_plan(path: str, project_path: str = "") -> tuple[bool, str]:
             sub_errors = []
             if not s.get("id") or not s.get("title") or not s.get("description"):
                 sub_errors.append("missing id/title/description")
-            if not s.get("completion_without_ollama", "").strip():
-                _fallback_files = s.get("files_to_create", []) + s.get("files_to_modify", [])
-                if _fallback_files:
-                    s["completion_without_ollama"] = f"{_fallback_files[0]} exists"
-                    _normalized = True
-                else:
-                    sub_errors.append("completion_without_ollama is empty and no files listed")
             # Reject .tasks/ paths unconditionally — planning artifacts are not project files
             for _flist_key in ("files_to_create", "files_to_modify"):
                 for _fp in s.get(_flist_key, []):
@@ -3406,12 +3399,11 @@ Be concrete and specific. Return ONLY the JSON, no other text.
             "- files_to_create: paths for brand-new files that don't exist yet.\n"
             "- Each subtask must have: id, title, description, "
             "files_to_create or files_to_modify (at least one), "
-            "completion_without_ollama, completion_with_ollama, status='pending'.\n\n"
+            "status='pending'.\n\n"
             "REQUIRED JSON STRUCTURE:\n"
             '{"phases": [{"id": "phase-1", "title": "...", "subtasks": ['
             '{"id": "T-001", "title": "...", "description": "...", '
-            '"files_to_create": ["src/x.py"], "completion_without_ollama": "...", '
-            '"completion_with_ollama": "...", "status": "pending"}]}]}'
+            '"files_to_create": ["src/x.py"], "status": "pending"}]}]}'
         )
 
         def validate():

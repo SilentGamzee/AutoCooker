@@ -149,7 +149,6 @@ Why good: exact find/replace, real variable names from read file, no invented AP
           "files_to_create": [],
           "files_to_modify": ["core/state.py"],
           "patterns_from": ["core/state.py"],
-          "completion_without_ollama": "core/state.py contains 'def restart_to_planning'",
           "implementation_steps": [
             {
               "action": "Add restart_to_planning method to KanbanTask after update_status method",
@@ -174,7 +173,6 @@ Why good: exact find/replace, real variable names from read file, no invented AP
           "files_to_create": [],
           "files_to_modify": ["web/js/app.js"],
           "patterns_from": ["web/js/app.js"],
-          "completion_without_ollama": "web/js/app.js contains 'Start Planning'",
           "user_visible_impact": "User sees 'Start Planning' button instead of 'Continue' on QA-phase tasks",
           "visual_spec": "Button uses existing var(--accent) style, no new CSS needed",
           "implementation_steps": [

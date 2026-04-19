@@ -62,7 +62,6 @@ Subtask
   └── id: str                       # T-001, T-002, ...
   └── files_to_create/modify        # validated against project files
   └── implementation_steps          # list of {action, code, find, replace, ...}
-  └── completion_without_ollama     # grep-style success check used by RuleCritic
 ```
 
 ### Task Storage

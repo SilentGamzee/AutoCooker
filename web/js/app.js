@@ -690,8 +690,6 @@ function renderSubtasks(subtasks) {
         </div>
         <div class="subtask-detail">
           <div class="subtask-desc">${esc(t.description || '')}</div>
-          <div class="subtask-cond"><strong>⚙ Structural:</strong> ${esc(t.completion_without_ollama || '')}</div>
-          <div class="subtask-cond"><strong>🤖 Quality:</strong>    ${esc(t.completion_with_ollama || '')}</div>
         </div>
       </div>
     </div>`;

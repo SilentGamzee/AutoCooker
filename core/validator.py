@@ -82,10 +82,7 @@ def validate_subtasks(path: str, expected_min: int = 1) -> Tuple[bool, str]:
         return False, "subtasks.json must be a JSON array"
     if len(data) < expected_min:
         return False, f"Expected at least {expected_min} tasks, got {len(data)}"
-    required_keys = [
-        "id", "title", "description",
-        "completion_with_ollama", "completion_without_ollama",
-    ]
+    required_keys = ["id", "title", "description"]
     for i, task in enumerate(data):
         missing = [k for k in required_keys if k not in task]
         if missing:

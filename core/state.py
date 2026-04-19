@@ -58,16 +58,12 @@ class Subtask:
     id: str
     title: str
     description: str
-    completion_with_ollama: str
-    completion_without_ollama: str
     status: str = "pending"
     implementation_steps: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
             "id": self.id, "title": self.title, "description": self.description,
-            "completion_with_ollama": self.completion_with_ollama,
-            "completion_without_ollama": self.completion_without_ollama,
             "status": self.status,
             "implementation_steps": self.implementation_steps,
         }

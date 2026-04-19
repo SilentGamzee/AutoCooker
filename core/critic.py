@@ -48,17 +48,12 @@ class RuleCritic:
         files_to_create: list[str] = subtask_dict.get("files_to_create") or []
         files_to_modify: list[str] = subtask_dict.get("files_to_modify") or []
         implementation_steps: list[dict] = subtask_dict.get("implementation_steps") or []
-        completion_cond: str = subtask_dict.get("completion_without_ollama", "").strip()
 
         # Collect all files that this subtask touches
         files_to_check = list(files_to_create) + list(files_to_modify)
 
         # --- 1. Lint ---
         issues.extend(self._check_lint(files_to_check, workdir))
-
-        # --- 2. Completion condition ---
-        if completion_cond:
-            issues.extend(self._check_completion_condition(completion_cond, workdir))
 
         # --- 3. Verify methods ---
         if implementation_steps:
@@ -155,76 +150,6 @@ class RuleCritic:
                         description=msg[:500],
                     )
                 )
-        return issues
-
-    # ──────────────────────────────────────────────────────────────
-    # Check: completion condition (grep-based)
-    # ──────────────────────────────────────────────────────────────
-
-    def _check_completion_condition(
-        self, condition: str, workdir: str
-    ) -> list[CriticIssue]:
-        """
-        Evaluate completion_without_ollama condition (same grammar as in coding.py).
-        Returns CriticIssue if condition is NOT satisfied.
-        """
-        issues: list[CriticIssue] = []
-
-        # --- File exists checks ---
-        for fpath in re.findall(r"[Ff]ile\s+([\w./\-_]+)\s+exists", condition):
-            if not os.path.isfile(os.path.join(workdir, fpath)):
-                issues.append(
-                    CriticIssue(
-                        severity="critical",
-                        category="completion",
-                        file=fpath,
-                        description=f"Completion condition not met: file does not exist: {fpath}",
-                    )
-                )
-
-        # --- File contains checks ---
-        for block in re.finditer(
-            r"[Ff]ile\s+([\w./\-_]+)((?:(?:\s+AND)?\s+contains\s+['\"][^'\"]+['\"])+)",
-            condition,
-        ):
-            fpath = block.group(1)
-            full = os.path.join(workdir, fpath)
-            if not os.path.isfile(full):
-                issues.append(
-                    CriticIssue(
-                        severity="critical",
-                        category="completion",
-                        file=fpath,
-                        description=f"Completion condition not met: file does not exist: {fpath}",
-                    )
-                )
-                continue
-            try:
-                content = open(full, encoding="utf-8", errors="replace").read()
-            except Exception as e:
-                issues.append(
-                    CriticIssue(
-                        severity="critical",
-                        category="completion",
-                        file=fpath,
-                        description=f"Cannot read file for completion check: {e}",
-                    )
-                )
-                continue
-
-            for needle in re.findall(
-                r"contains\s+['\"]([^'\"]+)['\"]", block.group(2)
-            ):
-                if needle not in content:
-                    issues.append(
-                        CriticIssue(
-                            severity="critical",
-                            category="completion",
-                            file=fpath,
-                            description=f"Completion condition not met: '{needle}' not found in {fpath}",
-                        )
-                    )
-
         return issues
 
     # ──────────────────────────────────────────────────────────────

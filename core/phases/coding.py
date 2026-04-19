@@ -480,41 +480,6 @@ class CodingPhase(BasePhase):
         for f in subtask_dict.get("files_to_create") or []:
             if not os.path.isfile(os.path.join(wd, f)):
                 return False, f"Required file missing: {f}"
-        condition = (subtask_dict.get("completion_without_ollama", "") or "").strip()
-        if condition:
-            return self._check_completion_condition(condition, wd)
-        return True, "OK (no structural condition)"
-
-    def _check_completion_condition(
-        self, condition: str, wd: str
-    ) -> tuple[bool, str]:
-        """Parse/check `completion_without_ollama` style assertions:
-          - "File X exists"
-          - "File X exists AND contains 'Y'"
-          - "File X contains 'Y' AND contains 'Z'"
-        """
-        import re
-
-        for fpath in re.findall(r"[Ff]ile\s+([\w./\-_]+)\s+exists", condition):
-            if not os.path.isfile(os.path.join(wd, fpath)):
-                return False, f"File does not exist: {fpath}"
-
-        for block in re.finditer(
-            r"[Ff]ile\s+([\w./\-_]+)((?:(?:\s+AND)?\s+contains\s+['\"][^'\"]+['\"])+)",
-            condition,
-        ):
-            fpath = block.group(1)
-            full = os.path.join(wd, fpath)
-            if not os.path.isfile(full):
-                return False, f"File does not exist: {fpath}"
-            try:
-                content = open(full, encoding="utf-8", errors="replace").read()
-            except Exception as e:
-                return False, f"Cannot read {fpath}: {e}"
-            for needle in re.findall(r"contains\s+['\"]([^'\"]+)['\"]", block.group(2)):
-                if needle not in content:
-                    return False, f"'{needle}' not found in {fpath}"
-
         return True, "OK"
 
     # ── 2.3 README (LLM-driven, runs only on overall success) ──────
