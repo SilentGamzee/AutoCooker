@@ -400,7 +400,205 @@ class OllamaClient:
             return {}
         return {"Authorization": f"Bearer {self.api_key}"}
 
-    def _post(self, url: str, json_payload: dict, timeout) -> requests.Response:
+    def _stream_chat(
+        self,
+        url: str,
+        json_payload: dict,
+        connect_timeout: float = 10.0,
+        first_byte_timeout: float = 60.0,
+        idle_timeout: float = 60.0,
+        hard_timeout: float = 1800.0,
+        log_fn: Optional[Callable] = None,
+        is_aborted: Optional[Callable[[], bool]] = None,
+    ) -> "OllamaClient._UrllibResponse":
+        """
+        POST with stream=True to an OpenAI-compatible /chat/completions endpoint,
+        with liveness-based timeouts instead of one fixed read timeout.
+
+        Rules:
+          - Connect within `connect_timeout`.
+          - If no bytes arrive within `first_byte_timeout` seconds → ReadTimeout.
+          - If any gap between bytes exceeds `idle_timeout` seconds → ReadTimeout.
+          - Hard ceiling: `hard_timeout` seconds total → ReadTimeout.
+
+        The SSE event stream is parsed and reassembled into a non-streaming
+        response shape ({choices:[{message:{role,content,tool_calls?}, finish_reason}]})
+        so the existing `chat_with_tools` code path can consume it unchanged.
+
+        The per-socket read timeout is set to `idle_timeout`, so urllib3
+        itself raises ReadTimeout on a full minute of silence — we don't need
+        a separate watchdog thread. The hard ceiling is checked after each
+        chunk arrives.
+        """
+        import time as _t
+
+        payload = dict(json_payload)
+        payload["stream"] = True
+
+        headers = dict(self._auth_headers())
+        headers.setdefault("Accept", "text/event-stream")
+
+        sess = self._sess()
+        req = requests.Request("POST", url, json=payload, headers=headers)
+        prepped = sess.prepare_request(req)
+        resp = sess.send(
+            prepped,
+            timeout=(connect_timeout, idle_timeout),
+            stream=True,
+        )
+
+        if not resp.ok:
+            # Non-2xx — consume synchronously and return wrapped response so
+            # caller's raise_for_status() behaves identically to non-streaming.
+            try:
+                body = resp.content
+            finally:
+                resp.close()
+            return self._UrllibResponse(resp.status_code, body, dict(resp.headers))
+
+        content_buf: list[str] = []
+        tool_calls_by_index: dict[int, dict] = {}
+        finish_reason: str = ""
+        model_name: str = ""
+        _start = _t.monotonic()
+        _first_byte_at: Optional[float] = None
+        _total_bytes = 0
+        buffer = b""
+
+        try:
+            for chunk in resp.iter_content(chunk_size=1024):
+                if is_aborted and is_aborted():
+                    resp.close()
+                    raise RuntimeError("__ABORTED__")
+                now = _t.monotonic()
+                if now - _start > hard_timeout:
+                    resp.close()
+                    raise requests.exceptions.ReadTimeout(
+                        f"Stream exceeded hard ceiling of {hard_timeout:.0f}s"
+                    )
+                if not chunk:
+                    # Keep-alive — urllib3 already enforced idle timeout via the
+                    # socket read timeout, so an empty chunk here is harmless.
+                    continue
+                if _first_byte_at is None:
+                    _first_byte_at = now
+                    if log_fn:
+                        log_fn(
+                            f"[Ollama] streaming — first bytes after {now - _start:.1f}s",
+                            "info",
+                        )
+                _total_bytes += len(chunk)
+                buffer += chunk
+                # SSE events are separated by \n\n. Parse complete events; keep
+                # trailing partial event in buffer for the next chunk.
+                while b"\n\n" in buffer:
+                    event, buffer = buffer.split(b"\n\n", 1)
+                    for line in event.split(b"\n"):
+                        line = line.strip()
+                        if not line or not line.startswith(b"data:"):
+                            continue
+                        data_str = line[5:].strip().decode("utf-8", errors="replace")
+                        if not data_str or data_str == "[DONE]":
+                            continue
+                        try:
+                            evt = json.loads(data_str)
+                        except json.JSONDecodeError:
+                            continue
+                        if not model_name:
+                            model_name = evt.get("model") or ""
+                        choices = evt.get("choices") or []
+                        if not choices:
+                            continue
+                        ch = choices[0]
+                        fr = ch.get("finish_reason")
+                        if fr:
+                            finish_reason = fr
+                        delta = ch.get("delta") or {}
+                        dc = delta.get("content")
+                        if dc:
+                            content_buf.append(dc)
+                        for tcd in (delta.get("tool_calls") or []):
+                            idx = tcd.get("index", 0)
+                            slot = tool_calls_by_index.setdefault(
+                                idx,
+                                {
+                                    "id": "",
+                                    "type": "function",
+                                    "function": {"name": "", "arguments": ""},
+                                },
+                            )
+                            if tcd.get("id"):
+                                slot["id"] = tcd["id"]
+                            if tcd.get("type"):
+                                slot["type"] = tcd["type"]
+                            fnd = tcd.get("function") or {}
+                            if fnd.get("name"):
+                                # Name is typically sent once in the first delta.
+                                slot["function"]["name"] = fnd["name"]
+                            if fnd.get("arguments") is not None:
+                                slot["function"]["arguments"] += fnd["arguments"]
+        except requests.exceptions.ReadTimeout as e:
+            try:
+                resp.close()
+            except Exception:
+                pass
+            if _first_byte_at is None:
+                raise requests.exceptions.ReadTimeout(
+                    f"No bytes received within first {idle_timeout:.0f}s of stream"
+                ) from e
+            raise requests.exceptions.ReadTimeout(
+                f"Stream idle for {idle_timeout:.0f}s "
+                f"(received {_total_bytes} bytes before stall)"
+            ) from e
+        except requests.exceptions.ChunkedEncodingError as e:
+            try:
+                resp.close()
+            except Exception:
+                pass
+            if _first_byte_at is None:
+                raise
+            if log_fn:
+                log_fn(f"[Ollama] stream ended abruptly: {e}", "warn")
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+
+        message: dict = {"role": "assistant", "content": "".join(content_buf)}
+        if tool_calls_by_index:
+            message["tool_calls"] = [
+                tool_calls_by_index[k] for k in sorted(tool_calls_by_index.keys())
+            ]
+        synth = {
+            "choices": [
+                {"message": message, "finish_reason": finish_reason or "stop", "index": 0}
+            ],
+            "model": model_name,
+        }
+        body_bytes = json.dumps(synth, ensure_ascii=False).encode("utf-8")
+        if log_fn:
+            elapsed = _t.monotonic() - _start
+            log_fn(
+                f"[Ollama] stream complete — {_total_bytes}B in {elapsed:.1f}s, "
+                f"content={len(message['content'])} chars, "
+                f"tool_calls={len(tool_calls_by_index)}",
+                "info",
+            )
+        return self._UrllibResponse(200, body_bytes, {})
+
+    def _post(
+        self,
+        url: str,
+        json_payload: dict,
+        timeout,
+        stream_liveness: bool = False,
+        log_fn: Optional[Callable] = None,
+        is_aborted: Optional[Callable[[], bool]] = None,
+        first_byte_timeout: float = 60.0,
+        idle_timeout: float = 60.0,
+        hard_timeout: float = 1800.0,
+    ) -> requests.Response:
         """
         Execute requests.post without blocking gevent's event loop.
 
@@ -416,6 +614,14 @@ class OllamaClient:
 
         Timeout: read timeout is capped at MAX_READ_TIMEOUT so that OS threads
         unblock within a reasonable time when the process needs to exit.
+
+        If `stream_liveness` is True and the provider is not gemini_native,
+        request is sent with stream=True and liveness-based timeouts:
+          - First byte must arrive within `first_byte_timeout` seconds
+          - No more than `idle_timeout` seconds between any two bytes
+          - Hard wall-clock ceiling of `hard_timeout` seconds total.
+        The SSE stream is reassembled into the same non-streaming response
+        shape so callers don't need to change.
         """
         # Cap the read timeout using per-instance limit (shorter for cloud providers)
         max_read = self.read_timeout
@@ -433,6 +639,19 @@ class OllamaClient:
                     # Use Gemini's native generateContent API (bypasses /v1beta/openai/
                     # compat layer which conflicts with system Google OAuth credentials)
                     result = self._gemini_native_post(json_payload, timeout)
+                elif stream_liveness:
+                    connect_t = timeout[0] if isinstance(timeout, tuple) else 10.0
+                    print(f"[THREAD] POST (stream) {url[:80]}", flush=True)
+                    result = self._stream_chat(
+                        url,
+                        json_payload,
+                        connect_timeout=connect_t,
+                        first_byte_timeout=first_byte_timeout,
+                        idle_timeout=idle_timeout,
+                        hard_timeout=hard_timeout,
+                        log_fn=log_fn,
+                        is_aborted=is_aborted,
+                    )
                 else:
                     print(f"[THREAD] POST {url[:80]}", flush=True)
                     sess = self._sess()
@@ -891,21 +1110,22 @@ class OllamaClient:
                 _ctx_chars = sum(len(str(m.get("content") or "")) for m in final_messages)
                 log_fn(f"[Ollama] Sending request (round {_round + 1}, context ~{_ctx_chars:,} chars)…")
 
-            # Adaptive read timeout: scales with payload size for cloud providers.
-            # Note: we use stream=False, so the server must generate the ENTIRE
-            # response before any byte returns. For large planning contexts with
-            # tool-calls, generation alone can take 2-3 minutes before the first
-            # byte hits our socket — so we're generous here.
-            #   base 90s + 1s per 1KB of request payload, capped at self.read_timeout.
-            #   extra +30s if tools are enabled (tool_call responses are heavier).
-            # Cloud read_timeout=300s → up to 5 min ceiling.
-            # Local read_timeout≥600s → effectively disabled (min 90s).
-            _payload_bytes = sum(len(str(m.get("content") or "")) for m in final_messages)
-            _tool_overhead = 30 if tools else 0
-            _adaptive = max(
-                90,
-                min(self.read_timeout, 90 + _tool_overhead + _payload_bytes // 1024),
-            )
+            # Streaming liveness timeouts. We use stream=True when the provider
+            # supports OpenAI SSE (everything except gemini_native which has its
+            # own path). Rules:
+            #   - First byte must arrive within FIRST_BYTE_TIMEOUT seconds.
+            #   - Every subsequent byte must arrive within IDLE_TIMEOUT seconds
+            #     of the previous one (so a silent minute aborts).
+            #   - Hard wall-clock ceiling of HARD_TIMEOUT seconds.
+            # Replaces the old adaptive read_timeout — streaming makes the
+            # "time-to-first-byte" variable irrelevant because any keep-alive
+            # chunk resets the idle clock.
+            _stream_liveness = self.auth_style != "gemini_native"
+            _FIRST_BYTE_TIMEOUT = 60.0
+            _IDLE_TIMEOUT = 60.0
+            _HARD_TIMEOUT = 1800.0
+            # Connect timeout 10s, socket read timeout == idle timeout.
+            _post_timeout = (10, _IDLE_TIMEOUT)
 
             # Retry loop with per-error-type budget.
             # Max attempts tuned by error class: 429 gets the long schedule
@@ -932,7 +1152,13 @@ class OllamaClient:
                     resp = self._post(
                         self._chat_completions_url(),
                         payload,
-                        (10, _adaptive),
+                        _post_timeout,
+                        stream_liveness=_stream_liveness,
+                        log_fn=log_fn,
+                        is_aborted=is_aborted,
+                        first_byte_timeout=_FIRST_BYTE_TIMEOUT,
+                        idle_timeout=_IDLE_TIMEOUT,
+                        hard_timeout=_HARD_TIMEOUT,
                     )
                     resp.raise_for_status()
                     _elapsed = _time.monotonic() - _t0
@@ -993,7 +1219,8 @@ class OllamaClient:
                         _time.sleep(backoff)
                         continue
                     msg = (
-                        f"Request timed out after {_elapsed:.0f}s (timeout={_adaptive}s) "
+                        f"Request timed out after {_elapsed:.0f}s "
+                        f"(stream idle > {_IDLE_TIMEOUT:.0f}s or > {_HARD_TIMEOUT:.0f}s total) "
                         f"on attempt {_attempt}/{_net_max_attempts}. Cloud provider overloaded or "
                         "context too large."
                     )
