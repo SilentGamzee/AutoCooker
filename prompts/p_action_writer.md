@@ -5,9 +5,20 @@ Write one action file per implementation subtask into the `actions/` directory.
 ## YOUR JOB
 
 1. Read `spec.json`.
-2. Use the KEY SOURCE FILES provided in the message (call `read_file` if you need something not provided).
+2. Use the KEY SOURCE FILES provided in the message. If you need more
+   files, **always call `read_files_batch` with ALL the paths at once**
+   — it's a single round-trip. Do NOT call `read_file` in a loop; that
+   wastes time and tokens. Only fall back to `read_file` when you
+   already know you need exactly one file that's too large to batch.
 3. Write one JSON file per subtask into `actions/` (e.g. `T001.json`).
 4. Call `confirm_phase_done` when all action files are written.
+
+### Writing search blocks verbatim
+The mechanical critic verifies every `search` against the real file.
+If you see the same "search not found in X" error twice in a row,
+**STOP GUESSING** — call `read_files_batch(['X'])` to get the file's
+real content, and copy the lines you want to match byte-for-byte
+(including indentation and punctuation).
 
 ---
 

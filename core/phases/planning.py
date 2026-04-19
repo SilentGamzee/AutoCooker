@@ -1294,8 +1294,14 @@ class PlanningPhase(BasePhase):
             if not p.startswith(".tasks") and not p.startswith(".git")
         )
 
-        # Pre-load top relevant file contents so LLM can write accurate code
-        file_contents_section = self._load_top_file_contents(wd, top_n=5, max_lines=300)
+        # Pre-load top relevant file contents so LLM can write accurate code.
+        # When retrying after critic FAIL, ALSO inject any project files
+        # named in the issue descriptions — otherwise the LLM re-emits
+        # the same hallucinated search string over and over.
+        issue_paths = self._extract_paths_from_issues(issues) if issues else []
+        file_contents_section = self._load_top_file_contents(
+            wd, top_n=5, max_lines=300, extra_paths=issue_paths
+        )
 
         # ── Targeted-fix mode detection ──────────────────────────────
         # Extract filenames the critic flagged; only those get rewritten.
@@ -1344,17 +1350,32 @@ class PlanningPhase(BasePhase):
                 except Exception:
                     failing_contents.append(f"=== {fn} (CURRENT — MISSING / UNREADABLE — RECREATE) ===")
 
+            # Suggest the next unused Txxx number so the LLM can add new
+            # action files when the critic reports missing coverage.
+            used_nums = []
+            for fn in all_on_disk:
+                m = re.match(r"T(\d{3})\.json$", fn)
+                if m:
+                    used_nums.append(int(m.group(1)))
+            next_idx = (max(used_nums) if used_nums else 0) + 1
+            next_suggestion = f"T{next_idx:03d}.json"
+
             targeted_section = (
-                "TARGETED FIX MODE — only rewrite the files listed below.\n"
+                "TARGETED FIX MODE — scoped rewrite + optional additions.\n"
                 f"FILES TO FIX ({len(failing_basenames)}): "
                 + ", ".join(sorted(failing_basenames)) + "\n"
                 f"FILES TO LEAVE ALONE ({len(passing_files)}): "
                 + (", ".join(passing_files) if passing_files else "(none)") + "\n"
                 "RULES:\n"
-                "  1. Call write_file ONLY for the files in 'FILES TO FIX'.\n"
+                "  1. You MUST rewrite every file in 'FILES TO FIX' using write_file.\n"
                 "  2. Do NOT call write_file for any file in 'FILES TO LEAVE ALONE' — "
                 "they already passed review.\n"
-                "  3. When you are done, call confirm_phase_done.\n\n"
+                "  3. If the critic reported a COVERAGE gap (missing subtask for some "
+                f"requirement), ADD a new action file — start at {next_suggestion} "
+                "and increment. Do NOT fold new coverage into an existing 'FILES TO "
+                "LEAVE ALONE' file. The critic's issue description names what is "
+                "missing; create a dedicated subtask for it.\n"
+                "  4. When all required writes are done, call confirm_phase_done.\n\n"
                 + "\n\n".join(failing_contents)
                 + "\n\n"
             )
@@ -1405,18 +1426,71 @@ class PlanningPhase(BasePhase):
 
         return ok
 
-    def _load_top_file_contents(self, project_path: str, top_n: int = 5, max_lines: int = 300) -> str:
+    def _extract_paths_from_issues(self, issues: list[dict] | None) -> list[str]:
+        """Scan issue descriptions for project-file paths (foo/bar.py, web/index.html, …).
+
+        Returns a de-duplicated, order-preserving list of rel paths that
+        exist in the project file cache. Used to pre-inject file contents
+        for the Step 2 retry prompt so the LLM sees real code for the
+        files the critic complained about (instead of hallucinating).
+        """
+        if not issues:
+            return []
+
+        # Common source extensions — enough to catch the paths critics mention.
+        path_re = re.compile(
+            r"\b([a-zA-Z0-9_\-]+(?:[\\/][a-zA-Z0-9_\-]+)*\."
+            r"(?:py|js|jsx|ts|tsx|html|htm|css|scss|json|md|yaml|yml|toml|ini|sh|go|rs|java|kt|cs|cpp|c|h|hpp|rb|php|swift|dart|lua|vue|svelte))\b",
+            re.IGNORECASE,
+        )
+
+        known: set[str] = {
+            p.replace("\\", "/").lstrip("./")
+            for p in (self.state.cache.file_paths or [])
+        }
+
+        seen: set[str] = set()
+        out: list[str] = []
+        for iss in issues:
+            desc = str(iss.get("description") or "")
+            for m in path_re.finditer(desc):
+                rel = m.group(1).replace("\\", "/").lstrip("./")
+                # Only include paths that actually exist in the project
+                if rel in known and rel not in seen:
+                    seen.add(rel)
+                    out.append(rel)
+        return out
+
+    def _load_top_file_contents(
+        self,
+        project_path: str,
+        top_n: int = 5,
+        max_lines: int = 300,
+        extra_paths: list[str] | None = None,
+    ) -> str:
         """Load contents of top-scored project files for inline context injection.
 
         Returns a formatted string block with file contents, or empty string if
-        scored_files.json is not available.
+        scored_files.json is not available. `extra_paths` are added verbatim
+        (de-duplicated) — used to force-inject files named in critic issues.
         """
-        top_paths = self._priority_files(top_n=top_n)
-        if not top_paths:
+        top_paths = list(self._priority_files(top_n=top_n) or [])
+
+        # Merge extra paths (e.g. files named in critic issues) AHEAD of the
+        # generic top list — those are the ones the LLM most needs to see.
+        merged: list[str] = []
+        seen: set[str] = set()
+        for p in list(extra_paths or []) + top_paths:
+            norm = p.replace("\\", "/").lstrip("./")
+            if norm and norm not in seen:
+                seen.add(norm)
+                merged.append(norm)
+
+        if not merged:
             return ""
 
         sections = []
-        for rel_path in top_paths:
+        for rel_path in merged:
             abs_path = os.path.join(project_path, rel_path)
             if not os.path.isfile(abs_path):
                 continue
