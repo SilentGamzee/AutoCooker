@@ -187,6 +187,7 @@ class OllamaClient:
         idle_timeout: float = 60.0,
         hard_timeout: float = 1800.0,
         log_fn: Optional[Callable] = None,
+        progress_fn: Optional[Callable[[str], None]] = None,
         is_aborted: Optional[Callable[[], bool]] = None,
     ) -> "OllamaClient._UrllibResponse":
         """
@@ -266,10 +267,31 @@ class OllamaClient:
 
         fr_map = {"STOP": "stop", "MAX_TOKENS": "length", "SAFETY": "stop"}
 
-        def _dbg(msg: str, level: str = "info") -> None:
-            """Log to both stdout and autocooker.log (when log_fn is set)."""
+        # Progress state — throttled live-updating UI line.
+        _PROGRESS_INTERVAL = 0.25
+        _last_progress = [0.0]
+        token_count = [0]          # Gemini usageMetadata.candidatesTokenCount
+        thought_done = [False]      # flips when first non-thought part appears
+
+        def _emit_progress(force: bool = False) -> None:
+            if not progress_fn:
+                return
+            now = _t.monotonic()
+            if not force and (now - _last_progress[0]) < _PROGRESS_INTERVAL:
+                return
+            _last_progress[0] = now
+            tc = token_count[0] or sum(len(t) for t in text_parts)
+            label = "done" if thought_done[0] else "thinking"
+            try:
+                progress_fn(f"[Gemini] streaming — {tc} tokens, thought={label}")
+            except Exception:
+                pass
+
+        def _dbg(msg: str, level: str = "info", to_log: bool = True) -> None:
+            """Log to stdout always; to autocooker.log only when to_log=True.
+            Per-event tracing uses to_log=False to avoid GUI spam."""
             print(f"[gemini_stream] {msg}", flush=True)
-            if log_fn:
+            if to_log and log_fn:
                 log_fn(f"[gemini_stream] {msg}", level)
 
         def _consume_event(evt: dict) -> None:
@@ -279,9 +301,13 @@ class OllamaClient:
             nonlocal finish_reason, model_name
             if evt.get("modelVersion"):
                 model_name = evt["modelVersion"]
+            # Update token count from usage metadata when server sends it.
+            um = evt.get("usageMetadata") or {}
+            if um.get("candidatesTokenCount"):
+                token_count[0] = int(um["candidatesTokenCount"])
             cands = evt.get("candidates") or []
             if not cands:
-                _dbg(f"event has no candidates; keys={list(evt.keys())}", "warn")
+                _dbg(f"event has no candidates; keys={list(evt.keys())}", "warn", to_log=False)
                 # Gemini sometimes wraps errors: {"error": {...}}
                 if "error" in evt:
                     _dbg(f"server error payload: {evt.get('error')}", "error")
@@ -293,6 +319,7 @@ class OllamaClient:
                     f"candidate has no parts; cand_keys={list(cand.keys())} "
                     f"content_keys={list((cand.get('content') or {}).keys())}",
                     "warn",
+                    to_log=False,
                 )
             for p in parts:
                 # Skip Gemini's internal "thought" parts — they're the
@@ -300,13 +327,16 @@ class OllamaClient:
                 # to the caller. Real text/tool parts never have this flag.
                 if p.get("thought"):
                     continue
+                # First non-thought part seen → thought phase finished.
+                thought_done[0] = True
                 if p.get("text"):
                     text_parts.append(p["text"])
                 if "functionCall" in p:
                     fc = p["functionCall"]
                     _dbg(
                         f"functionCall: name={fc.get('name')!r} "
-                        f"args={json.dumps(fc.get('args', {}), ensure_ascii=False)[:400]}"
+                        f"args={json.dumps(fc.get('args', {}), ensure_ascii=False)[:400]}",
+                        to_log=False,
                     )
                     tool_calls.append({
                         "id": f"call_{_uuid.uuid4().hex[:8]}",
@@ -321,6 +351,7 @@ class OllamaClient:
             fr_raw = cand.get("finishReason")
             if fr_raw:
                 finish_reason = fr_map.get(fr_raw.upper(), "stop")
+                thought_done[0] = True
 
         _dbg(f"POST {url[:140]} — streaming (will auto-detect SSE vs JSON-array)")
 
@@ -339,7 +370,16 @@ class OllamaClient:
                     continue
                 if _first_byte_at is None:
                     _first_byte_at = now
-                    if log_fn:
+                    # First byte message goes to progress (in-place), not log.
+                    if progress_fn:
+                        try:
+                            progress_fn(
+                                f"[Gemini] streaming — first bytes after "
+                                f"{now - _start:.1f}s"
+                            )
+                        except Exception:
+                            pass
+                    elif log_fn:
                         log_fn(
                             f"[Gemini] streaming — first bytes after {now - _start:.1f}s",
                             "info",
@@ -360,16 +400,22 @@ class OllamaClient:
                         if not data_str:
                             continue
                         raw_events.append(data_str)
-                        _dbg(f"SSE event #{len(raw_events)}: {data_str[:600]}")
+                        # Per-event trace → stdout only (GUI log would spam).
+                        _dbg(
+                            f"SSE event #{len(raw_events)}: {data_str[:600]}",
+                            to_log=False,
+                        )
                         try:
                             evt = json.loads(data_str)
                         except json.JSONDecodeError as _je:
                             _dbg(
                                 f"JSON decode error: {_je} — raw: {data_str[:500]!r}",
                                 "warn",
+                                to_log=False,
                             )
                             continue
                         _consume_event(evt)
+                        _emit_progress()
         except requests.exceptions.ReadTimeout as e:
             try:
                 resp.close()
@@ -473,9 +519,14 @@ class OllamaClient:
             f"{len(tool_calls)} tool_calls, finish_reason={finish_reason!r}"
         )
         try:
-            _dbg("synthesized: " + json.dumps(synth, ensure_ascii=False)[:4000])
+            _dbg(
+                "synthesized: " + json.dumps(synth, ensure_ascii=False)[:4000],
+                to_log=False,
+            )
         except Exception as _de:
-            _dbg(f"could not json-dump synth: {_de}", "warn")
+            _dbg(f"could not json-dump synth: {_de}", "warn", to_log=False)
+        # Force a final progress update so the live row reflects the last state.
+        _emit_progress(force=True)
         if not text_parts and not tool_calls:
             # Fallback-parsing failed too — dump the raw stream.
             try:
@@ -730,6 +781,7 @@ class OllamaClient:
         idle_timeout: float = 60.0,
         hard_timeout: float = 1800.0,
         log_fn: Optional[Callable] = None,
+        progress_fn: Optional[Callable[[str], None]] = None,
         is_aborted: Optional[Callable[[], bool]] = None,
     ) -> "OllamaClient._UrllibResponse":
         """
@@ -786,6 +838,28 @@ class OllamaClient:
         _total_bytes = 0
         buffer = b""
 
+        # Progress state — throttled in-place GUI updates.
+        _PROGRESS_INTERVAL = 0.25
+        _last_progress = [0.0]
+
+        def _emit_progress(force: bool = False) -> None:
+            if not progress_fn:
+                return
+            now2 = _t.monotonic()
+            if not force and (now2 - _last_progress[0]) < _PROGRESS_INTERVAL:
+                return
+            _last_progress[0] = now2
+            # No thought channel in OpenAI-compat; tokens approximated by
+            # accumulated content char count.
+            approx_tokens = sum(len(s) for s in content_buf)
+            try:
+                progress_fn(
+                    f"[Ollama] streaming — ~{approx_tokens} chars, "
+                    f"tool_calls={len(tool_calls_by_index)}"
+                )
+            except Exception:
+                pass
+
         try:
             for chunk in resp.iter_content(chunk_size=1024):
                 if is_aborted and is_aborted():
@@ -803,7 +877,15 @@ class OllamaClient:
                     continue
                 if _first_byte_at is None:
                     _first_byte_at = now
-                    if log_fn:
+                    if progress_fn:
+                        try:
+                            progress_fn(
+                                f"[Ollama] streaming — first bytes after "
+                                f"{now - _start:.1f}s"
+                            )
+                        except Exception:
+                            pass
+                    elif log_fn:
                         log_fn(
                             f"[Ollama] streaming — first bytes after {now - _start:.1f}s",
                             "info",
@@ -860,6 +942,7 @@ class OllamaClient:
                                 slot["function"]["name"] = fnd["name"]
                             if fnd.get("arguments") is not None:
                                 slot["function"]["arguments"] += fnd["arguments"]
+                        _emit_progress()
         except requests.exceptions.ReadTimeout as e:
             try:
                 resp.close()
@@ -900,6 +983,7 @@ class OllamaClient:
             "model": model_name,
         }
         body_bytes = json.dumps(synth, ensure_ascii=False).encode("utf-8")
+        _emit_progress(force=True)
         if log_fn:
             elapsed = _t.monotonic() - _start
             log_fn(
@@ -917,6 +1001,7 @@ class OllamaClient:
         timeout,
         stream_liveness: bool = False,
         log_fn: Optional[Callable] = None,
+        progress_fn: Optional[Callable[[str], None]] = None,
         is_aborted: Optional[Callable[[], bool]] = None,
         first_byte_timeout: float = 60.0,
         idle_timeout: float = 60.0,
@@ -969,6 +1054,7 @@ class OllamaClient:
                             idle_timeout=idle_timeout,
                             hard_timeout=hard_timeout,
                             log_fn=log_fn,
+                            progress_fn=progress_fn,
                             is_aborted=is_aborted,
                         )
                     else:
@@ -985,6 +1071,7 @@ class OllamaClient:
                         idle_timeout=idle_timeout,
                         hard_timeout=hard_timeout,
                         log_fn=log_fn,
+                        progress_fn=progress_fn,
                         is_aborted=is_aborted,
                     )
                 else:
@@ -1237,6 +1324,7 @@ class OllamaClient:
         validate_fn: Callable[[], tuple[bool, str]],
         tool_executor: Callable[[str, dict], str],
         log_fn: Optional[Callable[[str], None]] = None,
+        progress_fn: Optional[Callable[[str], None]] = None,
         is_aborted: Optional[Callable[[], bool]] = None,
         max_tool_rounds: int = 40,
         file_ttl: int = 3,
@@ -1490,6 +1578,7 @@ class OllamaClient:
                         _post_timeout,
                         stream_liveness=_stream_liveness,
                         log_fn=log_fn,
+                        progress_fn=progress_fn,
                         is_aborted=is_aborted,
                         first_byte_timeout=_FIRST_BYTE_TIMEOUT,
                         idle_timeout=_IDLE_TIMEOUT,

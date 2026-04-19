@@ -38,6 +38,46 @@ function task_log_added(taskId, logEntry) {
   scrollLogsToBottom();
 }
 
+// Live-updating single-line progress. Backend emits these for long-running
+// streams (LLM token stream) instead of spamming a new log row per event.
+// Same progress_id = overwrite; no progress_id = promote to normal log.
+eel.expose(task_log_progress);
+function task_log_progress(taskId, logEntry) {
+  if (activeTaskId !== taskId) return;
+  const pid = logEntry && logEntry.progress_id;
+  if (!pid) {
+    appendLogEntry(logEntry);
+    scrollLogsToBottom();
+    return;
+  }
+  const phase = logEntry.phase || 'all';
+  const msg = logEntry.msg || '';
+  const ts = logEntry.ts || '';
+  const type = logEntry.type || 'info';
+
+  // Update in each bucket (phase + all); create row on first sighting.
+  ['all', phase].forEach(ph => {
+    const bucket = getOrCreateBucket(ph);
+    const sel = `.log-progress[data-progress-id="${CSS.escape(pid)}"]`;
+    let row = bucket.querySelector(sel);
+    if (!row) {
+      row = document.createElement('div');
+      row.className = `log-entry log-progress type-${type}`;
+      row.dataset.progressId = pid;
+      const tsEl = document.createElement('div');
+      tsEl.className = 'log-ts';
+      const msgEl = document.createElement('div');
+      msgEl.className = 'log-msg';
+      row.appendChild(tsEl);
+      row.appendChild(msgEl);
+      bucket.appendChild(row);
+    }
+    row.querySelector('.log-ts').textContent = ts;
+    row.querySelector('.log-msg').textContent = msg;
+  });
+  scrollLogsToBottom();
+}
+
 eel.expose(task_step_changed);
 function task_step_changed(taskId, phase, step) {
   if (activeTaskId === taskId) {

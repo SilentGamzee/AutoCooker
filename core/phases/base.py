@@ -100,6 +100,31 @@ class BasePhase:
         entry   = self.task.logs[-1]
         self._gevent_safe(lambda: eel.task_log_added(task_id, entry))
 
+    def progress(self, msg: str, progress_id: str = "llm-stream", log_type: str = "info"):
+        """
+        Emit a *live-updating* log entry. Unlike `log()`, which appends a
+        new row for every call, consecutive `progress()` calls with the
+        same `progress_id` overwrite the previous row on the UI.
+
+        Used for streaming LLM output so the GUI shows a single line that
+        ticks the token count (and thought status) in place instead of
+        spamming one row per SSE chunk.
+
+        The entry is NOT persisted to task.logs or autocooker.log — it is
+        UI-ephemeral by design. Durable information (final summary, errors)
+        should go through `log()`.
+        """
+        from datetime import datetime
+        task_id = self.task.id
+        entry = {
+            "ts": datetime.now().strftime("%H:%M:%S"),
+            "msg": msg,
+            "phase": self.phase_name,
+            "type": log_type,
+            "progress_id": progress_id,
+        }
+        self._gevent_safe(lambda: eel.task_log_progress(task_id, entry))
+
     def set_step(self, step: str):
         task_id    = self.task.id
         phase_name = self.phase_name
@@ -970,6 +995,7 @@ Token count: {token_count} / {config['max_total_tokens']}
                     validate_fn=validate_fn,
                     tool_executor=executor,
                     log_fn=self.log,
+                    progress_fn=lambda m: self.progress(m, "llm-stream"),
                     is_aborted=lambda: self.task.id in self.state.abort_requested,
                     max_tool_rounds=max_tool_rounds,
                     file_ttl=file_ttl,
