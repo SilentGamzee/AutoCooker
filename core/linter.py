@@ -70,11 +70,49 @@ def lint_file_relative(working_dir: str, rel_path: str) -> tuple[bool, str]:
 # Python
 # ─────────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────────
+# Pyflakes severity classification
+# ─────────────────────────────────────────────────────────────────
+#
+# Pyflakes emits a mix of real bugs and cosmetic warnings. We split its
+# output into two buckets:
+#
+#   HARD — the code will misbehave or crash at runtime; fail the lint.
+#   SOFT — stylistic / latent-shadow issues; the file still runs. Log as
+#          a warning but don't fail the coding step.
+#
+# Matching is substring-based against the text of the pyflakes message
+# (e.g. "f-string is missing placeholders"). Anything that doesn't match
+# a SOFT pattern falls through to HARD — that's the safer default, since
+# new pyflakes rules tend to flag real issues.
+_PYFLAKES_SOFT_PATTERNS = (
+    "f-string is missing placeholders",
+    "shadowed by loop variable",
+    "is assigned to but never used",   # local var unused — cosmetic
+    "imported but unused",             # LLM often imports for later subtasks
+    "redefinition of unused",          # harmless duplicate stub
+    "unable to detect undefined names",
+)
+
+
+def _classify_pyflakes(msg: str) -> str:
+    """Return 'soft' or 'hard' for a pyflakes message."""
+    low = msg.lower()
+    for pat in _PYFLAKES_SOFT_PATTERNS:
+        if pat in low:
+            return "soft"
+    return "hard"
+
+
 def _lint_python(abs_path: str) -> tuple[bool, str]:
     """
     1. py_compile — catches SyntaxError immediately.
     2. pyflakes   — catches undefined names, unused imports, redefinitions.
     Falls back to syntax-only if pyflakes is not installed.
+
+    Pyflakes messages are split into HARD (fail the lint) and SOFT
+    (returned as a warning note but do not fail). See
+    _PYFLAKES_SOFT_PATTERNS above for the SOFT whitelist.
     """
     import py_compile
 
@@ -108,9 +146,26 @@ def _lint_python(abs_path: str) -> tuple[bool, str]:
         collector = _Collector()
         pyflakes.api.check(source, abs_path, reporter=collector)
 
-        if collector.messages:
-            return False, "\n".join(collector.messages)
-        return True, "OK"
+        if not collector.messages:
+            return True, "OK"
+
+        hard: list[str] = []
+        soft: list[str] = []
+        for m in collector.messages:
+            (hard if _classify_pyflakes(m) == "hard" else soft).append(m)
+
+        if hard:
+            # Hard failures dominate — report them. If there were also
+            # soft notes, include them so the caller has the full picture.
+            parts = ["\n".join(hard)]
+            if soft:
+                parts.append("--- soft warnings (ignored) ---")
+                parts.append("\n".join(soft))
+            return False, "\n".join(parts)
+
+        # Only soft warnings → PASS, but surface them in the message so
+        # the coding phase can log them as info.
+        return True, "OK (soft warnings ignored):\n" + "\n".join(soft)
 
     except ImportError:
         return True, "OK (syntax valid; pyflakes not installed — import check skipped)"
