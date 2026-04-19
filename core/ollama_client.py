@@ -287,9 +287,22 @@ class OllamaClient:
             except Exception:
                 pass
 
+        # Verbose per-event tracing is opt-in via env var. With it off we
+        # never emit per-event stdout prints or log_fn calls — the single
+        # updating progress line in the GUI is the only stream indicator.
+        _verbose = bool(os.environ.get("AUTOCOOKER_STREAM_DEBUG"))
+
         def _dbg(msg: str, level: str = "info", to_log: bool = True) -> None:
-            """Log to stdout always; to autocooker.log only when to_log=True.
-            Per-event tracing uses to_log=False to avoid GUI spam."""
+            """Emit a debug line for the Gemini stream.
+
+            - `to_log=False` means it's a per-event trace (noisy): printed
+              to stdout AND forwarded to log_fn only when the verbose env
+              flag is on. Default: silent.
+            - `to_log=True` is for summary / error lines: always printed,
+              always forwarded to log_fn when available.
+            """
+            if not to_log and not _verbose:
+                return
             print(f"[gemini_stream] {msg}", flush=True)
             if to_log and log_fn:
                 log_fn(f"[gemini_stream] {msg}", level)
