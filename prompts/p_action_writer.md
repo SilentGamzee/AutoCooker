@@ -1,20 +1,22 @@
-# Action Writer (Step 2)
+# Action Writer (Step 2b) — ONE Subtask at a Time
 
-Write one action file per implementation subtask into the `actions/` directory.
+The message describes **one specific subtask** (id + title + files +
+brief). Your job is to write **exactly one** action file for it and
+nothing else.
 
 ## YOUR JOB
 
-1. Read `spec.json`.
-2. Use the KEY SOURCE FILES provided in the message. If you need more
-   files, **always call `read_files_batch` with ALL the paths at once**
-   — it's a single round-trip. Do NOT call `read_file` in a loop; that
-   wastes time and tokens. Only fall back to `read_file` when you
-   already know you need exactly one file that's too large to batch.
-3. Write one JSON file per subtask into `actions/` (e.g. `T001.json`).
-4. Call `confirm_phase_done` when all action files are written.
+1. Read `YOUR SINGLE SUBTASK` in the message.
+2. Use the KEY SOURCE FILES provided for the files this subtask
+   touches. If you need more files, **call `read_files_batch` with
+   ALL paths at once** — never loop `read_file`.
+3. Write exactly ONE action file at the path shown in the message
+   (e.g. `actions/T002.json`). DO NOT write any other file in the
+   `actions/` directory.
+4. Call `confirm_phase_done`.
 
 ### Writing search blocks verbatim
-The mechanical critic verifies every `search` against the real file.
+The mechanical validator checks every `search` against the real file.
 If you see the same "search not found in X" error twice in a row,
 **STOP GUESSING** — call `read_files_batch(['X'])` to get the file's
 real content, and copy the lines you want to match byte-for-byte
@@ -156,15 +158,13 @@ For new files, replace `blocks` with `"create": "<full file content>"`.
 
 ## PROCEDURE
 
-1. Read `spec.json`.
-2. For each file that needs changes, drop one action file.
-3. Copy real text from the KEY SOURCE FILES for every `search`.
-4. For any ADD-near-X change, include X's definition VERBATIM in both
+1. Read the one subtask in `YOUR SINGLE SUBTASK`.
+2. Copy real text from the KEY SOURCE FILES for every `search`.
+3. For any ADD-near-X change, include X's definition VERBATIM in both
    `search` and `replace`.
+4. Write exactly ONE action file at the path shown.
 5. Call `confirm_phase_done`.
 
-## ORDERING
-- Data/state changes first
-- Backend/API changes next
-- HTML before JS that references new elements
-- CSS last
+Ordering across subtasks (data→backend→HTML→JS→CSS) is the outline
+step's concern, not yours — just implement the single subtask you're
+given.

@@ -1271,16 +1271,15 @@ class PlanningPhase(BasePhase):
         issues: list[dict] | None = None,
     ) -> bool:
         """
-        Read spec.json + project files, write one action file per subtask.
-        Action files: .tasks/task_NNN/actions/T001.json, T002.json, …
-        Auto-removes orphaned action files from previous iterations.
-        Pre-loads top relevant source file contents so the LLM has real code
-        to reference without needing to call read_file first.
+        Compose Step 2 as three smaller LLM calls to keep each prompt tight:
 
-        If `issues` is supplied (retry after critic FAIL), the call enters
-        TARGETED MODE: only the action files named in `issue.file` are
-        regenerated; the passing files are preserved verbatim and their
-        current content is shown to the LLM as reference.
+            2a. Outline            — list of subtasks {id, title, files, brief}
+            2b. Per-subtask write  — one LLM call per action file
+            2c. Completeness       — LLM verifies coverage; missing → more 2b
+
+        In targeted mode (retry after critic FAIL), the outline is rebuilt
+        from the failing action files instead of calling 2a. 2c still
+        runs so that coverage-gap issues produce brand-new action files.
         """
         wd = self.task.project_path or self.state.working_dir
         actions_dir = os.path.join(self.task.task_dir, "actions")
@@ -1289,142 +1288,413 @@ class PlanningPhase(BasePhase):
         spec_path = os.path.join(self.task.task_dir, "spec.json")
         spec_content = self._read_file_safe(spec_path)
 
+        # ── Targeted-fix mode detection ────────────────────────────
+        failing_basenames: set[str] = set()
+        if issues:
+            for iss in issues:
+                fn = os.path.basename(str(iss.get("file") or "").replace("\\", "/")).strip()
+                if fn.endswith(".json"):
+                    failing_basenames.add(fn)
+        targeted_mode = bool(failing_basenames)
+
+        # ── 2a. Build outline ──────────────────────────────────────
+        if targeted_mode:
+            outline = self._outline_from_failing_files(actions_dir, failing_basenames)
+            self.log(
+                f"  Targeted mode: {len(outline)} file(s) to regenerate "
+                f"({len([f for f in os.listdir(actions_dir) if f.endswith('.json')]) - len(outline)} "
+                f"preserved)",
+                "info",
+            )
+        else:
+            self.log("─── 2a Outline ───")
+            ok, outline = self._new_step2a_outline(
+                model, critique_feedback, spec_content, wd, issues
+            )
+            if not ok:
+                self.log("[FAIL] Could not build subtasks outline", "error")
+                return False
+            self.log(f"  Outline: {len(outline)} subtask(s)", "info")
+
+        # ── 2b. Write each action file individually ────────────────
+        for entry in outline:
+            label = str(entry.get("id") or "?")
+            self.log(f"─── 2b Write {label} ───")
+            if not self._new_step2b_write_single(
+                model, entry, spec_content, wd, issues
+            ):
+                self.log(f"[FAIL] Writing action for {label} failed", "error")
+                return False
+
+        # ── 2c. Completeness loop (bounded) ────────────────────────
+        # Even in targeted mode we run this, because the critic's issues
+        # often include coverage gaps that require NEW action files.
+        for cycle in range(2):
+            self.log(f"─── 2c Completeness (pass {cycle+1}) ───")
+            on_disk = self._read_all_action_summaries(actions_dir)
+            missing = self._new_step2c_completeness(
+                model, on_disk, spec_content, wd
+            )
+            if not missing:
+                break
+            self.log(
+                f"  Completeness reported {len(missing)} missing subtask(s)",
+                "warn",
+            )
+            used_nums = []
+            for f in os.listdir(actions_dir):
+                m = re.match(r"T(\d{3})\.json$", f)
+                if m:
+                    used_nums.append(int(m.group(1)))
+            next_idx = (max(used_nums) if used_nums else 0) + 1
+            for entry in missing:
+                entry["id"] = f"T-{next_idx:03d}"
+                next_idx += 1
+                self.log(
+                    f"  Adding {entry['id']}: {entry.get('title','')[:60]}",
+                    "info",
+                )
+                if not self._new_step2b_write_single(
+                    model, entry, spec_content, wd, None
+                ):
+                    self.log(
+                        f"[FAIL] Writing missing {entry['id']} failed",
+                        "error",
+                    )
+                    return False
+
+        # Renumber only in full-rewrite mode (targeted preserves basenames).
+        if not targeted_mode:
+            self._renumber_action_files(actions_dir)
+
+        return True
+
+    # ── 2a. Outline LLM step ──────────────────────────────────────────
+    def _new_step2a_outline(
+        self,
+        model: str,
+        critique_feedback: str,
+        spec_content: str,
+        wd: str,
+        issues: list[dict] | None,
+    ) -> tuple[bool, list[dict]]:
+        """Have the LLM emit a flat subtask list in subtasks_outline.json."""
+        outline_path = os.path.join(self.task.task_dir, "subtasks_outline.json")
+        try:
+            if os.path.isfile(outline_path):
+                os.remove(outline_path)
+        except OSError:
+            pass
+
+        issue_paths = self._extract_paths_from_issues(issues) if issues else []
+        file_contents_section = self._load_top_file_contents(
+            wd, top_n=5, max_lines=200, extra_paths=issue_paths
+        )
         existing_files = "\n".join(
             f"  {p}" for p in self.state.cache.file_paths[:80]
             if not p.startswith(".tasks") and not p.startswith(".git")
         )
-
-        # Pre-load top relevant file contents so LLM can write accurate code.
-        # When retrying after critic FAIL, ALSO inject any project files
-        # named in the issue descriptions — otherwise the LLM re-emits
-        # the same hallucinated search string over and over.
-        issue_paths = self._extract_paths_from_issues(issues) if issues else []
-        file_contents_section = self._load_top_file_contents(
-            wd, top_n=5, max_lines=300, extra_paths=issue_paths
-        )
-
-        # ── Targeted-fix mode detection ──────────────────────────────
-        # Extract filenames the critic flagged; only those get rewritten.
-        # Orphan-cleanup is disabled in this mode so passing files survive.
-        failing_basenames: set[str] = set()
-        if issues:
-            for iss in issues:
-                fn = iss.get("file") or ""
-                fn = os.path.basename(str(fn).replace("\\", "/")).strip()
-                if fn.endswith(".json"):
-                    failing_basenames.add(fn)
-
-        targeted_mode = bool(failing_basenames)
-
-        # Track which action files are written in this run for cleanup
-        written_basenames: set[str] = set()
-
-        def _track_write(rel_path: str, content: str):
-            norm = rel_path.replace("\\", "/")
-            if "/actions/" in norm:
-                written_basenames.add(os.path.basename(norm))
-
-        executor = self._make_planning_executor(wd, on_file_written=_track_write)
-
-        rel_actions = self._rel(actions_dir)
-        critique_section = (
+        crit_section = (
             f"\nCRITIQUE FEEDBACK TO ADDRESS:\n{critique_feedback}\n\n"
             if critique_feedback else ""
         )
-
-        # ── Targeted-fix section: show current content of failing files
-        # and list passing files that MUST NOT be touched. ──
-        targeted_section = ""
-        if targeted_mode:
-            all_on_disk = sorted(
-                f for f in os.listdir(actions_dir) if f.endswith(".json")
-            )
-            passing_files = [f for f in all_on_disk if f not in failing_basenames]
-
-            failing_contents: list[str] = []
-            for fn in sorted(failing_basenames):
-                p = os.path.join(actions_dir, fn)
-                try:
-                    with open(p, "r", encoding="utf-8") as fh:
-                        failing_contents.append(f"=== {fn} (CURRENT — FIX THIS) ===\n{fh.read()}")
-                except Exception:
-                    failing_contents.append(f"=== {fn} (CURRENT — MISSING / UNREADABLE — RECREATE) ===")
-
-            # Suggest the next unused Txxx number so the LLM can add new
-            # action files when the critic reports missing coverage.
-            used_nums = []
-            for fn in all_on_disk:
-                m = re.match(r"T(\d{3})\.json$", fn)
-                if m:
-                    used_nums.append(int(m.group(1)))
-            next_idx = (max(used_nums) if used_nums else 0) + 1
-            next_suggestion = f"T{next_idx:03d}.json"
-
-            targeted_section = (
-                "TARGETED FIX MODE — scoped rewrite + optional additions.\n"
-                f"FILES TO FIX ({len(failing_basenames)}): "
-                + ", ".join(sorted(failing_basenames)) + "\n"
-                f"FILES TO LEAVE ALONE ({len(passing_files)}): "
-                + (", ".join(passing_files) if passing_files else "(none)") + "\n"
-                "RULES:\n"
-                "  1. You MUST rewrite every file in 'FILES TO FIX' using write_file.\n"
-                "  2. Do NOT call write_file for any file in 'FILES TO LEAVE ALONE' — "
-                "they already passed review.\n"
-                "  3. If the critic reported a COVERAGE gap (missing subtask for some "
-                f"requirement), ADD a new action file — start at {next_suggestion} "
-                "and increment. Do NOT fold new coverage into an existing 'FILES TO "
-                "LEAVE ALONE' file. The critic's issue description names what is "
-                "missing; create a dedicated subtask for it.\n"
-                "  4. When all required writes are done, call confirm_phase_done.\n\n"
-                + "\n\n".join(failing_contents)
-                + "\n\n"
-            )
-            self.log(
-                f"  Targeted fix: {len(failing_basenames)} file(s) to fix, "
-                f"{len(passing_files)} preserved",
-                "info",
-            )
+        rel_outline = self._rel(outline_path)
 
         msg = (
             f"Task: {self.task.title}\n"
             f"Description: {self.task.description}\n\n"
             f"SPECIFICATION:\n{spec_content}\n\n"
-            f"{critique_section}"
-            f"{targeted_section}"
+            f"{crit_section}"
             f"{file_contents_section}"
-            f"Project files available for files_to_modify:\n{existing_files}\n\n"
-            f"{'Action files directory: ' + rel_actions + '/' if targeted_mode else 'Write one action file per implementation subtask to: ' + rel_actions + '/'}\n"
-            "Name files: T001.json, T002.json, T003.json, …\n"
-            "Each file is a single JSON subtask object with implementation_steps.\n"
-            + ("After writing the FIXED files only, call confirm_phase_done."
-               if targeted_mode else
-               "After writing ALL action files, call confirm_phase_done.")
+            f"Project files available:\n{existing_files}\n\n"
+            f"Write the subtask outline to: {rel_outline}\n"
+            "Schema: {\"subtasks\": [{\"id\":\"T-001\",\"title\":\"...\","
+            "\"files_to_modify\":[...],\"files_to_create\":[...],"
+            "\"brief\":\"...\"}, ...]}\n"
+            "After write_file, call confirm_phase_done."
         )
+
+        executor = self._make_planning_executor(wd)
 
         def validate():
-            return self._validate_action_files(actions_dir, wd)
+            if not os.path.isfile(outline_path):
+                return False, "subtasks_outline.json not written"
+            try:
+                with open(outline_path, "r", encoding="utf-8") as fh:
+                    d = json.load(fh)
+            except Exception as e:
+                return False, f"subtasks_outline.json invalid JSON: {e}"
+            subs = d.get("subtasks") if isinstance(d, dict) else None
+            if not isinstance(subs, list) or not subs:
+                return False, "subtasks_outline.json needs non-empty 'subtasks'"
+            known = {
+                p.replace("\\", "/").lstrip("./")
+                for p in (self.state.cache.file_paths or [])
+            }
+            for i, s in enumerate(subs):
+                if not isinstance(s, dict):
+                    return False, f"subtasks[{i}] must be an object"
+                if not s.get("id") or not s.get("title"):
+                    return False, f"subtasks[{i}] needs id and title"
+                files = list(s.get("files_to_modify") or []) + list(s.get("files_to_create") or [])
+                if not files:
+                    return False, f"subtasks[{i}] ({s.get('id')}) has no files"
+                for fp in (s.get("files_to_modify") or []):
+                    norm = str(fp).replace("\\", "/").lstrip("./")
+                    if norm not in known:
+                        return False, (
+                            f"subtasks[{i}] files_to_modify has {fp!r} "
+                            f"which is not in the project file list. Move it "
+                            f"to files_to_create if it's new."
+                        )
+            return True, "OK"
 
         ok = self.run_loop(
-            "2 Write Actions", "p_action_writer.md",
+            "2a Outline", "p_action_outline.md",
             PLANNING_TOOLS, executor, msg, validate, model,
-            reconstruct_after=3,
-            max_outer_iterations=7,
-            max_tool_rounds=40,
+            reconstruct_after=2, max_outer_iterations=4, max_tool_rounds=20,
+        )
+        if not ok:
+            return False, []
+        try:
+            with open(outline_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            return True, list(data.get("subtasks") or [])
+        except Exception:
+            return False, []
+
+    # ── 2b. Single-subtask writer ─────────────────────────────────────
+    def _new_step2b_write_single(
+        self,
+        model: str,
+        entry: dict,
+        spec_content: str,
+        wd: str,
+        extra_issues: list[dict] | None,
+    ) -> bool:
+        """Write exactly one action file for one subtask entry."""
+        from core.action_validator import validate_action_file
+
+        actions_dir = os.path.join(self.task.task_dir, "actions")
+
+        # Normalise id → Txxx.json
+        raw_id = str(entry.get("id") or "").replace("-", "").upper()
+        if not re.match(r"^T\d{3}$", raw_id):
+            existing_nums = [
+                int(m.group(1)) for f in os.listdir(actions_dir)
+                if (m := re.match(r"T(\d{3})\.json$", f))
+            ]
+            next_idx = (max(existing_nums) if existing_nums else 0) + 1
+            raw_id = f"T{next_idx:03d}"
+        target_basename = f"{raw_id}.json"
+        target_abs = os.path.join(actions_dir, target_basename)
+        target_rel = self._rel(target_abs)
+
+        modify_paths = list(entry.get("files_to_modify") or [])
+        create_paths = list(entry.get("files_to_create") or [])
+
+        # Inject JUST this subtask's existing files (focused context).
+        file_contents_section = self._load_top_file_contents(
+            wd, top_n=0, max_lines=400, extra_paths=modify_paths
         )
 
-        # Orphan cleanup: in targeted-fix mode we MUST preserve the
-        # passing files (the LLM was told not to rewrite them), so skip
-        # cleanup entirely. Full-rewrite mode keeps the old behaviour.
-        if ok and written_basenames and not targeted_mode:
-            self._cleanup_orphaned_actions(actions_dir, written_basenames)
+        # Relevant critic issues for THIS file (targeted-mode retries).
+        issues_lines: list[str] = []
+        for iss in (extra_issues or []):
+            iss_file = os.path.basename(str(iss.get("file") or "").replace("\\", "/"))
+            if iss_file == target_basename:
+                desc = str(iss.get("description") or "").strip()
+                if desc:
+                    issues_lines.append(f"  - {desc}")
+        issues_section = ""
+        if issues_lines:
+            issues_section = (
+                "CRITIC FEEDBACK FOR THIS FILE — address every item:\n"
+                + "\n".join(issues_lines) + "\n\n"
+            )
 
-        # Renumbering also only makes sense when we regenerated everything —
-        # renaming passing files in targeted mode would invalidate the
-        # critic's prior verdict on them.
-        if ok and not targeted_mode:
-            self._renumber_action_files(actions_dir)
+        existing_files = "\n".join(
+            f"  {p}" for p in self.state.cache.file_paths[:80]
+            if not p.startswith(".tasks") and not p.startswith(".git")
+        )
 
-        return ok
+        msg = (
+            f"Task: {self.task.title}\n\n"
+            f"SPECIFICATION (for context):\n{spec_content[:2500]}\n\n"
+            f"YOUR SINGLE SUBTASK:\n"
+            f"  id:                {entry.get('id')}\n"
+            f"  title:             {entry.get('title','')}\n"
+            f"  brief:             {entry.get('brief','')}\n"
+            f"  files_to_modify:   {modify_paths}\n"
+            f"  files_to_create:   {create_paths}\n\n"
+            f"{issues_section}"
+            f"{file_contents_section}"
+            f"Project files list:\n{existing_files}\n\n"
+            f"Write EXACTLY ONE action file at: {target_rel}\n"
+            f"Do NOT write any other file. After the single write_file, "
+            f"call confirm_phase_done."
+        )
+
+        executor = self._make_planning_executor(wd)
+
+        def validate():
+            if not os.path.isfile(target_abs):
+                return False, f"{target_basename} not written"
+            try:
+                with open(target_abs, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+            except Exception as e:
+                return False, f"{target_basename} invalid JSON: {e}"
+            proj_set = {
+                p.replace("\\", "/").lstrip("./")
+                for p in (self.state.cache.file_paths or [])
+            }
+            mech = validate_action_file(target_basename, data, wd, proj_set)
+            if mech:
+                top = mech[0].get("description", "")[:400]
+                return False, f"{target_basename}: {top}"
+            return True, "OK"
+
+        return self.run_loop(
+            f"2b Write {raw_id}", "p_action_writer.md",
+            PLANNING_TOOLS, executor, msg, validate, model,
+            reconstruct_after=2, max_outer_iterations=4, max_tool_rounds=15,
+        )
+
+    # ── 2c. Completeness check ────────────────────────────────────────
+    def _new_step2c_completeness(
+        self,
+        model: str,
+        current_outline: list[dict],
+        spec_content: str,
+        wd: str,
+    ) -> list[dict]:
+        """
+        Ask LLM to confirm coverage. Returns list of new subtask entries
+        to write (empty list = everything covered).
+        """
+        report_path = os.path.join(self.task.task_dir, "completeness_report.json")
+        try:
+            if os.path.isfile(report_path):
+                os.remove(report_path)
+        except OSError:
+            pass
+
+        summary_lines = []
+        for e in current_outline:
+            mod = e.get("files_to_modify") or []
+            new = e.get("files_to_create") or []
+            summary_lines.append(
+                f"  {e.get('id','?')}: {e.get('title','')}\n"
+                f"    modify={mod} create={new}\n"
+                f"    brief: {e.get('brief','')}"
+            )
+        summary = "\n".join(summary_lines) if summary_lines else "  (none)"
+
+        msg = (
+            f"Task: {self.task.title}\n\n"
+            f"SPECIFICATION:\n{spec_content}\n\n"
+            f"CURRENT ACTION OUTLINE ({len(current_outline)} subtask(s)):\n"
+            f"{summary}\n\n"
+            f"Write completeness_report.json to: {self._rel(report_path)}\n"
+            'Schema: {"complete": bool, "missing": [{id, title, '
+            'files_to_modify, files_to_create, brief}]}\n'
+            "If every spec requirement and acceptance criterion is "
+            "covered above → complete=true, missing=[]. Otherwise list "
+            "ONLY genuinely-missing subtasks. After write_file, call "
+            "confirm_phase_done."
+        )
+
+        executor = self._make_planning_executor(wd)
+
+        def validate():
+            if not os.path.isfile(report_path):
+                return False, "completeness_report.json not written"
+            try:
+                with open(report_path, "r", encoding="utf-8") as fh:
+                    d = json.load(fh)
+            except Exception as e:
+                return False, f"invalid JSON: {e}"
+            if not isinstance(d, dict) or "complete" not in d or "missing" not in d:
+                return False, "must have 'complete' and 'missing' keys"
+            if not isinstance(d["missing"], list):
+                return False, "'missing' must be an array"
+            for i, it in enumerate(d["missing"]):
+                if not isinstance(it, dict) or not it.get("title"):
+                    return False, f"missing[{i}] needs at least a title"
+            return True, "OK"
+
+        ok = self.run_loop(
+            "2c Completeness", "p_action_completeness.md",
+            PLANNING_TOOLS, executor, msg, validate, model,
+            reconstruct_after=2, max_outer_iterations=3, max_tool_rounds=12,
+        )
+        if not ok:
+            return []
+        try:
+            with open(report_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except Exception:
+            return []
+        if data.get("complete"):
+            return []
+        missing = data.get("missing") or []
+        # Keep only entries that have at least one file target; drop noise.
+        return [
+            m for m in missing
+            if (m.get("files_to_modify") or m.get("files_to_create"))
+        ]
+
+    # ── helpers used by the three-step flow ───────────────────────────
+    def _outline_from_failing_files(
+        self, actions_dir: str, failing_basenames: set[str]
+    ) -> list[dict]:
+        """Rebuild outline entries from the existing failing action files."""
+        out: list[dict] = []
+        for fn in sorted(failing_basenames):
+            path = os.path.join(actions_dir, fn)
+            stub_id = fn[:-5]  # strip ".json"
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    d = json.load(fh)
+                out.append({
+                    "id": d.get("id") or stub_id,
+                    "title": d.get("title") or "(regenerate)",
+                    "files_to_modify": d.get("files_to_modify") or [],
+                    "files_to_create": d.get("files_to_create") or [],
+                    "brief": d.get("description") or "",
+                })
+            except Exception:
+                out.append({
+                    "id": stub_id,
+                    "title": "(recreate from spec)",
+                    "files_to_modify": [],
+                    "files_to_create": [],
+                    "brief": "Previous action file was missing or invalid.",
+                })
+        return out
+
+    def _read_all_action_summaries(self, actions_dir: str) -> list[dict]:
+        """Light summary of every action file currently on disk."""
+        out: list[dict] = []
+        if not os.path.isdir(actions_dir):
+            return out
+        for fn in sorted(os.listdir(actions_dir)):
+            if not fn.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(actions_dir, fn), "r", encoding="utf-8") as fh:
+                    d = json.load(fh)
+                out.append({
+                    "id": d.get("id") or fn[:-5],
+                    "title": d.get("title") or "",
+                    "files_to_modify": d.get("files_to_modify") or [],
+                    "files_to_create": d.get("files_to_create") or [],
+                    "brief": d.get("description") or "",
+                })
+            except Exception:
+                continue
+        return out
 
     def _extract_paths_from_issues(self, issues: list[dict] | None) -> list[str]:
         """Scan issue descriptions for project-file paths (foo/bar.py, web/index.html, …).
