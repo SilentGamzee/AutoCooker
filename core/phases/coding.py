@@ -77,6 +77,7 @@ class CodingPhase(BasePhase):
             pass
 
         for i, subtask_dict in enumerate(self.task.subtasks):
+            self.set_step(f"{i+1}/{len(self.task.subtasks)}")
             sid = subtask_dict.get("id", f"T-{i+1:03d}")
             prior_status = subtask_dict.get("status", "pending")
 

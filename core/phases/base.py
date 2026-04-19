@@ -125,10 +125,10 @@ class BasePhase:
         }
         self._gevent_safe(lambda: eel.task_log_progress(task_id, entry))
 
-    def set_step(self, step: str):
+    def set_step(self, step: str, info: Optional[str] = None):
         task_id    = self.task.id
         phase_name = self.phase_name
-        self._gevent_safe(lambda: eel.task_step_changed(task_id, phase_name, step))
+        self._gevent_safe(lambda: eel.task_step_changed(task_id, phase_name, step, info))
 
     def push_task(self):
         """Push full task state to UI."""
@@ -976,6 +976,8 @@ Token count: {token_count} / {config['max_total_tokens']}
         for outer in range(max_outer_iterations):
             # ── Abort checkpoint ──────────────────────────────────
             self.state.check_abort(self.task.id)
+
+            self.set_step(step_name, info=f"Round {outer + 1}")
 
             self.log(f"  [Loop {outer+1}/{max_outer_iterations}] → Ollama…", "info")
             tool_calls_made = 0   # reset each outer iteration

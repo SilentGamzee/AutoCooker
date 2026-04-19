@@ -182,6 +182,7 @@
         <span class="mt-status-tag" id="mt-col-tag"></span>
         <span class="tag-err hidden" id="mt-err-tag">Has Errors</span>
         <span class="mt-subtask-count hidden" id="mt-subtask-count"></span>
+        <span class="mt-phase-info hidden" id="mt-phase-info"></span>
       </div>
     </div>
 
@@ -437,22 +438,6 @@
     <div class="modal-new-footer">
       <button class="btn-ghost" onclick="closeDiffModal()">Close</button>
       <button class="btn-merge" onclick="closeDiffModal();mergeWorkdir()">⇥ Merge to Branch</button>
-    </div>
-  </div>
-</div>
-
-<!-- ═══════════════ GENERIC MESSAGE MODAL ════════════════════════ -->
-<div class="overlay" id="overlay-msg" onclick="if(event.target===this)closeMessageModal()">
-  <div class="modal-new" style="max-width:520px">
-    <div class="modal-new-header">
-      <h2 id="msg-modal-title">Notice</h2>
-      <button class="modal-close" onclick="closeMessageModal()">✕</button>
-    </div>
-    <div class="modal-new-body">
-      <div id="msg-modal-body" style="white-space:pre-wrap;word-break:break-word;font-size:13px;line-height:1.5;color:var(--text1)"></div>
-    </div>
-    <div class="modal-new-footer">
-      <button class="btn-primary" onclick="closeMessageModal()">OK</button>
     </div>
   </div>
 </div>
