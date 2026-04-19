@@ -1316,14 +1316,23 @@ class PlanningPhase(BasePhase):
                 return False
             self.log(f"  Outline: {len(outline)} subtask(s)", "info")
 
-        # ── 2b. Write each action file individually ────────────────
-        for entry in outline:
-            label = str(entry.get("id") or "?")
-            self.log(f"─── 2b Write {label} ───")
-            if not self._new_step2b_write_single(
-                model, entry, spec_content, wd, issues
-            ):
-                self.log(f"[FAIL] Writing action for {label} failed", "error")
+        # ── 2b. Write each action file ─────────────────────────────
+        # First-pass (non-targeted): run agents in parallel to cut wall
+        # time — each subtask has a distinct target file so there are no
+        # write conflicts.  Targeted-fix (after critic FAIL): run serially
+        # so that corrections stay consistent (one agent sees one issue
+        # at a time, no interleaved reasoning across files).
+        if targeted_mode:
+            for entry in outline:
+                label = str(entry.get("id") or "?")
+                self.log(f"─── 2b Write {label} (serial, targeted fix) ───")
+                if not self._new_step2b_write_single(
+                    model, entry, spec_content, wd, issues
+                ):
+                    self.log(f"[FAIL] Writing action for {label} failed", "error")
+                    return False
+        else:
+            if not self._run_2b_parallel(outline, model, spec_content, wd, issues=None):
                 return False
 
         # ── 2c. Completeness loop (bounded) ────────────────────────
@@ -1354,19 +1363,96 @@ class PlanningPhase(BasePhase):
                     f"  Adding {entry['id']}: {entry.get('title','')[:60]}",
                     "info",
                 )
-                if not self._new_step2b_write_single(
-                    model, entry, spec_content, wd, None
-                ):
-                    self.log(
-                        f"[FAIL] Writing missing {entry['id']} failed",
-                        "error",
-                    )
+            # New subtasks from 2c are additions, not corrections → safe
+            # to run in parallel when we're in the initial pass. In
+            # targeted mode, keep serial for consistency.
+            if targeted_mode:
+                for entry in missing:
+                    if not self._new_step2b_write_single(
+                        model, entry, spec_content, wd, None
+                    ):
+                        self.log(
+                            f"[FAIL] Writing missing {entry['id']} failed",
+                            "error",
+                        )
+                        return False
+            else:
+                if not self._run_2b_parallel(missing, model, spec_content, wd, issues=None):
                     return False
 
         # Renumber only in full-rewrite mode (targeted preserves basenames).
         if not targeted_mode:
             self._renumber_action_files(actions_dir)
 
+        return True
+
+    # ── 2b-parallel. Fan-out one LLM agent per subtask ────────────────
+    def _run_2b_parallel(
+        self,
+        entries: list[dict],
+        model: str,
+        spec_content: str,
+        wd: str,
+        issues: list[dict] | None,
+    ) -> bool:
+        """
+        Write multiple action files concurrently, one LLM agent each.
+        Only used for initial creation (non-targeted). Each agent writes
+        a distinct target file, so no write conflicts. Logs may interleave
+        across agents — that's acceptable, the [id] prefix on each line
+        (from self.log inside _new_step2b_write_single via run_loop) keeps
+        them traceable.
+        """
+        if not entries:
+            return True
+        if len(entries) == 1:
+            # Single entry → no point spinning up a pool.
+            entry = entries[0]
+            label = str(entry.get("id") or "?")
+            self.log(f"─── 2b Write {label} ───")
+            return self._new_step2b_write_single(
+                model, entry, spec_content, wd, issues
+            )
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        max_workers = min(len(entries), 4)
+        self.log(
+            f"─── 2b Write {len(entries)} subtasks in parallel "
+            f"(max {max_workers} agents) ───",
+            "info",
+        )
+
+        def _one(entry: dict) -> tuple[str, bool]:
+            label = str(entry.get("id") or "?")
+            ok = False
+            try:
+                ok = self._new_step2b_write_single(
+                    model, entry, spec_content, wd, issues
+                )
+            except Exception as e:
+                self.log(f"[FAIL] 2b {label} raised: {e!r}", "error")
+                ok = False
+            return label, ok
+
+        results: list[tuple[str, bool]] = []
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(_one, e): e for e in entries}
+            for fut in as_completed(futures):
+                results.append(fut.result())
+
+        failed = [lbl for lbl, ok in results if not ok]
+        if failed:
+            self.log(
+                f"[FAIL] Parallel 2b — {len(failed)}/{len(entries)} failed: "
+                f"{', '.join(failed)}",
+                "error",
+            )
+            return False
+        self.log(
+            f"  ✓ Parallel 2b complete: {len(entries)} action file(s) written",
+            "ok",
+        )
         return True
 
     # ── 2a. Outline LLM step ──────────────────────────────────────────
