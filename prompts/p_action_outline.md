@@ -41,7 +41,9 @@ code blocks, no search/replace, just a subtask list.
   so catching it here saves a round-trip.
 - **No "review/analyze/test" subtasks.** Every subtask must produce
   real code changes in project files.
-- **Use sequential ids**: T-001, T-002, T-003 …
+- **Use sequential ids starting from T-001**: T-001, T-002, T-003 …
+  Always start from T-001 for every new outline, regardless of any
+  previous action files on disk.
 - **Ordering matters**: data/state before backend, backend before
   frontend, HTML before JS that binds to it, CSS last.
 - **Do NOT write any other file here** — only `subtasks_outline.json`.

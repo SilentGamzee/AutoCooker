@@ -1317,26 +1317,16 @@ class PlanningPhase(BasePhase):
             self.log(f"  Outline: {len(outline)} subtask(s)", "info")
 
             # Clean up stale action files whose IDs are NOT in the new
-            # outline. Without this, a shrinking replan (e.g. 6 → 2
-            # subtasks) leaves T003.json…T006.json on disk from the
-            # previous run, and _step6_load_subtasks picks them all up
-            # — Coding then executes obsolete subtasks. Preserve files
-            # for subtasks currently marked status='done' so patch-mode
-            # work isn't discarded.
-            outline_ids: set[str] = set()
+            # outline. The fresh outline from 2a is authoritative — any
+            # leftover Txxx.json from a previous run must go, including
+            # ones whose subtask was marked 'done' in a prior pass,
+            # otherwise Coding re-executes obsolete work.
+            keep_ids: set[str] = set()
             for entry in outline:
                 eid = str(entry.get("id") or "").strip()
                 if eid:
-                    outline_ids.add(eid)
-                    outline_ids.add(eid.replace("-", ""))  # T-001 and T001
-            done_ids: set[str] = set()
-            for st in self.task.subtasks:
-                if st.get("status") == "done":
-                    sid = str(st.get("id") or "").strip()
-                    if sid:
-                        done_ids.add(sid)
-                        done_ids.add(sid.replace("-", ""))
-            keep_ids = outline_ids | done_ids
+                    keep_ids.add(eid)
+                    keep_ids.add(eid.replace("-", ""))  # T-001 and T001
             removed = []
             for fname in list(os.listdir(actions_dir)):
                 m = re.match(r"(T\d{3})\.json$", fname)
@@ -1589,7 +1579,26 @@ class PlanningPhase(BasePhase):
         try:
             with open(outline_path, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
-            return True, list(data.get("subtasks") or [])
+            subs = list(data.get("subtasks") or [])
+            # Force sequential numbering T-001, T-002, ... The LLM sometimes
+            # continues numbering from previous runs (e.g. emits T-003 as
+            # the first entry). Authoritative reassignment keeps action
+            # files and coding consistent.
+            renumbered = False
+            for i, s in enumerate(subs):
+                want = f"T-{i + 1:03d}"
+                if str(s.get("id") or "") != want:
+                    s["id"] = want
+                    renumbered = True
+            if renumbered:
+                data["subtasks"] = subs
+                with open(outline_path, "w", encoding="utf-8") as fh:
+                    json.dump(data, fh, ensure_ascii=False, indent=2)
+                self.log(
+                    "  Renumbered outline subtasks to sequential T-001..",
+                    "info",
+                )
+            return True, subs
         except Exception:
             return False, []
 
