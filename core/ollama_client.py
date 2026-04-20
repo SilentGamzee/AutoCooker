@@ -736,13 +736,20 @@ class OllamaClient:
                 "AUTOCOOKER_GEMINI_MAX_OUTPUT", "16384"))
         except ValueError:
             max_out = 16384
-        gen_cfg: dict = {"maxOutputTokens": max_out}
         model_l = (model or "").lower()
         supports_thinking = (
             "gemini-2.5" in model_l
             or "gemini-3" in model_l
             or "thinking" in model_l
         )
+        # For models that accept thinkingConfig we cap thoughts explicitly
+        # and leave maxOutputTokens at the configured value. For models
+        # that reject thinkingConfig (gemma-4, older Gemini) thoughts eat
+        # the same budget as visible output — double maxOutputTokens so
+        # the real answer still fits after the uncontrolled thinking
+        # phase.
+        effective_max = max_out if supports_thinking else max_out * 2
+        gen_cfg: dict = {"maxOutputTokens": effective_max}
         if supports_thinking:
             gen_cfg["thinkingConfig"] = {
                 "thinkingBudget": think_budget,
