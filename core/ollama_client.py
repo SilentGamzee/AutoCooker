@@ -550,6 +550,24 @@ class OllamaClient:
                 "EMPTY RESULT — raw stream body follows:\n" + raw_all[:8000],
                 "error",
             )
+            # An empty response is never useful to the caller: either the
+            # stream was truncated mid-thought (no finishReason arrived) or
+            # the model emitted only private "thought" parts. Surface this
+            # as a retriable ReadTimeout so the outer loop retries instead
+            # of handing back content="" (which downstream treats as a
+            # valid silent response and breaks the phase).
+            saw_finish = finish_reason != "stop" or any(
+                '"finishReason"' in e for e in raw_events
+            )
+            detail = (
+                "stream ended with only thought parts and no finishReason"
+                if not saw_finish
+                else "server closed stream with no text/tool_calls content"
+            )
+            raise requests.exceptions.ReadTimeout(
+                f"[Gemini] empty response after {elapsed:.1f}s "
+                f"({_total_bytes}B, {len(raw_events)} events) — {detail}"
+            )
 
         if log_fn:
             log_fn(
