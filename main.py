@@ -90,10 +90,10 @@ OLLAMA    = OllamaClient()
 
 # Pipeline guard — prevents concurrent runs without holding a lock
 # during the entire pipeline execution (which blocked eel's event loop).
-# _PIPELINE_GATE is only held for the brief check in start_task/restart_task.
-# _PIPELINE_RUNNING is the actual "is something running" flag.
-_PIPELINE_GATE    = threading.Lock()   # held only during start/stop check
-_PIPELINE_RUNNING = False              # True while a pipeline thread is active
+# _PIPELINE_GATE is held only during the brief check in start_task/restart_task.
+_PIPELINE_GATE     = threading.Lock()
+MAX_CONCURRENT_TASKS = 3                # Maximum number of concurrent tasks
+_RUNNING_TASKS     = set()              # Set of task IDs currently running
 
 # ── Auto-restore last working directory ───────────────────────────
 # Load settings first so recent_dirs and last_working_dir are available
@@ -394,15 +394,15 @@ def start_task(task_id: str) -> dict:
         return {"ok": False, "error": "Task not found"}
 
     # Atomically check + mark running so no two pipelines start simultaneously.
-    # _PIPELINE_GATE is held only for this brief check — NOT for the whole run.
-    global _PIPELINE_RUNNING
+    # _PIPELINE_GATE is held only during the brief check in start_task/restart_task.
     with _PIPELINE_GATE:
-        if _PIPELINE_RUNNING:
-            return {"ok": False, "error": "Another task is already running. Abort it first."}
-        _PIPELINE_RUNNING = True
+        if len(_RUNNING_TASKS) >= MAX_CONCURRENT_TASKS:
+            return {"ok": False, "error": f"Maximum number of concurrent tasks ({MAX_CONCURRENT_TASKS}) reached."}
+        if task_id in _RUNNING_TASKS:
+            return {"ok": False, "error": "Task is already running. Abort it first."}
+        _RUNNING_TASKS.add(task_id)
 
     def run():
-        global _PIPELINE_RUNNING
         try:
             _run_pipeline()
         except Exception:
@@ -410,7 +410,7 @@ def start_task(task_id: str) -> dict:
             traceback.print_exc()
         finally:
             with _PIPELINE_GATE:
-                _PIPELINE_RUNNING = False
+                _RUNNING_TASKS.discard(task_id)
 
     def _run_pipeline():
         STATE.active_task_id = task_id
@@ -843,8 +843,9 @@ def restart_task(task_id: str) -> dict:
     """
     import shutil as _shutil
 
-    if _PIPELINE_RUNNING:
-        return {"ok": False, "error": "A pipeline is running — abort it first"}
+    with _PIPELINE_GATE:
+        if task_id in _RUNNING_TASKS:
+            return {"ok": False, "error": "A pipeline is running — abort it first"}
 
     task = STATE.get_task(task_id)
     if not task:
@@ -1136,7 +1137,7 @@ def on_eel_close(route, websockets):
         which our except SystemExit block catches and waits for completion
     """
     if not websockets:
-        if not _PIPELINE_RUNNING:
+        if not _RUNNING_TASKS:
             import os as _os
             print("[EEL] Browser closed, no pipeline running — exiting.", flush=True)
             _os._exit(0)
@@ -1273,17 +1274,17 @@ if __name__ == "__main__":
         # eel calls sys.exit() after the close_callback returns.
         # If a pipeline is running, wait for it to complete before exiting
         # so the task is not killed mid-execution.
-        if _PIPELINE_RUNNING:
+        if _RUNNING_TASKS:
             print(
-                "\n[EEL] Browser disconnected — pipeline is still running in background.\n"
-                "       Waiting for task to complete before exiting…\n"
+                "\n[EEL] Browser disconnected — pipelines are still running in background.\n"
+                "       Waiting for all tasks to complete before exiting…\n"
                 "       (Press Ctrl+C to force-quit and lose task progress)",
                 flush=True,
             )
             try:
-                while _PIPELINE_RUNNING:
+                while _RUNNING_TASKS:
                     time.sleep(2)
-                print("[EEL] Pipeline finished — exiting cleanly.", flush=True)
+                print("[EEL] All pipelines finished — exiting cleanly.", flush=True)
             except KeyboardInterrupt:
                 print("\n[EEL] Force-quit requested.", flush=True)
         else:
