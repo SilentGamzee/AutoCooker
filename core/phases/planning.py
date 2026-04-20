@@ -1316,6 +1316,50 @@ class PlanningPhase(BasePhase):
                 return False
             self.log(f"  Outline: {len(outline)} subtask(s)", "info")
 
+            # Clean up stale action files whose IDs are NOT in the new
+            # outline. Without this, a shrinking replan (e.g. 6 → 2
+            # subtasks) leaves T003.json…T006.json on disk from the
+            # previous run, and _step6_load_subtasks picks them all up
+            # — Coding then executes obsolete subtasks. Preserve files
+            # for subtasks currently marked status='done' so patch-mode
+            # work isn't discarded.
+            outline_ids: set[str] = set()
+            for entry in outline:
+                eid = str(entry.get("id") or "").strip()
+                if eid:
+                    outline_ids.add(eid)
+                    outline_ids.add(eid.replace("-", ""))  # T-001 and T001
+            done_ids: set[str] = set()
+            for st in self.task.subtasks:
+                if st.get("status") == "done":
+                    sid = str(st.get("id") or "").strip()
+                    if sid:
+                        done_ids.add(sid)
+                        done_ids.add(sid.replace("-", ""))
+            keep_ids = outline_ids | done_ids
+            removed = []
+            for fname in list(os.listdir(actions_dir)):
+                m = re.match(r"(T\d{3})\.json$", fname)
+                if not m:
+                    continue
+                raw = m.group(1)                    # "T001"
+                canonical = f"T-{raw[1:]}"          # "T-001"
+                if raw not in keep_ids and canonical not in keep_ids:
+                    try:
+                        os.remove(os.path.join(actions_dir, fname))
+                        removed.append(fname)
+                    except OSError as e:
+                        self.log(
+                            f"  [WARN] Failed to remove stale {fname}: {e}",
+                            "warn",
+                        )
+            if removed:
+                self.log(
+                    f"  Removed {len(removed)} stale action file(s) not in "
+                    f"new outline: {', '.join(removed)}",
+                    "info",
+                )
+
         # ── 2b. Write each action file ─────────────────────────────
         # First-pass (non-targeted): run agents in parallel to cut wall
         # time — each subtask has a distinct target file so there are no
