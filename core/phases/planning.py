@@ -1644,7 +1644,7 @@ class PlanningPhase(BasePhase):
         return self.run_loop(
             f"2b Write {raw_id}", "p_action_writer.md",
             PLANNING_TOOLS, executor, msg, validate, model,
-            reconstruct_after=2, max_outer_iterations=4, max_tool_rounds=15,
+            reconstruct_after=2, max_outer_iterations=10, max_tool_rounds=15,
         )
 
     # ── 2c. Completeness check ────────────────────────────────────────
