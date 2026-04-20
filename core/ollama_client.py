@@ -210,7 +210,7 @@ class OllamaClient:
         model = json_payload.get("model", "gemini-2.0-flash")
         messages = json_payload.get("messages", [])
         tools = json_payload.get("tools", [])
-        gemini_req = self._openai_to_gemini(messages, tools)
+        gemini_req = self._openai_to_gemini(messages, tools, model=model)
 
         parsed = _up(self.base_url)
         host = parsed.netloc
@@ -598,7 +598,7 @@ class OllamaClient:
         messages = json_payload.get("messages", [])
         tools = json_payload.get("tools", [])
 
-        gemini_req = self._openai_to_gemini(messages, tools)
+        gemini_req = self._openai_to_gemini(messages, tools, model=model)
 
         # Host from base_url (strip any path)
         parsed = _up(self.base_url)
@@ -640,7 +640,7 @@ class OllamaClient:
         finally:
             conn.close()
 
-    def _openai_to_gemini(self, messages: list, tools: list) -> dict:
+    def _openai_to_gemini(self, messages: list, tools: list, model: str = "") -> dict:
         """Translate OpenAI messages + tools to Gemini native request format."""
         import json as _json
 
@@ -719,14 +719,12 @@ class OllamaClient:
             req["tools"] = [{"functionDeclarations": fn_decls}]
             req["toolConfig"] = {"functionCallingConfig": {"mode": "AUTO"}}
 
-        # Cap the thinking budget. Without this, gemma-4 / Gemini 2.5
-        # thinking-mode models can burn the ENTIRE maxOutputTokens on
-        # internal `"thought": true` parts and then return
-        # finishReason=MAX_TOKENS with 0 visible text/tool_calls — seen
-        # repeatedly in task_013 (1367 SSE events, 530s, all thoughts).
-        # Env overrides:
+        # Cap the output budget. Env overrides:
         #   AUTOCOOKER_GEMINI_THINKING_BUDGET  (int tokens, default 4096)
         #   AUTOCOOKER_GEMINI_MAX_OUTPUT       (int tokens, default 16384)
+        # thinkingConfig is Gemini-2.5-only; gemma-4 and older Gemini
+        # models reject it with "Thinking budget is not supported for
+        # this model" (400 INVALID_ARGUMENT). Gate on model name.
         import os as _os
         try:
             think_budget = int(_os.environ.get(
@@ -738,13 +736,19 @@ class OllamaClient:
                 "AUTOCOOKER_GEMINI_MAX_OUTPUT", "16384"))
         except ValueError:
             max_out = 16384
-        req["generationConfig"] = {
-            "maxOutputTokens": max_out,
-            "thinkingConfig": {
+        gen_cfg: dict = {"maxOutputTokens": max_out}
+        model_l = (model or "").lower()
+        supports_thinking = (
+            "gemini-2.5" in model_l
+            or "gemini-3" in model_l
+            or "thinking" in model_l
+        )
+        if supports_thinking:
+            gen_cfg["thinkingConfig"] = {
                 "thinkingBudget": think_budget,
                 "includeThoughts": False,
-            },
-        }
+            }
+        req["generationConfig"] = gen_cfg
         return req
 
     def _gemini_to_openai(self, gemini_resp: dict) -> dict:
