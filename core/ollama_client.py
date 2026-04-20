@@ -718,6 +718,33 @@ class OllamaClient:
                 fn_decls.append(decl)
             req["tools"] = [{"functionDeclarations": fn_decls}]
             req["toolConfig"] = {"functionCallingConfig": {"mode": "AUTO"}}
+
+        # Cap the thinking budget. Without this, gemma-4 / Gemini 2.5
+        # thinking-mode models can burn the ENTIRE maxOutputTokens on
+        # internal `"thought": true` parts and then return
+        # finishReason=MAX_TOKENS with 0 visible text/tool_calls — seen
+        # repeatedly in task_013 (1367 SSE events, 530s, all thoughts).
+        # Env overrides:
+        #   AUTOCOOKER_GEMINI_THINKING_BUDGET  (int tokens, default 4096)
+        #   AUTOCOOKER_GEMINI_MAX_OUTPUT       (int tokens, default 16384)
+        import os as _os
+        try:
+            think_budget = int(_os.environ.get(
+                "AUTOCOOKER_GEMINI_THINKING_BUDGET", "4096"))
+        except ValueError:
+            think_budget = 4096
+        try:
+            max_out = int(_os.environ.get(
+                "AUTOCOOKER_GEMINI_MAX_OUTPUT", "16384"))
+        except ValueError:
+            max_out = 16384
+        req["generationConfig"] = {
+            "maxOutputTokens": max_out,
+            "thinkingConfig": {
+                "thinkingBudget": think_budget,
+                "includeThoughts": False,
+            },
+        }
         return req
 
     def _gemini_to_openai(self, gemini_resp: dict) -> dict:
