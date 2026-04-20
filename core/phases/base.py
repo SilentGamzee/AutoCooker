@@ -1007,6 +1007,15 @@ Token count: {token_count} / {config['max_total_tokens']}
                 
                 # Логирование после успешного завершения
                 if _DEBUG: print(f"[RUN_LOOP] chat_with_tools completed: tool_calls_made={tool_calls_made}, final_text_len={len(final_text)}", flush=True)
+
+                # Stash the final assistant text on the executor so phase
+                # code can fall back to parsing it when the model refused
+                # to call the expected tool (e.g. QA writing the verdict
+                # as prose instead of calling submit_qa_verdict).
+                try:
+                    executor.last_assistant_text = final_text or ""
+                except Exception:
+                    pass
                 
             except RuntimeError as e:
                 if _DEBUG: print(f"[RUN_LOOP] RuntimeError in chat_with_tools: {type(e).__name__}: {e}", flush=True)
@@ -1153,13 +1162,24 @@ Token count: {token_count} / {config['max_total_tokens']}
                         )
 
                 if tool_calls_made == 0:
+                    # If the validator said "<tool_name> not yet called",
+                    # name that tool in the retry message. Default to
+                    # write_file only when no specific tool is expected
+                    # (matches the historical writer-phase behaviour).
+                    import re as _re_tool
+                    m_tool = _re_tool.search(
+                        r"\b([a-z_][a-z0-9_]*)\s+not\s+yet\s+called\b", reason or ""
+                    )
+                    required_tool = m_tool.group(1) if m_tool else "write_file"
                     retry_msg += (
                         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                         "❌ CRITICAL ERROR: YOU DID NOT CALL ANY TOOLS\n"
                         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                        "You responded with TEXT ONLY. The file was NOT created.\n"
+                        "You responded with TEXT ONLY. The step cannot complete.\n"
                         "Describing what you would do does NOTHING.\n\n"
-                        "YOU MUST CALL write_file IN YOUR VERY NEXT RESPONSE.\n\n"
+                        f"YOU MUST CALL {required_tool} IN YOUR VERY NEXT RESPONSE.\n"
+                        "Put the verdict/summary/result into the tool ARGUMENTS — "
+                        "do NOT write it as prose.\n\n"
                         "NO TEXT DESCRIPTIONS. ONLY TOOL CALLS.\n"
                         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
                     )

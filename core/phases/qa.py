@@ -2,6 +2,7 @@
 from __future__ import annotations
 import os
 import subprocess
+from typing import Optional
 
 from core.state import AppState, KanbanTask
 from core.tools import ToolExecutor, QA_REVIEWER_TOOLS  # Only reviewer tools, no fixer!
@@ -231,12 +232,86 @@ class QAPhase(BasePhase):
             max_outer_iterations=MAX_REVIEWER_ITERATIONS,
         )
 
+        # Fallback: some models (observed repeatedly with gemma-4-*) write
+        # the verdict as prose instead of calling submit_qa_verdict. If
+        # the run_loop exhausted iterations without a tool verdict, try
+        # to parse a clear PASS/FAIL out of the last assistant message so
+        # the task doesn't die for a format reason after real QA work.
+        if executor.qa_verdict is None:
+            text = getattr(executor, "last_assistant_text", "") or ""
+            parsed = self._parse_verdict_from_text(text)
+            if parsed is not None:
+                p_verdict, p_issues, p_summary = parsed
+                executor.qa_verdict = p_verdict
+                executor.qa_verdict_issues = p_issues
+                executor.qa_verdict_summary = p_summary
+                self.log(
+                    f"  [FALLBACK] Parsed verdict {p_verdict} from assistant "
+                    f"prose — submit_qa_verdict was never called.",
+                    "warn",
+                )
+
         verdict = executor.qa_verdict or "FAIL"
         issues  = executor.qa_verdict_issues or []
         summary = executor.qa_verdict_summary or "(no summary)"
         for issue in issues:
             self.log(f"  ✗ {issue}", "warn")
         return verdict, issues, summary
+
+    def _parse_verdict_from_text(
+        self, text: str
+    ) -> Optional[tuple[str, list[str], str]]:
+        """Best-effort extraction of a QA verdict from free-form text.
+
+        Returns (verdict, issues, summary) or None if no verdict is found.
+        Only triggers on unambiguous markers so we never invent a PASS.
+        """
+        if not text or len(text) < 2:
+            return None
+        import re as _re
+        # Strip markdown emphasis so markers like **VERDICT: FAIL** match.
+        t = _re.sub(r"\*+", " ", text).strip()
+
+        # Look for explicit verdict markers first — most reliable.
+        m = _re.search(
+            r"(?:^|\n|\s)(?:verdict|result|outcome)\s*[:\-=]\s*"
+            r"\**\s*(PASS(?:ED)?|FAIL(?:ED)?)\b",
+            t, _re.IGNORECASE,
+        )
+        if not m:
+            # Fallback: a line that IS just the verdict.
+            m = _re.search(
+                r"(?:^|\n)\s*\**\s*(PASS(?:ED)?|FAIL(?:ED)?)\s*\**\s*(?:\n|$)",
+                t, _re.IGNORECASE,
+            )
+        if not m:
+            return None
+
+        raw = m.group(1).upper()
+        verdict = "PASS" if raw.startswith("PASS") else "FAIL"
+
+        # Summary: first non-empty line that isn't the verdict marker.
+        summary_lines = [
+            ln.strip(" *#-\t") for ln in t.splitlines()
+            if ln.strip() and not _re.fullmatch(
+                r"\**\s*(PASS|FAIL|PASSED|FAILED)\s*\**", ln.strip(), _re.IGNORECASE
+            )
+        ]
+        summary = (summary_lines[0] if summary_lines else "")[:300]
+
+        # Issues: only populated on FAIL. Heuristic: bullet-like lines.
+        issues: list[str] = []
+        if verdict == "FAIL":
+            for ln in t.splitlines():
+                s = ln.strip()
+                if _re.match(r"^[\-\*•]\s+", s) or _re.match(
+                    r"^\s*\d+[.)]\s+", s
+                ):
+                    issues.append(_re.sub(r"^[\-\*•\d.)\s]+", "", s)[:300])
+                if len(issues) >= 20:
+                    break
+
+        return verdict, issues, summary or ("parsed from prose" if verdict == "PASS" else "issues parsed from prose")
 
     # ── Fix ───────────────────────────────────────────────────────────
     # ── Scope builder ─────────────────────────────────────────────────
