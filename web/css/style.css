@@ -1629,48 +1629,49 @@ html, body {
   display: flex;
   align-items: center;
   gap: 12px;
-  margin: 12px 0;
-  padding: 12px;
+  margin: 8px 0;
+  padding: 6px 12px;
   background: rgba(255, 255, 255, 0.03);
-  border-radius: 8px;
+  border-radius: 6px;
   border: 1px solid rgba(255, 255, 255, 0.06);
+  min-height: 48px;
 }
 
 .phase-badge {
   display: flex;
   flex-direction: column;
   align-items: flex-start;
-  gap: 4px;
-  padding: 8px 12px;
+  gap: 2px;
+  padding: 4px 10px;
   background: rgba(255, 255, 255, 0.05);
-  border-radius: 8px;
-  border: 2px solid transparent;
+  border-radius: 6px;
+  border: 1px solid transparent;
   transition: all 0.3s;
-  min-width: 130px;
+  min-width: 120px;
 }
 
 .phase-step {
-  font-size: 10px;
+  font-size: 9px;
   background: rgba(255, 255, 255, 0.1);
   color: var(--text3);
-  padding: 1px 6px;
-  border-radius: 4px;
+  padding: 0 4px;
+  border-radius: 3px;
   font-family: var(--mono);
 }
 
 .phase-icon {
-  font-size: 16px;
+  font-size: 14px;
 }
 
 .phase-name {
   font-weight: 600;
   color: var(--text);
-  font-size: 13px;
+  font-size: 12px;
   line-height: 1.2;
 }
 
 .phase-status {
-  font-size: 12px;
+  font-size: 11px;
   color: var(--text2);
 }
 

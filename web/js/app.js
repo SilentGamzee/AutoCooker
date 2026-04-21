@@ -80,34 +80,33 @@ function task_log_progress(taskId, logEntry) {
 
 eel.expose(task_step_changed);
 function task_step_changed(taskId, phase, step, info) {
+  const isDone = step === 'Done' || step === 'Completed' || !step;
+  const infoText = info ? ` (${info})` : '';
+
   if (activeTaskId === taskId) {
     const phaseInfoEl = document.getElementById('mt-phase-info');
-    const isDone = step === 'Done' || step === 'Completed' || !step;
-
     if (phaseInfoEl) {
       if (isDone) {
         phaseInfoEl.textContent = '';
         phaseInfoEl.classList.add('hidden');
       } else {
-        const infoText = info ? ` (${info})` : '';
         phaseInfoEl.textContent = `${step}${infoText}`;
         phaseInfoEl.classList.remove('hidden');
       }
     }
+  }
 
-    // Update status bar phase steps
-    document.querySelectorAll('.phase-step').forEach(el => {
-      el.textContent = '';
-    });
+  // Update status bar phase steps
+  document.querySelectorAll('.phase-step').forEach(el => {
+    el.textContent = '';
+  });
 
-    const phaseStepEl = document.querySelector(`.phase-badge[data-phase="${phase}"] .phase-step`);
-    if (phaseStepEl) {
-      if (isDone) {
-        phaseStepEl.textContent = '';
-      } else {
-        const infoText = info ? ` (${info})` : '';
-        phaseStepEl.textContent = `${step}${infoText}`;
-      }
+  const phaseStepEl = document.querySelector(`.phase-badge[data-phase="${phase}"] .phase-step`);
+  if (phaseStepEl) {
+    if (isDone) {
+      phaseStepEl.textContent = '';
+    } else {
+      phaseStepEl.textContent = `${step}${infoText}`;
     }
   }
 }
@@ -491,11 +490,26 @@ function populateModal(task) {
   document.getElementById('mt-title').textContent = task.title;
   document.getElementById('mt-slug').textContent  = task.id;
 
-  // Clear phase info
+  // Phase Info
   const phaseInfoEl = document.getElementById('mt-phase-info');
   if (phaseInfoEl) {
-    phaseInfoEl.textContent = '';
-    phaseInfoEl.classList.add('hidden');
+    const isDone = task.step === 'Done' || task.step === 'Completed' || !task.step;
+    if (isDone) {
+      phaseInfoEl.textContent = '';
+      phaseInfoEl.classList.add('hidden');
+    } else if (task.step) {
+      let infoText = '';
+      if (task.info) {
+        infoText += ` (${task.info})`;
+      } else if (task.current_loop && task.max_loops) {
+        infoText += ` (Loop ${task.current_loop}/${task.max_loops})`;
+      }
+      phaseInfoEl.textContent = `${task.step}${infoText}`;
+      phaseInfoEl.classList.remove('hidden');
+    } else {
+      phaseInfoEl.textContent = '';
+      phaseInfoEl.classList.add('hidden');
+    }
   }
 
   // Column tag
