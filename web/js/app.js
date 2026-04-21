@@ -82,10 +82,17 @@ eel.expose(task_step_changed);
 function task_step_changed(taskId, phase, step, info) {
   if (activeTaskId === taskId) {
     const phaseInfoEl = document.getElementById('mt-phase-info');
+    const isDone = step === 'Done' || step === 'Completed' || !step;
+
     if (phaseInfoEl) {
-      const infoText = info ? ` (${info})` : '';
-      phaseInfoEl.textContent = `${step}${infoText}`;
-      phaseInfoEl.classList.remove('hidden');
+      if (isDone) {
+        phaseInfoEl.textContent = '';
+        phaseInfoEl.classList.add('hidden');
+      } else {
+        const infoText = info ? ` (${info})` : '';
+        phaseInfoEl.textContent = `${step}${infoText}`;
+        phaseInfoEl.classList.remove('hidden');
+      }
     }
 
     // Update status bar phase steps
@@ -95,8 +102,12 @@ function task_step_changed(taskId, phase, step, info) {
 
     const phaseStepEl = document.querySelector(`.phase-badge[data-phase="${phase}"] .phase-step`);
     if (phaseStepEl) {
-      const infoText = info ? ` (${info})` : '';
-      phaseStepEl.textContent = `${step}${infoText}`;
+      if (isDone) {
+        phaseStepEl.textContent = '';
+      } else {
+        const infoText = info ? ` (${info})` : '';
+        phaseStepEl.textContent = `${step}${infoText}`;
+      }
     }
   }
 }
@@ -479,6 +490,13 @@ function populateModal(task) {
   // Header
   document.getElementById('mt-title').textContent = task.title;
   document.getElementById('mt-slug').textContent  = task.id;
+
+  // Clear phase info
+  const phaseInfoEl = document.getElementById('mt-phase-info');
+  if (phaseInfoEl) {
+    phaseInfoEl.textContent = '';
+    phaseInfoEl.classList.add('hidden');
+  }
 
   // Column tag
   const colLabels = {
