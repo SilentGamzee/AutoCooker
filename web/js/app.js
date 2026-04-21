@@ -87,6 +87,17 @@ function task_step_changed(taskId, phase, step, info) {
       phaseInfoEl.textContent = `${step}${infoText}`;
       phaseInfoEl.classList.remove('hidden');
     }
+
+    // Update status bar phase steps
+    document.querySelectorAll('.phase-step').forEach(el => {
+      el.textContent = '';
+    });
+
+    const phaseStepEl = document.querySelector(`.phase-badge[data-phase="${phase}"] .phase-step`);
+    if (phaseStepEl) {
+      const infoText = info ? ` (${info})` : '';
+      phaseStepEl.textContent = `${step}${infoText}`;
+    }
   }
 }
 
