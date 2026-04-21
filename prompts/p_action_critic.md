@@ -52,18 +52,26 @@ cheaper than fabricating one.
 
 If UI genuinely changes, evaluate against these rules:
 
-- **Hierarchy**: one clear primary action per screen; visual weight
-  matches functional importance. Competing bold elements → issue.
+- **Hierarchy & Flow**: one clear primary action per screen; visual
+  weight matches functional importance. If multiple data points are
+  added to one area (e.g. status + label + info), ensure they have
+  clear alignment and visual separation.
 - **Consistency**: reused component must look/behave identically to
   its existing instances; do not introduce a third variation of an
   already-existing pattern.
 - **Tokens, not hardcoded values**: colors, spacing, radii, font
   sizes must reference existing design-system tokens / CSS variables
-  already in the project. Raw hex, raw px values where a token
-  exists → issue.
-- **States covered**: new interactive elements need hover/focus/
-  disabled styling; new async surfaces need empty + loading + error
-  states. Missing → issue.
+  (e.g. `var(--bg3)`, `var(--r8)`) already in the project. Raw hex,
+  raw px, or raw `rgba` values where a token exists or could be
+  reused → issue.
+- **Layout Stability (Anti-Jitter)**: do new dynamic elements have
+  a strategy for varying content lengths? (e.g. `min-width`,
+  `text-overflow: ellipsis`, or `flex-shrink: 0`). Elements that
+  cause surrounding UI to "jump" when text is updated → issue.
+- **States & Transitions**: new interactive elements need hover/focus/
+  disabled styling; dynamic surfaces (that update via JS/events)
+  need explicit handling for empty + loading + error + **done**
+  states. (e.g. "hide info text when phase is complete").
 - **Responsive**: layout must hold at mobile width, not just desktop.
   Fixed widths, overflow, tiny touch targets → issue.
 - **Accessibility basics**: focusable controls are `<button>`/`<a>`,
@@ -71,9 +79,10 @@ If UI genuinely changes, evaluate against these rules:
   broken.
 
 Severity:
-- `critical` → breaks hierarchy, consistency, or responsive usability
-  (e.g. two primary buttons, hardcoded color clashing with theme,
-  element unreachable on mobile).
+- `critical` → breaks hierarchy, consistency, responsive usability,
+  or layout stability (e.g. two primary buttons, hardcoded color
+  clashing with theme, element causing UI jitter, unreachable on
+  mobile).
 - `minor` → polish gaps (missing hover state, slight spacing
   inconsistency); verdict can still be PASS.
 
@@ -168,6 +177,21 @@ If you can't find any coverage gap AND ordering looks sane AND
     }
   ],
   "summary": "Hierarchy broken by duplicate primary action."
+}
+```
+
+**FAIL — UI/UX stability:**
+```json
+{
+  "verdict": "FAIL",
+  "issues": [
+    {
+      "severity": "critical",
+      "file": "T003.json",
+      "description": "T003 adds dynamic phase-status text but uses a standard flex container without min-width or overflow control. This will cause the entire badge to shift size and 'jitter' when the status text changes. Add a min-width to the badge or use text-overflow: ellipsis."
+    }
+  ],
+  "summary": "Layout instability due to missing jitter prevention on dynamic text."
 }
 ```
 
