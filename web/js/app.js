@@ -62,7 +62,7 @@ function task_log_progress(taskId, logEntry) {
     let row = bucket.querySelector(sel);
     if (!row) {
       row = document.createElement('div');
-      row.className = `log-entry log-progress type-${type}`;
+      row.className = `log-entry log-progress type-${getLogEntryClass(type)}`;
       row.dataset.progressId = pid;
       const tsEl = document.createElement('div');
       tsEl.className = 'log-ts';
@@ -80,33 +80,34 @@ function task_log_progress(taskId, logEntry) {
 
 eel.expose(task_step_changed);
 function task_step_changed(taskId, phase, step, info) {
-  const isDone = step === 'Done' || step === 'Completed' || !step;
-  const infoText = info ? ` (${info})` : '';
-
   if (activeTaskId === taskId) {
     const phaseInfoEl = document.getElementById('mt-phase-info');
+    const isDone = step === 'Done' || step === 'Completed' || !step;
+
     if (phaseInfoEl) {
       if (isDone) {
         phaseInfoEl.textContent = '';
         phaseInfoEl.classList.add('hidden');
       } else {
+        const infoText = info ? ` (${info})` : '';
         phaseInfoEl.textContent = `${step}${infoText}`;
         phaseInfoEl.classList.remove('hidden');
       }
     }
-  }
 
-  // Update status bar phase steps
-  document.querySelectorAll('.phase-step').forEach(el => {
-    el.textContent = '';
-  });
+    // Update status bar phase steps
+    document.querySelectorAll('.phase-step').forEach(el => {
+      el.textContent = '';
+    });
 
-  const phaseStepEl = document.querySelector(`.phase-badge[data-phase="${phase}"] .phase-step`);
-  if (phaseStepEl) {
-    if (isDone) {
-      phaseStepEl.textContent = '';
-    } else {
-      phaseStepEl.textContent = `${step}${infoText}`;
+    const phaseStepEl = document.querySelector(`.phase-badge[data-phase="${phase}"] .phase-step`);
+    if (phaseStepEl) {
+      if (isDone) {
+        phaseStepEl.textContent = '';
+      } else {
+        const infoText = info ? ` (${info})` : '';
+        phaseStepEl.textContent = `${step}${infoText}`;
+      }
     }
   }
 }
@@ -490,26 +491,11 @@ function populateModal(task) {
   document.getElementById('mt-title').textContent = task.title;
   document.getElementById('mt-slug').textContent  = task.id;
 
-  // Phase Info
+  // Clear phase info
   const phaseInfoEl = document.getElementById('mt-phase-info');
   if (phaseInfoEl) {
-    const isDone = task.step === 'Done' || task.step === 'Completed' || !task.step;
-    if (isDone) {
-      phaseInfoEl.textContent = '';
-      phaseInfoEl.classList.add('hidden');
-    } else if (task.step) {
-      let infoText = '';
-      if (task.info) {
-        infoText += ` (${task.info})`;
-      } else if (task.current_loop && task.max_loops) {
-        infoText += ` (Loop ${task.current_loop}/${task.max_loops})`;
-      }
-      phaseInfoEl.textContent = `${task.step}${infoText}`;
-      phaseInfoEl.classList.remove('hidden');
-    } else {
-      phaseInfoEl.textContent = '';
-      phaseInfoEl.classList.add('hidden');
-    }
+    phaseInfoEl.textContent = '';
+    phaseInfoEl.classList.add('hidden');
   }
 
   // Column tag
@@ -843,12 +829,40 @@ function switchLogPhase(btn, phase) {
   scrollLogsToBottom();
 }
 
+function getLogEntryClass(type) {
+  switch (type) {
+    case 'write_file':
+    case 'modify_file':
+      return 'write';
+    case 'list_directory':
+      return 'list';
+    case 'read_file':
+      return 'read';
+    case 'tool_result':
+      return 'tool';
+    case 'success':
+    case 'confirmation':
+      return 'success';
+    case 'error':
+      return 'error';
+    case 'warning':
+      return 'warning';
+    case 'ollama':
+      return 'ollama';
+    default:
+      return 'info';
+  }
+}
+
 function buildLogEntry(entry, container) {
   const type = entry.type || 'info';
   const msg  = entry.msg  || '';
+  const typeClass = getLogEntryClass(type);
 
   // Collapse long tool_result entries
   if (type === 'tool_result' && msg.length > 120) {
+    const row = document.createElement('div');
+    row.className = `log-entry type-${typeClass}`;
     const toggle = document.createElement('div');
     toggle.className = 'log-result-toggle';
     const body = document.createElement('div');
@@ -859,13 +873,14 @@ function buildLogEntry(entry, container) {
       const open = body.classList.toggle('open');
       toggle.querySelector('span').textContent = open ? '▾ Hide output' : '▸ Show output';
     };
-    container.appendChild(toggle);
-    container.appendChild(body);
+    row.appendChild(toggle);
+    row.appendChild(body);
+    container.appendChild(row);
     return;
   }
 
   const row = document.createElement('div');
-  row.className = `log-entry type-${type}`;
+  row.className = `log-entry type-${typeClass}`;
 
   const ts = document.createElement('div');
   ts.className = 'log-ts';

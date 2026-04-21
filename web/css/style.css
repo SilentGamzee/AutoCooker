@@ -1178,6 +1178,32 @@ html, body {
 }
 .log-phase-bucket.visible { display: flex; }
 
+/* ── Log entries ────────────────────────────────────── */
+.log-entry {
+  display: flex;
+  gap: 8px;
+  padding: 2px 0;
+  font-family: var(--mono);
+  font-size: 11px;
+}
+.log-ts {
+  color: var(--text3);
+  flex-shrink: 0;
+  min-width: 75px;
+}
+.log-msg {
+  flex: 1;
+  word-break: break-all;
+}
+.log-entry.type-write { color: var(--accent); }
+.log-entry.type-list { color: var(--yellow); }
+.log-entry.type-read { color: #60a5fa; }
+.log-entry.type-tool { color: var(--text3); }
+.log-entry.type-success { color: var(--green); }
+.log-entry.type-error { color: var(--red); }
+.log-entry.type-warning { color: #fb923c; }
+.log-entry.type-ollama { color: var(--purple); }
+
 /* ── FILES PANE ──────────────────────────────────────── */
 .files-pane {
   padding: 0 !important;
@@ -1629,49 +1655,48 @@ html, body {
   display: flex;
   align-items: center;
   gap: 12px;
-  margin: 8px 0;
-  padding: 6px 12px;
+  margin: 12px 0;
+  padding: 12px;
   background: rgba(255, 255, 255, 0.03);
-  border-radius: 6px;
+  border-radius: 8px;
   border: 1px solid rgba(255, 255, 255, 0.06);
-  min-height: 48px;
 }
 
 .phase-badge {
   display: flex;
   flex-direction: column;
   align-items: flex-start;
-  gap: 2px;
-  padding: 4px 10px;
+  gap: 4px;
+  padding: 8px 12px;
   background: rgba(255, 255, 255, 0.05);
-  border-radius: 6px;
-  border: 1px solid transparent;
+  border-radius: 8px;
+  border: 2px solid transparent;
   transition: all 0.3s;
-  min-width: 120px;
+  min-width: 130px;
 }
 
 .phase-step {
-  font-size: 9px;
+  font-size: 10px;
   background: rgba(255, 255, 255, 0.1);
   color: var(--text3);
-  padding: 0 4px;
-  border-radius: 3px;
+  padding: 1px 6px;
+  border-radius: 4px;
   font-family: var(--mono);
 }
 
 .phase-icon {
-  font-size: 14px;
+  font-size: 16px;
 }
 
 .phase-name {
   font-weight: 600;
   color: var(--text);
-  font-size: 12px;
+  font-size: 13px;
   line-height: 1.2;
 }
 
 .phase-status {
-  font-size: 11px;
+  font-size: 12px;
   color: var(--text2);
 }
 
