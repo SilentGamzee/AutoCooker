@@ -806,6 +806,32 @@ EVIDENCE: [what code you found or what's missing]
         all_ok     = True
         all_issues: list[str] = []
 
+        # ── Broader task context for scope judgment ───────────────
+        # The flagged class/function often appears in the spec or in
+        # a sibling subtask's implementation_steps. Feeding that
+        # context to the LLM prevents false-positives where a helper
+        # class is legitimately part of the feature but isn't named
+        # in the single subtask's own description.
+        spec_excerpt = ""
+        try:
+            spec_path = os.path.join(self.task.task_dir, "spec.json")
+            if os.path.isfile(spec_path):
+                with open(spec_path, "r", encoding="utf-8") as fh:
+                    spec_raw = fh.read()
+                spec_excerpt = spec_raw[:3000]
+        except Exception:
+            pass
+
+        sibling_lines: list[str] = []
+        for _st in self.task.subtasks:
+            _sid = _st.get("id", "?")
+            _title = _st.get("title", "")
+            _brief = _st.get("brief") or _st.get("description") or ""
+            sibling_lines.append(
+                f"  {_sid}: {_title}\n    {str(_brief).strip()[:300]}"
+            )
+        siblings_block = "\n".join(sibling_lines) if sibling_lines else "(none)"
+
         for subtask in done_subtasks:
             sid         = subtask.get("id", "?")
             title       = subtask.get("title", "")
@@ -838,7 +864,7 @@ EVIDENCE: [what code you found or what's missing]
                 continue
 
             # ── Ask LLM to judge scope ─────────────────────────────────
-            prompt = f"""You are a strict code reviewer verifying that a developer made ONLY the changes requested in the subtask and nothing more.
+            prompt = f"""You are a code reviewer verifying that a developer made changes that belong to the overall task, even if they fall slightly outside this one subtask's own wording. The task is split into multiple subtasks — a helper class, CSS rule, or utility added under one subtask is IN SCOPE as long as the overall task/spec needs it.
 
 SUBTASK ID: {sid}
 SUBTASK TITLE: {title}
@@ -849,21 +875,29 @@ FILES ALLOWED TO CHANGE:
   Create: {', '.join(creates) if creates else '(none)'}
   Modify: {', '.join(modifies) if modifies else '(none)'}
 
+TASK SPECIFICATION (use this as the authoritative source of what is in scope for the whole task):
+{spec_excerpt if spec_excerpt else '(spec not available)'}
+
+ALL SUBTASKS IN THIS TASK (a change that serves any of these is in scope, even if declared under a different subtask):
+{siblings_block}
+
 ACTUAL DIFF (workdir vs target branch `{git_branch}`):
 {diff_text}
 
-REVIEW CRITERIA — flag a change as OUT-OF-SCOPE if it:
-1. Modifies lines unrelated to the subtask description
-2. Renames, moves, or restructures existing code not mentioned in the description
-3. Refactors logic that was not asked to be changed
-4. Changes formatting/style of lines that don't need to change
-5. Touches files not listed in FILES ALLOWED TO CHANGE
-6. Adds new abstractions, classes, or helpers not required by the description
+REVIEW CRITERIA — flag a change as OUT-OF-SCOPE only if it CLEARLY does NOT serve the TASK SPECIFICATION or any subtask above. Examples of legitimately OUT-OF-SCOPE:
+1. Unrelated refactor, rename, or reformat of code the task does not touch conceptually.
+2. Dead code, debug prints, TODO scaffolding not tied to any subtask.
+3. Touches a file not listed in FILES ALLOWED TO CHANGE AND not mentioned anywhere in the task spec.
 
-Do NOT flag as out-of-scope:
-- Any change directly required by the description
-- Necessary imports for new code
-- Minor surrounding context lines (diff context lines starting with space)
+IN SCOPE — do NOT flag:
+- Any change directly required by the subtask description.
+- Helper classes, CSS rules, utility functions, or auxiliary identifiers that implement what the task spec or ANY subtask above describes (e.g. a ".foo-toggle" / ".foo-body" CSS pair introduced to build a "collapsible" feature the spec asks for — IN SCOPE).
+- Identifiers (class names, function names, ids) that appear anywhere in TASK SPECIFICATION or in another subtask's title/brief.
+- Necessary imports for new code.
+- Minor surrounding context lines (diff context lines starting with a space).
+- Cosmetic touch-ups of lines the subtask legitimately rewrites.
+
+If unsure → default to IN SCOPE. We prefer missing a rare out-of-scope leak over blocking a legitimate feature change.
 
 Respond with this exact format:
 VERDICT: PASS  (all changes are within scope)

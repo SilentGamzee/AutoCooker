@@ -506,6 +506,29 @@ def start_task(task_id: str) -> dict:
                             st["status"] = "pending"
                             st["current_loop"] = 0
                             st["analysis_needed"] = False
+
+                    # ── Reset workdir to pristine project state ─────
+                    # Without this, files from the last Coding run
+                    # remain modified; the LLM re-plans against them
+                    # thinking they're clean and its search anchors
+                    # don't match. Reset lets the full corrected plan
+                    # re-apply from zero each patch iteration.
+                    try:
+                        import shutil as _sh
+                        from core.sandbox import WORKDIR_NAME as _WD
+                        _workdir = os.path.join(task.task_dir, _WD)
+                        if os.path.isdir(_workdir):
+                            _sh.rmtree(_workdir, ignore_errors=True)
+                            task.add_log(
+                                "  ↺ workdir reset — patch will re-apply plan from pristine source",
+                                "system", "info"
+                            )
+                    except Exception as _exc:
+                        task.add_log(
+                            f"  [WARN] Failed to reset workdir before patch: {_exc}",
+                            "system", "warn"
+                        )
+
                     _push_task(task)
                 
                 # ══════════════════════════════════════════════════════
