@@ -423,6 +423,22 @@ class QAPhase(BasePhase):
             max_outer_iterations=MAX_REVIEWER_ITERATIONS,
         )
 
+        # Same fallback as QA Review: recover a prose verdict if the
+        # model wrote PASS/FAIL as text instead of calling the tool.
+        if executor.qa_verdict is None:
+            text = getattr(executor, "last_assistant_text", "") or ""
+            parsed = self._parse_verdict_from_text(text)
+            if parsed is not None:
+                p_verdict, p_issues, p_summary = parsed
+                executor.qa_verdict = p_verdict
+                executor.qa_verdict_issues = p_issues
+                executor.qa_verdict_summary = p_summary
+                self.log(
+                    f"  [FALLBACK] Parsed goal verdict {p_verdict} from "
+                    f"assistant prose — submit_qa_verdict was never called.",
+                    "warn",
+                )
+
         verdict = executor.qa_verdict or "FAIL"
         issues  = executor.qa_verdict_issues or []
         summary = executor.qa_verdict_summary or "(no summary)"
