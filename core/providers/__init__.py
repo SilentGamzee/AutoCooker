@@ -1,7 +1,12 @@
-"""Provider configuration manager.
+"""Provider configuration manager + LLM transport implementations.
 
-Supports multiple LLM providers (LM Studio, OmniRoute).
-Each provider exposes an OpenAI-compatible /v1/models and /v1/chat/completions API.
+Provider-specific transport modules:
+  core.providers.base          — BaseTransport ABC + UrllibResponse
+  core.providers.openai_compat — LM Studio, OmniRoute (OpenAI-compatible SSE)
+  core.providers.gemini        — Google Gemini native API
+  core.providers.anthropic     — Anthropic Claude Messages API
+
+The ProvidersManager below handles config persistence and client factory.
 """
 from __future__ import annotations
 import json
@@ -9,7 +14,7 @@ import os
 import threading
 import uuid
 import requests
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass
 from typing import Optional
 
 PROVIDERS_FILENAME = "providers.json"
@@ -35,10 +40,10 @@ def get() -> "ProvidersManager":
 @dataclass
 class ProviderConfig:
     id: str
-    type: str          # "lmstudio" | "omniroute" | "gemini"
+    type: str          # "lmstudio" | "omniroute" | "gemini" | "anthropic"
     name: str
     base_url: str
-    api_key: str = ""  # required for omniroute and gemini
+    api_key: str = ""
     is_active: bool = True
 
     def to_dict(self) -> dict:
@@ -56,7 +61,6 @@ class ProviderConfig:
         d = self.to_dict()
         if d["api_key"]:
             key = d["api_key"]
-            # Show first 5 chars and last 4 chars, mask the rest
             if len(key) > 9:
                 d["api_key_masked"] = key[:5] + "*" * (len(key) - 9) + key[-4:]
             else:
@@ -89,11 +93,12 @@ _DEFAULTS = [
     ),
 ]
 
-# Known base URLs per type
+# Known base URLs per type (used by UI to pre-fill the URL field)
 PROVIDER_DEFAULTS = {
     "lmstudio":  {"base_url": "http://localhost:1234", "name": "LM Studio"},
     "omniroute": {"base_url": "https://api.omni-route.com", "name": "OmniRoute"},
     "gemini":    {"base_url": "https://generativelanguage.googleapis.com/v1beta/openai", "name": "Gemini"},
+    "anthropic": {"base_url": "https://api.anthropic.com", "name": "Anthropic Claude"},
 }
 
 
@@ -179,7 +184,7 @@ class ProvidersManager:
         return None
 
     def update(self, provider_id: str, name: str = None, base_url: str = None, api_key: str = None) -> Optional[ProviderConfig]:
-        """Update mutable fields of a provider. Pass None to leave a field unchanged."""
+        """Update mutable fields of a provider. Pass None to leave unchanged."""
         with self._lock:
             for p in self._providers:
                 if p.id == provider_id:
@@ -216,6 +221,8 @@ class ProvidersManager:
         """Fetch model list from a single provider."""
         if provider.type == "gemini":
             return self._fetch_gemini_models(provider)
+        if provider.type == "anthropic":
+            return self._fetch_anthropic_models(provider)
         url = f"{self._api_base(provider)}/models"
         headers = {}
         if provider.api_key:
@@ -228,20 +235,36 @@ class ProvidersManager:
             print(f"[ProvidersManager] fetch_models {provider.name}: {e}", flush=True)
             return []
 
+    def _fetch_anthropic_models(self, provider: ProviderConfig) -> list[str]:
+        """Fetch model list from the Anthropic /v1/models endpoint."""
+        if not provider.api_key:
+            print(f"[ProvidersManager] fetch_models {provider.name}: no API key set", flush=True)
+            return []
+        base = provider.base_url.rstrip("/")
+        url = f"{base}/v1/models"
+        headers = {
+            "x-api-key": provider.api_key,
+            "anthropic-version": "2023-06-01",
+        }
+        try:
+            r = requests.get(url, headers=headers, timeout=8)
+            r.raise_for_status()
+            return [m["id"] for m in r.json().get("data", [])]
+        except Exception as e:
+            print(f"[ProvidersManager] fetch_models {provider.name}: {e}", flush=True)
+            return []
+
     def _fetch_gemini_models(self, provider: ProviderConfig) -> list[str]:
-        """
-        Fetch model list via the native Gemini REST API.
+        """Fetch model list via the native Gemini REST API.
 
         The OpenAI-compat /models endpoint returns 400 for Gemini.
         The native endpoint is GET /v1beta/models?key=API_KEY and returns
-        models whose name is like "models/gemini-2.0-flash". We filter to
-        those that support generateContent (i.e. chat-capable) and strip
-        the "models/" prefix so the id matches what chat/completions expects.
+        models whose name is like 'models/gemini-2.0-flash'. We filter to
+        those that support generateContent and strip the 'models/' prefix.
         """
         if not provider.api_key:
             print(f"[ProvidersManager] fetch_models {provider.name}: no API key set", flush=True)
             return []
-        # Base host: strip the /v1beta/openai path, use just the host root
         from urllib.parse import urlparse
         parsed = urlparse(provider.base_url)
         host_root = f"{parsed.scheme}://{parsed.netloc}"
@@ -254,8 +277,8 @@ class ProvidersManager:
                 methods = m.get("supportedGenerationMethods", [])
                 if "generateContent" not in methods:
                     continue
-                name = m.get("name", "")          # "models/gemini-2.0-flash"
-                model_id = name.split("/", 1)[-1]  # "gemini-2.0-flash"
+                name = m.get("name", "")
+                model_id = name.split("/", 1)[-1]
                 if model_id:
                     models.append(model_id)
             return models
@@ -264,9 +287,7 @@ class ProvidersManager:
             return []
 
     def get_models_by_provider(self, active_only: bool = True) -> dict[str, list[str]]:
-        """
-        Returns {provider_id: [model_ids]} for all (or only active) providers.
-        """
+        """Returns {provider_id: [model_ids]} for all (or only active) providers."""
         providers = self.get_active() if active_only else self.get_all()
         result = {}
         for p in providers:
@@ -288,21 +309,27 @@ class ProvidersManager:
                 return p
         return None
 
-    # Cloud provider types that should use a shorter read timeout
-    _CLOUD_TYPES = {"omniroute", "gemini"}
+    # Cloud provider types — use a shorter read timeout (300s vs 600s local)
+    _CLOUD_TYPES = {"omniroute", "gemini", "anthropic"}
+
+    # Maps provider.type → auth_style used by OllamaClient / transport factories
+    _AUTH_STYLES = {
+        "gemini":    "gemini_native",
+        "anthropic": "anthropic",
+    }
 
     def _read_timeout_for(self, provider: ProviderConfig) -> int:
-        """300s for cloud APIs (stream=False + large tool-call responses can
-        easily take 2-3 min to generate), 600s for local providers."""
+        """300s for cloud APIs, 600s for local providers."""
         return 300 if provider.type in self._CLOUD_TYPES else 600
 
     def _make_client(self, provider: ProviderConfig) -> "OllamaClient":
         from core.ollama_client import OllamaClient
+        auth_style = self._AUTH_STYLES.get(provider.type, "bearer")
         return OllamaClient(
             base_url=provider.base_url,
             api_key=provider.api_key,
             read_timeout=self._read_timeout_for(provider),
-            auth_style="gemini_native" if provider.type == "gemini" else "bearer",
+            auth_style=auth_style,
         )
 
     @staticmethod
@@ -311,32 +338,28 @@ class ProvidersManager:
         return model_id.split("/", 1)[-1] if "/" in model_id else model_id
 
     def make_client_for_model(self, model_id: str) -> "OllamaClient":
-        """
-        Return an OllamaClient configured for the provider that has model_id.
-        Falls back to the first active provider if model cannot be found.
+        """Return an OllamaClient configured for the provider that has model_id.
+        Falls back to the first active provider if the model cannot be found.
         """
         norm_id = self._normalize_model_id(model_id)
         for p in self.get_active():
             provider_models = self.fetch_models_for(p)
             if model_id in provider_models or norm_id in provider_models:
                 return self._make_client(p)
-        # Fallback: first active provider
         active = self.get_active()
         if active:
             return self._make_client(active[0])
         from core.ollama_client import OllamaClient
-        return OllamaClient()  # default LM Studio
+        return OllamaClient()
 
     def check_models_available(self, model_ids: list[str]) -> dict:
-        """
-        Check whether each model_id is available from an active provider.
+        """Check whether each model_id is available from an active provider.
         Returns {"ok": bool, "errors": [str], "unavailable_models": [str]}
         """
         if not model_ids:
             return {"ok": True, "errors": [], "unavailable_models": []}
 
-        # Build map: model_id -> set of provider names that have it (active only)
-        active_models: dict[str, str] = {}  # model_id -> provider name
+        active_models: dict[str, str] = {}
         for p in self.get_active():
             for m in self.fetch_models_for(p):
                 active_models[m] = p.name
@@ -346,7 +369,6 @@ class ProvidersManager:
         for mid in model_ids:
             if mid and mid not in active_models:
                 unavailable.append(mid)
-                # Try to find which inactive provider has it
                 for p in self.get_all():
                     if not p.is_active:
                         if mid in self.fetch_models_for(p):

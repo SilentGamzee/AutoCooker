@@ -1307,7 +1307,7 @@ async function renderProviderList() {
     listEl.innerHTML = '<div class="prov-empty">No providers configured</div>';
     return;
   }
-  const typeLabels = { lmstudio: 'LM Studio', omniroute: 'OmniRoute', gemini: 'Gemini' };
+  const typeLabels = { lmstudio: 'LM Studio', omniroute: 'OmniRoute', gemini: 'Gemini', anthropic: 'Anthropic' };
   listEl.innerHTML = providers.map(p => {
     const activeClass = p.is_active ? 'prov-active' : 'prov-inactive';
     const activeLabel = p.is_active ? 'Active' : 'Inactive';
@@ -1315,7 +1315,7 @@ async function renderProviderList() {
     const keyInfo = p.api_key_masked
       ? `<span class="prov-key-badge">${esc(p.api_key_masked)}</span>`
       : '';
-    const needsKey = (p.type === 'omniroute' || p.type === 'gemini');
+    const needsKey = (p.type === 'omniroute' || p.type === 'gemini' || p.type === 'anthropic');
     return `
       <div class="prov-item ${activeClass}" data-id="${esc(p.id)}" id="prov-item-${esc(p.id)}">
         <div class="prov-item-view">
@@ -1413,9 +1413,10 @@ async function saveProviderEdit(id) {
 }
 
 const PROVIDER_DEFAULTS = {
-  lmstudio:  { url: 'http://localhost:1234',                                        needsKey: false },
-  omniroute: { url: 'https://api.omni-route.com',                                  needsKey: true  },
-  gemini:    { url: 'https://generativelanguage.googleapis.com/v1beta/openai',      needsKey: true  },
+  lmstudio:   { url: 'http://localhost:1234',                                       needsKey: false },
+  omniroute:  { url: 'https://api.omni-route.com',                                 needsKey: true  },
+  gemini:     { url: 'https://generativelanguage.googleapis.com/v1beta/openai',     needsKey: true  },
+  anthropic:  { url: 'https://api.anthropic.com',                                  needsKey: true  },
 };
 
 function onProviderTypeChange() {

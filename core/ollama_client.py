@@ -1,9 +1,14 @@
 """Ollama API client with tool-calling support.
 
 ИСПРАВЛЕНИЯ (относительно оригинала):
-1. Добавлен метод _extract_from_thinking() для fallback-парсинга поля thinking  
+1. Добавлен метод _extract_from_thinking() для fallback-парсинга поля thinking
 2. Метод complete() теперь проверяет thinking если response пустой
 3. Исправлена проблема с Qwen 7.0 thinking mode (пустой response)
+
+Provider-specific transport logic lives in core/providers/:
+  openai_compat.py  — LM Studio, OmniRoute (OpenAI-compatible SSE)
+  gemini.py         — Google Gemini native API
+  anthropic.py      — Anthropic Claude Messages API
 """
 from __future__ import annotations
 import json
@@ -16,6 +21,19 @@ import requests
 from typing import Callable, Optional
 
 from core.state import FileCache
+from core.providers.base import UrllibResponse
+
+
+def _create_transport(auth_style: str, base_url: str, api_key: str):
+    """Instantiate the correct provider transport based on auth_style."""
+    if auth_style == "gemini_native":
+        from core.providers.gemini import GeminiTransport
+        return GeminiTransport(base_url, api_key)
+    if auth_style == "anthropic":
+        from core.providers.anthropic import AnthropicTransport
+        return AnthropicTransport(base_url, api_key)
+    from core.providers.openai_compat import OpenAICompatTransport
+    return OpenAICompatTransport(base_url, api_key)
 
 _DEBUG = os.environ.get("AUTOCOOKER_DEBUG", "").lower() in ("1", "true", "yes")
 
@@ -42,9 +60,10 @@ class OllamaClient:
                  read_timeout: int = 600, auth_style: str = "bearer"):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
-        self.read_timeout = read_timeout  # seconds; 600 for local, 120 for cloud APIs
-        # "bearer" → Authorization: Bearer KEY (LM Studio, OmniRoute)
-        # "goog"   → x-goog-api-key: KEY (Gemini — avoids conflict with OAuth Bearer)
+        self.read_timeout = read_timeout  # seconds; 600 for local, 300 for cloud APIs
+        # "bearer"       → OpenAI-compat SSE (LM Studio, OmniRoute)
+        # "gemini_native"→ Google Gemini native generateContent API
+        # "anthropic"    → Anthropic Messages API (Claude)
         self.auth_style = auth_style
         # Persistent session — closed on abort() to cancel in-flight requests
         self._session = self._new_session()
@@ -55,6 +74,8 @@ class OllamaClient:
         # a sliding 60s window; if >3 hits → enforce 30s cooldown.
         self._rl_429_times: list[float] = []
         self._rl_cooldown_until: float = 0.0
+        # Provider-specific HTTP transport (handles format translation + streaming)
+        self._transport = _create_transport(auth_style, base_url, api_key)
 
     @staticmethod
     def _new_session() -> requests.Session:
@@ -154,649 +175,6 @@ class OllamaClient:
             pass
         return None
 
-    class _UrllibResponse:
-        """Thin wrapper around urllib response that mimics requests.Response."""
-        def __init__(self, status_code: int, body: bytes, headers: dict):
-            self.status_code = status_code
-            self._body = body
-            self.headers = headers
-            self.ok = 200 <= status_code < 300
-
-        def json(self):
-            import json as _json
-            return _json.loads(self._body)
-
-        @property
-        def text(self):
-            return self._body.decode("utf-8", errors="replace")
-
-        def raise_for_status(self):
-            if not self.ok:
-                # Create a minimal mock so e.response.status_code works in callers
-                err = requests.exceptions.HTTPError(f"{self.status_code} Client Error")
-                err.response = self  # type: ignore[attr-defined]
-                raise err
-
-    # ── Gemini native API (bypasses OpenAI compat layer entirely) ──────────────
-
-    def _gemini_native_stream(
-        self,
-        json_payload: dict,
-        connect_timeout: float = 10.0,
-        first_byte_timeout: float = 60.0,
-        idle_timeout: float = 60.0,
-        hard_timeout: float = 1800.0,
-        log_fn: Optional[Callable] = None,
-        progress_fn: Optional[Callable[[str], None]] = None,
-        is_aborted: Optional[Callable[[], bool]] = None,
-    ) -> "OllamaClient._UrllibResponse":
-        """
-        Stream Gemini's native :streamGenerateContent?alt=sse endpoint with
-        the same liveness-based timeouts as _stream_chat.
-
-        Gemini SSE events carry `candidates[0].content.parts[]`, where each
-        part is either {"text": "..."} (incremental text) or a complete
-        {"functionCall": {"name", "args"}} (function calls are not split
-        across events in Gemini's stream).
-
-        Parses events as they arrive, translates them to OpenAI response
-        shape so callers consume the same format as the non-streaming and
-        OpenAI-compat paths.
-        """
-        import time as _t
-        import uuid as _uuid
-        from urllib.parse import urlparse as _up
-
-        model = json_payload.get("model", "gemini-2.0-flash")
-        messages = json_payload.get("messages", [])
-        tools = json_payload.get("tools", [])
-        gemini_req = self._openai_to_gemini(messages, tools, model=model)
-
-        parsed = _up(self.base_url)
-        host = parsed.netloc
-        url = f"https://{host}/v1beta/models/{model}:streamGenerateContent"
-
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "text/event-stream",
-            "X-goog-api-key": self.api_key,
-            "User-Agent": "python-httpclient/3",
-        }
-
-        sess = self._sess()
-        # Pass alt=sse via params= so it's URL-encoded correctly and survives
-        # session-level proxy rewrites; embedding ?alt=sse in the URL string
-        # has been observed to get stripped in some setups.
-        req = requests.Request("POST", url, json=gemini_req, headers=headers,
-                               params={"alt": "sse"})
-        prepped = sess.prepare_request(req)
-        # Strip any Authorization header an ADC-patched session might inject.
-        prepped.headers.pop("Authorization", None)
-
-        resp = sess.send(
-            prepped,
-            timeout=(connect_timeout, idle_timeout),
-            stream=True,
-        )
-
-        if not resp.ok:
-            try:
-                body = resp.content
-            finally:
-                resp.close()
-            print(
-                f"[gemini_stream] HTTP {resp.status_code} error body: "
-                f"{body[:2000].decode('utf-8', errors='replace')}",
-                flush=True,
-            )
-            return self._UrllibResponse(resp.status_code, body, dict(resp.headers))
-
-        text_parts: list[str] = []
-        tool_calls: list[dict] = []
-        finish_reason = "stop"
-        model_name = model
-
-        _start = _t.monotonic()
-        _first_byte_at: Optional[float] = None
-        _total_bytes = 0
-        buffer = b""
-        # Raw capture for debug: keep every SSE event we received so we
-        # can dump the full server response when something goes wrong.
-        raw_events: list[str] = []
-        raw_chunks: list[bytes] = []
-
-        fr_map = {"STOP": "stop", "MAX_TOKENS": "length", "SAFETY": "stop"}
-
-        # Progress state — throttled live-updating UI line.
-        _PROGRESS_INTERVAL = 0.25
-        _last_progress = [0.0]
-        token_count = [0]          # Gemini usageMetadata.candidatesTokenCount
-        thought_done = [False]      # flips when first non-thought part appears
-
-        def _emit_progress(force: bool = False) -> None:
-            if not progress_fn:
-                return
-            now = _t.monotonic()
-            if not force and (now - _last_progress[0]) < _PROGRESS_INTERVAL:
-                return
-            _last_progress[0] = now
-            tc = token_count[0] or sum(len(t) for t in text_parts)
-            label = "done" if thought_done[0] else "thinking"
-            try:
-                progress_fn(f"[Gemini] streaming — {tc} tokens, thought={label}")
-            except Exception:
-                pass
-
-        # Verbose per-event tracing is opt-in via env var. With it off we
-        # never emit per-event stdout prints or log_fn calls — the single
-        # updating progress line in the GUI is the only stream indicator.
-        _verbose = bool(os.environ.get("AUTOCOOKER_STREAM_DEBUG"))
-
-        def _dbg(msg: str, level: str = "info", to_log: bool = True) -> None:
-            """Emit a debug line for the Gemini stream.
-
-            - `to_log=False` means it's a per-event trace (noisy): printed
-              to stdout AND forwarded to log_fn only when the verbose env
-              flag is on. Default: silent.
-            - `to_log=True` is for summary / error lines: always printed,
-              always forwarded to log_fn when available.
-            """
-            if not to_log and not _verbose:
-                return
-            print(f"[gemini_stream] {msg}", flush=True)
-            if to_log and log_fn:
-                log_fn(f"[gemini_stream] {msg}", level)
-
-        def _consume_event(evt: dict) -> None:
-            """Mutate text_parts / tool_calls / finish_reason / model_name
-            from one GenerateContentResponse envelope. Used by BOTH the SSE
-            loop and the JSON-array fallback."""
-            nonlocal finish_reason, model_name
-            if evt.get("modelVersion"):
-                model_name = evt["modelVersion"]
-            # Update token count from usage metadata when server sends it.
-            um = evt.get("usageMetadata") or {}
-            if um.get("candidatesTokenCount"):
-                token_count[0] = int(um["candidatesTokenCount"])
-            cands = evt.get("candidates") or []
-            if not cands:
-                _dbg(f"event has no candidates; keys={list(evt.keys())}", "warn", to_log=False)
-                # Gemini sometimes wraps errors: {"error": {...}}
-                if "error" in evt:
-                    _dbg(f"server error payload: {evt.get('error')}", "error")
-                return
-            cand = cands[0]
-            parts = (cand.get("content") or {}).get("parts", []) or []
-            if not parts:
-                _dbg(
-                    f"candidate has no parts; cand_keys={list(cand.keys())} "
-                    f"content_keys={list((cand.get('content') or {}).keys())}",
-                    "warn",
-                    to_log=False,
-                )
-            for p in parts:
-                # Skip Gemini's internal "thought" parts — they're the
-                # model's private chain-of-thought and shouldn't surface
-                # to the caller. Real text/tool parts never have this flag.
-                if p.get("thought"):
-                    continue
-                # First non-thought part seen → thought phase finished.
-                thought_done[0] = True
-                if p.get("text"):
-                    text_parts.append(p["text"])
-                if "functionCall" in p:
-                    fc = p["functionCall"]
-                    _dbg(
-                        f"functionCall: name={fc.get('name')!r} "
-                        f"args={json.dumps(fc.get('args', {}), ensure_ascii=False)[:400]}",
-                        to_log=False,
-                    )
-                    tool_calls.append({
-                        "id": f"call_{_uuid.uuid4().hex[:8]}",
-                        "type": "function",
-                        "function": {
-                            "name": fc.get("name", ""),
-                            "arguments": json.dumps(
-                                fc.get("args", {}), ensure_ascii=False
-                            ),
-                        },
-                    })
-            fr_raw = cand.get("finishReason")
-            if fr_raw:
-                finish_reason = fr_map.get(fr_raw.upper(), "stop")
-                thought_done[0] = True
-
-        _dbg(f"POST {url[:140]} — streaming (will auto-detect SSE vs JSON-array)")
-
-        try:
-            for chunk in resp.iter_content(chunk_size=1024):
-                if is_aborted and is_aborted():
-                    resp.close()
-                    raise RuntimeError("__ABORTED__")
-                now = _t.monotonic()
-                if now - _start > hard_timeout:
-                    resp.close()
-                    raise requests.exceptions.ReadTimeout(
-                        f"Gemini stream exceeded hard ceiling of {hard_timeout:.0f}s"
-                    )
-                if not chunk:
-                    continue
-                if _first_byte_at is None:
-                    _first_byte_at = now
-                    # First byte message goes to progress (in-place), not log.
-                    if progress_fn:
-                        try:
-                            progress_fn(
-                                f"[Gemini] streaming — first bytes after "
-                                f"{now - _start:.1f}s"
-                            )
-                        except Exception:
-                            pass
-                    elif log_fn:
-                        log_fn(
-                            f"[Gemini] streaming — first bytes after {now - _start:.1f}s",
-                            "info",
-                        )
-                _total_bytes += len(chunk)
-                raw_chunks.append(chunk)
-                # Gemini's SSE stream uses CRLF line terminators (data: ...\r\n\r\n).
-                # Normalise to LF so a single split pattern (\n\n) handles both
-                # LF and CRLF servers consistently.
-                buffer += chunk.replace(b"\r\n", b"\n")
-                while b"\n\n" in buffer:
-                    event, buffer = buffer.split(b"\n\n", 1)
-                    for line in event.split(b"\n"):
-                        line = line.strip()
-                        if not line or not line.startswith(b"data:"):
-                            continue
-                        data_str = line[5:].strip().decode("utf-8", errors="replace")
-                        if not data_str:
-                            continue
-                        raw_events.append(data_str)
-                        # Per-event trace → stdout only (GUI log would spam).
-                        _dbg(
-                            f"SSE event #{len(raw_events)}: {data_str[:600]}",
-                            to_log=False,
-                        )
-                        try:
-                            evt = json.loads(data_str)
-                        except json.JSONDecodeError as _je:
-                            _dbg(
-                                f"JSON decode error: {_je} — raw: {data_str[:500]!r}",
-                                "warn",
-                                to_log=False,
-                            )
-                            continue
-                        _consume_event(evt)
-                        _emit_progress()
-        except requests.exceptions.ReadTimeout as e:
-            try:
-                resp.close()
-            except Exception:
-                pass
-            if _first_byte_at is None:
-                raise requests.exceptions.ReadTimeout(
-                    f"No bytes received within first {idle_timeout:.0f}s of Gemini stream"
-                ) from e
-            raise requests.exceptions.ReadTimeout(
-                f"Gemini stream idle for {idle_timeout:.0f}s "
-                f"(received {_total_bytes} bytes before stall)"
-            ) from e
-        except requests.exceptions.ChunkedEncodingError as e:
-            try:
-                resp.close()
-            except Exception:
-                pass
-            if _first_byte_at is None:
-                raise
-            if log_fn:
-                log_fn(f"[Gemini] stream ended abruptly: {e}", "warn")
-        finally:
-            try:
-                resp.close()
-            except Exception:
-                pass
-
-        # ── Fallback: response wasn't SSE (or ?alt=sse was stripped). Gemini's
-        # default :streamGenerateContent returns a chunked JSON array
-        # [{resp1}, {resp2}, …] — parse the whole body as JSON or NDJSON.
-        if not raw_events and raw_chunks:
-            try:
-                raw_all = b"".join(raw_chunks).decode("utf-8", errors="replace").strip()
-            except Exception as _de:
-                raw_all = ""
-                _dbg(f"could not decode raw body: {_de}", "warn")
-            if raw_all:
-                _dbg(
-                    f"no SSE events found — trying JSON-array fallback on "
-                    f"{len(raw_all)}-char body starting {raw_all[:80]!r}"
-                )
-                parsed_any = False
-                # 1) Single JSON array at top level.
-                try:
-                    data = json.loads(raw_all)
-                    if isinstance(data, list):
-                        for evt in data:
-                            if isinstance(evt, dict):
-                                _consume_event(evt)
-                                parsed_any = True
-                    elif isinstance(data, dict):
-                        _consume_event(data)
-                        parsed_any = True
-                except json.JSONDecodeError:
-                    pass
-                # 2) NDJSON / concatenated JSON objects (one per line).
-                if not parsed_any:
-                    import re as _re
-                    decoder = json.JSONDecoder()
-                    text = raw_all.lstrip("[").rstrip("]").strip()
-                    idx = 0
-                    while idx < len(text):
-                        # Skip separators (commas, whitespace, newlines).
-                        m = _re.match(r"[\s,]+", text[idx:])
-                        if m:
-                            idx += m.end()
-                            continue
-                        try:
-                            evt, end = decoder.raw_decode(text, idx)
-                        except json.JSONDecodeError:
-                            break
-                        if isinstance(evt, dict):
-                            _consume_event(evt)
-                            parsed_any = True
-                        idx = end
-                if not parsed_any:
-                    _dbg(
-                        "fallback parsing failed — body was not SSE, JSON "
-                        "array, or NDJSON. First 1000 chars:\n" + raw_all[:1000],
-                        "error",
-                    )
-
-        if tool_calls:
-            finish_reason = "tool_calls"
-        message: dict = {"role": "assistant", "content": "".join(text_parts)}
-        if tool_calls:
-            message["tool_calls"] = tool_calls
-        synth = {
-            "choices": [
-                {"message": message, "finish_reason": finish_reason, "index": 0}
-            ],
-            "model": model_name,
-        }
-
-        # DEBUG: full dump of what we're handing back to chat_with_tools.
-        elapsed = _t.monotonic() - _start
-        _dbg(
-            f"DONE {_total_bytes}B in {elapsed:.1f}s, "
-            f"{len(raw_events)} SSE events, {len(text_parts)} text parts, "
-            f"{len(tool_calls)} tool_calls, finish_reason={finish_reason!r}"
-        )
-        try:
-            _dbg(
-                "synthesized: " + json.dumps(synth, ensure_ascii=False)[:4000],
-                to_log=False,
-            )
-        except Exception as _de:
-            _dbg(f"could not json-dump synth: {_de}", "warn", to_log=False)
-        # Force a final progress update so the live row reflects the last state.
-        _emit_progress(force=True)
-        if not text_parts and not tool_calls:
-            # Fallback-parsing failed too — dump the raw stream.
-            try:
-                raw_all = b"".join(raw_chunks).decode("utf-8", errors="replace")
-            except Exception:
-                raw_all = repr(b"".join(raw_chunks))
-            _dbg(
-                "EMPTY RESULT — raw stream body follows:\n" + raw_all[:8000],
-                "error",
-            )
-            # An empty response is never useful to the caller: either the
-            # stream was truncated mid-thought (no finishReason arrived) or
-            # the model emitted only private "thought" parts. Surface this
-            # as a retriable ReadTimeout so the outer loop retries instead
-            # of handing back content="" (which downstream treats as a
-            # valid silent response and breaks the phase).
-            saw_finish = finish_reason != "stop" or any(
-                '"finishReason"' in e for e in raw_events
-            )
-            detail = (
-                "stream ended with only thought parts and no finishReason"
-                if not saw_finish
-                else "server closed stream with no text/tool_calls content"
-            )
-            raise requests.exceptions.ReadTimeout(
-                f"[Gemini] empty response after {elapsed:.1f}s "
-                f"({_total_bytes}B, {len(raw_events)} events) — {detail}"
-            )
-
-        if log_fn:
-            log_fn(
-                f"[Gemini] stream complete — {_total_bytes}B in {elapsed:.1f}s, "
-                f"content={len(message['content'])} chars, "
-                f"tool_calls={len(tool_calls)}",
-                "info",
-            )
-        return self._UrllibResponse(
-            200,
-            json.dumps(synth, ensure_ascii=False).encode("utf-8"),
-            {},
-        )
-
-    def _gemini_native_post(self, json_payload: dict, timeout) -> "_UrllibResponse":
-        """
-        Call Gemini's native generateContent API with ?key= auth.
-        Bypasses the /v1beta/openai/ compat endpoint which conflicts with
-        system-level Google OAuth credentials (AQ. token format).
-        Translates OpenAI request/response format ↔ Gemini native format.
-        """
-        import json as _json
-        import http.client as _hc
-        import ssl as _ssl
-        from urllib.parse import urlparse as _up
-
-        model = json_payload.get("model", "gemini-2.0-flash")
-        messages = json_payload.get("messages", [])
-        tools = json_payload.get("tools", [])
-
-        gemini_req = self._openai_to_gemini(messages, tools, model=model)
-
-        # Host from base_url (strip any path)
-        parsed = _up(self.base_url)
-        host = parsed.netloc
-        path = f"/v1beta/models/{model}:generateContent"
-
-        body = _json.dumps(gemini_req).encode("utf-8")
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "User-Agent": "python-httpclient/3",
-            "X-goog-api-key": self.api_key,
-        }
-        print(f"[gemini_native] POST https://{host}{path[:60]}…", flush=True)
-
-        read_t = timeout[1] if isinstance(timeout, tuple) else (timeout or 120)
-        ctx = _ssl.create_default_context()
-        conn = _hc.HTTPSConnection(host, timeout=read_t, context=ctx)
-        try:
-            conn.request("POST", path, body=body, headers=headers)
-            resp = conn.getresponse()
-            resp_body = resp.read()
-            status = resp.status
-            print(f"[gemini_native] status={status}", flush=True)
-            if 200 <= status < 300:
-                gemini_resp = _json.loads(resp_body)
-                openai_resp = self._gemini_to_openai(gemini_resp)
-                return self._UrllibResponse(status, _json.dumps(openai_resp).encode(), {})
-            else:
-                print(f"[gemini_native] error body: {resp_body[:500]}", flush=True)
-                return self._UrllibResponse(status, resp_body, {})
-        except (TimeoutError, OSError, ConnectionError, _hc.HTTPException) as e:
-            msg = (
-                f"Network error communicating with Gemini API ({type(e).__name__}: {e}). "
-                f"The request will be retried."
-            )
-            print(f"[gemini_native] {msg}", flush=True)
-            raise RuntimeError(msg) from e
-        finally:
-            conn.close()
-
-    def _openai_to_gemini(self, messages: list, tools: list, model: str = "") -> dict:
-        """Translate OpenAI messages + tools to Gemini native request format."""
-        import json as _json
-
-        system_instruction = None
-        contents = []
-        # Map tool_call_id → function_name for resolving tool result messages
-        tc_id_to_name: dict[str, str] = {}
-
-        for msg in messages:
-            role = msg.get("role", "user")
-            content = msg.get("content") or ""
-
-            if role == "system":
-                system_instruction = {"parts": [{"text": content}]}
-                continue
-
-            if role == "assistant":
-                parts = []
-                if content:
-                    parts.append({"text": content})
-                for tc in (msg.get("tool_calls") or []):
-                    fn = tc.get("function", {})
-                    args = fn.get("arguments", {})
-                    if isinstance(args, str):
-                        try:
-                            args = _json.loads(args)
-                        except Exception:
-                            args = {}
-                    fn_name = fn.get("name", "")
-                    tc_id_to_name[tc.get("id", "")] = fn_name
-                    parts.append({"functionCall": {"name": fn_name, "args": args}})
-                if parts:
-                    contents.append({"role": "model", "parts": parts})
-                continue
-
-            if role == "tool":
-                # Resolve function name via tool_call_id
-                tc_id = msg.get("tool_call_id", "")
-                fn_name = tc_id_to_name.get(tc_id, "unknown")
-                result_str = content if isinstance(content, str) else str(content)
-                fn_resp = {"functionResponse": {
-                    "name": fn_name,
-                    "response": {"content": result_str},
-                }}
-                # Batch consecutive tool responses into one user content
-                if contents and contents[-1].get("role") == "user" and \
-                        any("functionResponse" in p for p in contents[-1].get("parts", [])):
-                    contents[-1]["parts"].append(fn_resp)
-                else:
-                    contents.append({"role": "user", "parts": [fn_resp]})
-                continue
-
-            # user role
-            if isinstance(content, list):
-                parts = [{"text": c["text"]} for c in content if c.get("type") == "text"]
-            else:
-                parts = [{"text": content}]
-            # Merge consecutive user messages
-            if contents and contents[-1].get("role") == "user" and \
-                    not any("functionResponse" in p for p in contents[-1].get("parts", [])):
-                contents[-1]["parts"].extend(parts)
-            else:
-                contents.append({"role": "user", "parts": parts})
-
-        req: dict = {"contents": contents}
-        if system_instruction:
-            req["systemInstruction"] = system_instruction
-        if tools:
-            fn_decls = []
-            for t in tools:
-                fn = t.get("function", {})
-                decl: dict = {"name": fn.get("name", ""), "description": fn.get("description", "")}
-                if fn.get("parameters"):
-                    decl["parameters"] = fn["parameters"]
-                fn_decls.append(decl)
-            req["tools"] = [{"functionDeclarations": fn_decls}]
-            req["toolConfig"] = {"functionCallingConfig": {"mode": "AUTO"}}
-
-        # Cap the output budget. Env overrides:
-        #   AUTOCOOKER_GEMINI_THINKING_BUDGET  (int tokens, default 4096)
-        #   AUTOCOOKER_GEMINI_MAX_OUTPUT       (int tokens, default 16384)
-        # thinkingConfig is Gemini-2.5-only; gemma-4 and older Gemini
-        # models reject it with "Thinking budget is not supported for
-        # this model" (400 INVALID_ARGUMENT). Gate on model name.
-        import os as _os
-        try:
-            think_budget = int(_os.environ.get(
-                "AUTOCOOKER_GEMINI_THINKING_BUDGET", "4096"))
-        except ValueError:
-            think_budget = 4096
-        try:
-            max_out = int(_os.environ.get(
-                "AUTOCOOKER_GEMINI_MAX_OUTPUT", "16384"))
-        except ValueError:
-            max_out = 16384
-        model_l = (model or "").lower()
-        supports_thinking = (
-            "gemini-2.5" in model_l
-            or "gemini-3" in model_l
-            or "thinking" in model_l
-        )
-        # For models that accept thinkingConfig we cap thoughts explicitly
-        # and leave maxOutputTokens at the configured value. For models
-        # that reject thinkingConfig (gemma-4, older Gemini) thoughts eat
-        # the same budget as visible output — double maxOutputTokens so
-        # the real answer still fits after the uncontrolled thinking
-        # phase.
-        effective_max = max_out if supports_thinking else max_out * 2
-        gen_cfg: dict = {"maxOutputTokens": effective_max}
-        if supports_thinking:
-            gen_cfg["thinkingConfig"] = {
-                "thinkingBudget": think_budget,
-                "includeThoughts": False,
-            }
-        req["generationConfig"] = gen_cfg
-        return req
-
-    def _gemini_to_openai(self, gemini_resp: dict) -> dict:
-        """Translate Gemini native response to OpenAI response format."""
-        import json as _json
-        import uuid as _uuid
-
-        candidates = gemini_resp.get("candidates", [{}])
-        candidate = candidates[0] if candidates else {}
-        parts = (candidate.get("content") or {}).get("parts", [])
-        finish = candidate.get("finishReason", "STOP").upper()
-        finish_map = {"STOP": "stop", "MAX_TOKENS": "length", "SAFETY": "stop"}
-        finish_reason = finish_map.get(finish, "stop")
-
-        text = "\n".join(p["text"] for p in parts if "text" in p)
-        tool_calls = []
-        for p in parts:
-            if "functionCall" in p:
-                fc = p["functionCall"]
-                tool_calls.append({
-                    "id": f"call_{_uuid.uuid4().hex[:8]}",
-                    "type": "function",
-                    "function": {
-                        "name": fc.get("name", ""),
-                        "arguments": _json.dumps(fc.get("args", {}), ensure_ascii=False),
-                    },
-                })
-        if tool_calls:
-            finish_reason = "tool_calls"
-
-        message: dict = {"role": "assistant", "content": text}
-        if tool_calls:
-            message["tool_calls"] = tool_calls
-
-        return {
-            "choices": [{"message": message, "finish_reason": finish_reason, "index": 0}],
-            "model": gemini_resp.get("modelVersion", "gemini"),
-        }
-
-    # ── Session management ────────────────────────────────────────
-
     def abort(self) -> None:
         """
         Cancel any in-flight HTTP request by closing+replacing the session.
@@ -814,293 +192,24 @@ class OllamaClient:
         with self._session_lock:
             return self._session
 
-    def _api_base(self) -> str:
-        """Return the OpenAI-compatible API base URL.
-
-        Rules:
-          - If base_url already has a non-trivial path (e.g. /v1beta/openai
-            for Gemini), use it as-is — the URL is already the API root.
-          - Otherwise append /v1 (LM Studio / OmniRoute convention).
-        """
-        from urllib.parse import urlparse
-        base = self.base_url.rstrip("/")
-        path = urlparse(base).path.rstrip("/")
-        if path:          # URL already has a path component → use as-is
-            return base
-        return f"{base}/v1"
-
-    def _chat_completions_url(self) -> str:
-        return f"{self._api_base()}/chat/completions"
-
-    def _models_url(self) -> str:
-        return f"{self._api_base()}/models"
-
-    def _auth_headers(self) -> dict:
-        """Return auth header for this provider."""
-        if not self.api_key:
-            return {}
-        return {"Authorization": f"Bearer {self.api_key}"}
-
-    def _stream_chat(
-        self,
-        url: str,
-        json_payload: dict,
-        connect_timeout: float = 10.0,
-        first_byte_timeout: float = 60.0,
-        idle_timeout: float = 60.0,
-        hard_timeout: float = 1800.0,
-        log_fn: Optional[Callable] = None,
-        progress_fn: Optional[Callable[[str], None]] = None,
-        is_aborted: Optional[Callable[[], bool]] = None,
-    ) -> "OllamaClient._UrllibResponse":
-        """
-        POST with stream=True to an OpenAI-compatible /chat/completions endpoint,
-        with liveness-based timeouts instead of one fixed read timeout.
-
-        Rules:
-          - Connect within `connect_timeout`.
-          - If no bytes arrive within `first_byte_timeout` seconds → ReadTimeout.
-          - If any gap between bytes exceeds `idle_timeout` seconds → ReadTimeout.
-          - Hard ceiling: `hard_timeout` seconds total → ReadTimeout.
-
-        The SSE event stream is parsed and reassembled into a non-streaming
-        response shape ({choices:[{message:{role,content,tool_calls?}, finish_reason}]})
-        so the existing `chat_with_tools` code path can consume it unchanged.
-
-        The per-socket read timeout is set to `idle_timeout`, so urllib3
-        itself raises ReadTimeout on a full minute of silence — we don't need
-        a separate watchdog thread. The hard ceiling is checked after each
-        chunk arrives.
-        """
-        import time as _t
-
-        payload = dict(json_payload)
-        payload["stream"] = True
-
-        headers = dict(self._auth_headers())
-        headers.setdefault("Accept", "text/event-stream")
-
-        sess = self._sess()
-        req = requests.Request("POST", url, json=payload, headers=headers)
-        prepped = sess.prepare_request(req)
-        resp = sess.send(
-            prepped,
-            timeout=(connect_timeout, idle_timeout),
-            stream=True,
-        )
-
-        if not resp.ok:
-            # Non-2xx — consume synchronously and return wrapped response so
-            # caller's raise_for_status() behaves identically to non-streaming.
-            try:
-                body = resp.content
-            finally:
-                resp.close()
-            return self._UrllibResponse(resp.status_code, body, dict(resp.headers))
-
-        content_buf: list[str] = []
-        tool_calls_by_index: dict[int, dict] = {}
-        finish_reason: str = ""
-        model_name: str = ""
-        _start = _t.monotonic()
-        _first_byte_at: Optional[float] = None
-        _total_bytes = 0
-        buffer = b""
-
-        # Progress state — throttled in-place GUI updates.
-        _PROGRESS_INTERVAL = 0.25
-        _last_progress = [0.0]
-
-        def _emit_progress(force: bool = False) -> None:
-            if not progress_fn:
-                return
-            now2 = _t.monotonic()
-            if not force and (now2 - _last_progress[0]) < _PROGRESS_INTERVAL:
-                return
-            _last_progress[0] = now2
-            # No thought channel in OpenAI-compat; tokens approximated by
-            # accumulated content char count.
-            approx_tokens = sum(len(s) for s in content_buf)
-            try:
-                progress_fn(
-                    f"[Ollama] streaming — ~{approx_tokens} chars, "
-                    f"tool_calls={len(tool_calls_by_index)}"
-                )
-            except Exception:
-                pass
-
-        try:
-            for chunk in resp.iter_content(chunk_size=1024):
-                if is_aborted and is_aborted():
-                    resp.close()
-                    raise RuntimeError("__ABORTED__")
-                now = _t.monotonic()
-                if now - _start > hard_timeout:
-                    resp.close()
-                    raise requests.exceptions.ReadTimeout(
-                        f"Stream exceeded hard ceiling of {hard_timeout:.0f}s"
-                    )
-                if not chunk:
-                    # Keep-alive — urllib3 already enforced idle timeout via the
-                    # socket read timeout, so an empty chunk here is harmless.
-                    continue
-                if _first_byte_at is None:
-                    _first_byte_at = now
-                    if progress_fn:
-                        try:
-                            progress_fn(
-                                f"[Ollama] streaming — first bytes after "
-                                f"{now - _start:.1f}s"
-                            )
-                        except Exception:
-                            pass
-                    elif log_fn:
-                        log_fn(
-                            f"[Ollama] streaming — first bytes after {now - _start:.1f}s",
-                            "info",
-                        )
-                _total_bytes += len(chunk)
-                # Normalise CRLF → LF so \n\n splitting handles both LF and
-                # CRLF servers (SSE spec allows both; Google uses CRLF).
-                buffer += chunk.replace(b"\r\n", b"\n")
-                # SSE events are separated by \n\n. Parse complete events; keep
-                # trailing partial event in buffer for the next chunk.
-                while b"\n\n" in buffer:
-                    event, buffer = buffer.split(b"\n\n", 1)
-                    for line in event.split(b"\n"):
-                        line = line.strip()
-                        if not line or not line.startswith(b"data:"):
-                            continue
-                        data_str = line[5:].strip().decode("utf-8", errors="replace")
-                        if not data_str or data_str == "[DONE]":
-                            continue
-                        try:
-                            evt = json.loads(data_str)
-                        except json.JSONDecodeError:
-                            continue
-                        if not model_name:
-                            model_name = evt.get("model") or ""
-                        choices = evt.get("choices") or []
-                        if not choices:
-                            continue
-                        ch = choices[0]
-                        fr = ch.get("finish_reason")
-                        if fr:
-                            finish_reason = fr
-                        delta = ch.get("delta") or {}
-                        dc = delta.get("content")
-                        if dc:
-                            content_buf.append(dc)
-                        for tcd in (delta.get("tool_calls") or []):
-                            idx = tcd.get("index", 0)
-                            slot = tool_calls_by_index.setdefault(
-                                idx,
-                                {
-                                    "id": "",
-                                    "type": "function",
-                                    "function": {"name": "", "arguments": ""},
-                                },
-                            )
-                            if tcd.get("id"):
-                                slot["id"] = tcd["id"]
-                            if tcd.get("type"):
-                                slot["type"] = tcd["type"]
-                            fnd = tcd.get("function") or {}
-                            if fnd.get("name"):
-                                # Name is typically sent once in the first delta.
-                                slot["function"]["name"] = fnd["name"]
-                            if fnd.get("arguments") is not None:
-                                slot["function"]["arguments"] += fnd["arguments"]
-                        _emit_progress()
-        except requests.exceptions.ReadTimeout as e:
-            try:
-                resp.close()
-            except Exception:
-                pass
-            if _first_byte_at is None:
-                raise requests.exceptions.ReadTimeout(
-                    f"No bytes received within first {idle_timeout:.0f}s of stream"
-                ) from e
-            raise requests.exceptions.ReadTimeout(
-                f"Stream idle for {idle_timeout:.0f}s "
-                f"(received {_total_bytes} bytes before stall)"
-            ) from e
-        except requests.exceptions.ChunkedEncodingError as e:
-            try:
-                resp.close()
-            except Exception:
-                pass
-            if _first_byte_at is None:
-                raise
-            if log_fn:
-                log_fn(f"[Ollama] stream ended abruptly: {e}", "warn")
-        finally:
-            try:
-                resp.close()
-            except Exception:
-                pass
-
-        message: dict = {"role": "assistant", "content": "".join(content_buf)}
-        if tool_calls_by_index:
-            message["tool_calls"] = [
-                tool_calls_by_index[k] for k in sorted(tool_calls_by_index.keys())
-            ]
-        synth = {
-            "choices": [
-                {"message": message, "finish_reason": finish_reason or "stop", "index": 0}
-            ],
-            "model": model_name,
-        }
-        body_bytes = json.dumps(synth, ensure_ascii=False).encode("utf-8")
-        _emit_progress(force=True)
-        if log_fn:
-            elapsed = _t.monotonic() - _start
-            log_fn(
-                f"[Ollama] stream complete — {_total_bytes}B in {elapsed:.1f}s, "
-                f"content={len(message['content'])} chars, "
-                f"tool_calls={len(tool_calls_by_index)}",
-                "info",
-            )
-        return self._UrllibResponse(200, body_bytes, {})
-
     def _post(
         self,
-        url: str,
         json_payload: dict,
         timeout,
         stream_liveness: bool = False,
         log_fn: Optional[Callable] = None,
         progress_fn: Optional[Callable[[str], None]] = None,
         is_aborted: Optional[Callable[[], bool]] = None,
-        first_byte_timeout: float = 60.0,
-        idle_timeout: float = 60.0,
+        first_byte_timeout: float = 300.0,
+        idle_timeout: float = 300.0,
         hard_timeout: float = 1800.0,
-    ) -> requests.Response:
+    ) -> UrllibResponse:
+        """Dispatch an LLM request to the provider transport.
+
+        Runs in a gevent threadpool when inside a greenlet so the event loop
+        stays unblocked. All provider-specific logic (format translation,
+        streaming SSE parsing, auth) lives in self._transport.
         """
-        Execute requests.post without blocking gevent's event loop.
-
-        When called from inside a gevent greenlet (the normal case with eel):
-          - Submits the HTTP request to a real OS thread via gevent's thread pool
-          - Suspends the current greenlet so the event loop can process WebSocket
-            messages, eel calls, timers, etc. while Ollama is working
-          - Resumes the greenlet when the response arrives
-
-        When called from a real OS thread (fallback):
-          - Executes requests.post directly (OS thread blocks independently,
-            so the gevent hub event loop still runs concurrently)
-
-        Timeout: read timeout is capped at MAX_READ_TIMEOUT so that OS threads
-        unblock within a reasonable time when the process needs to exit.
-
-        If `stream_liveness` is True and the provider is not gemini_native,
-        request is sent with stream=True and liveness-based timeouts:
-          - First byte must arrive within `first_byte_timeout` seconds
-          - No more than `idle_timeout` seconds between any two bytes
-          - Hard wall-clock ceiling of `hard_timeout` seconds total.
-        The SSE stream is reassembled into the same non-streaming response
-        shape so callers don't need to change.
-        """
-        # Cap the read timeout using per-instance limit (shorter for cloud providers)
         max_read = self.read_timeout
         if isinstance(timeout, tuple):
             connect_t, read_t = timeout
@@ -1108,33 +217,14 @@ class OllamaClient:
         elif timeout is not None:
             timeout = min(float(timeout), max_read)
 
-        auth_headers = self._auth_headers()
-
         def _do_post():
             try:
                 connect_t = timeout[0] if isinstance(timeout, tuple) else 10.0
-                if self.auth_style == "gemini_native":
-                    if stream_liveness:
-                        print(f"[THREAD] POST (gemini-stream) {url[:80]}", flush=True)
-                        result = self._gemini_native_stream(
-                            json_payload,
-                            connect_timeout=connect_t,
-                            first_byte_timeout=first_byte_timeout,
-                            idle_timeout=idle_timeout,
-                            hard_timeout=hard_timeout,
-                            log_fn=log_fn,
-                            progress_fn=progress_fn,
-                            is_aborted=is_aborted,
-                        )
-                    else:
-                        # Use Gemini's native generateContent API (bypasses /v1beta/openai/
-                        # compat layer which conflicts with system Google OAuth credentials)
-                        result = self._gemini_native_post(json_payload, timeout)
-                elif stream_liveness:
-                    print(f"[THREAD] POST (stream) {url[:80]}", flush=True)
-                    result = self._stream_chat(
-                        url,
-                        json_payload,
+                if stream_liveness:
+                    print(f"[THREAD] POST (stream/{self.auth_style})", flush=True)
+                    result = self._transport.call(
+                        self._sess(), json_payload,
+                        stream=True,
                         connect_timeout=connect_t,
                         first_byte_timeout=first_byte_timeout,
                         idle_timeout=idle_timeout,
@@ -1144,11 +234,12 @@ class OllamaClient:
                         is_aborted=is_aborted,
                     )
                 else:
-                    print(f"[THREAD] POST {url[:80]}", flush=True)
-                    sess = self._sess()
-                    req = requests.Request("POST", url, json=json_payload, headers=auth_headers)
-                    prepped = sess.prepare_request(req)
-                    result = sess.send(prepped, timeout=timeout)
+                    print(f"[THREAD] POST ({self.auth_style})", flush=True)
+                    result = self._transport.call(
+                        self._sess(), json_payload,
+                        stream=False,
+                        timeout=timeout,
+                    )
                 print(f"[THREAD] HTTP POST completed: status={result.status_code}", flush=True)
                 if not result.ok:
                     try:
@@ -1165,18 +256,15 @@ class OllamaClient:
             import gevent.hub as _gh
             import gevent as _gevent
             hub = _gh.get_hub()
-            # getcurrent() is not hub → we're inside a greenlet, not the hub itself
             if hub is not None and _gevent.getcurrent() is not hub:
                 if _DEBUG: print(f"[GEVENT] Using threadpool for async POST", flush=True)
-                # threadpool.apply() runs _do_post in a real OS thread
-                # and yields the current greenlet back to the hub while waiting
                 result = hub.threadpool.apply(_do_post)
                 if _DEBUG: print(f"[GEVENT] Threadpool returned result", flush=True)
                 return result
         except ImportError:
             if _DEBUG: print(f"[GEVENT] gevent not available, using direct call", flush=True)
         except Exception as e:
-            if _DEBUG: print(f"[GEVENT] Exception in gevent setup: {type(e).__name__}: {e}, falling back to direct call", flush=True)
+            if _DEBUG: print(f"[GEVENT] Exception in gevent setup: {type(e).__name__}: {e}, falling back", flush=True)
 
         return _do_post()
 
@@ -1246,7 +334,6 @@ class OllamaClient:
             for _attempt in range(1, _max_attempts + 1):
                 try:
                     resp = self._post(
-                        self._chat_completions_url(),
                         {
                             "model": model,
                             "messages": [{"role": "user", "content": prompt}],
@@ -1336,7 +423,6 @@ class OllamaClient:
         """Vision completion for image description."""
         try:
             resp = self._post(
-                self._chat_completions_url(),
                 {
                     "model": model,
                     "messages": [
@@ -1364,12 +450,7 @@ class OllamaClient:
             return ""
 
     def list_models(self) -> list[str]:
-        try:
-            r = requests.get(self._models_url(), headers=self._auth_headers(), timeout=5)
-            r.raise_for_status()
-            return [m["id"] for m in r.json().get("data", [])]
-        except Exception:
-            return []
+        return self._transport.list_models(self._sess())
 
     # ── Multi-turn chat with tool calling ─────────────────────────
 
@@ -1642,7 +723,6 @@ class OllamaClient:
                     import time as _time
                     _t0 = _time.monotonic()
                     resp = self._post(
-                        self._chat_completions_url(),
                         payload,
                         _post_timeout,
                         stream_liveness=_stream_liveness,
