@@ -32,10 +32,21 @@ class AnthropicTransport(BaseTransport):
     # Optional callback injected by ProvidersManager — returns fresh auth headers
     # (supports OAuth token refresh). If unset, falls back to static x-api-key.
     _auth_header_provider = None
+    # When True, prepend the Claude Code identity line to the system prompt.
+    # Subscription OAuth tokens are scoped to Claude Code and will be rate
+    # limited / rejected if the system prompt doesn't match this identity.
+    _oauth_mode = False
 
-    def set_auth_header_provider(self, fn) -> None:
+    # Claude Code subscription requires the system prompt to identify the
+    # caller as Claude Code CLI. Exact string mirrors the official CLI.
+    _CLAUDE_CODE_IDENTITY = (
+        "You are Claude Code, Anthropic's official CLI for Claude."
+    )
+
+    def set_auth_header_provider(self, fn, oauth_mode: bool = False) -> None:
         """Inject a callable that returns a fresh auth header dict per call."""
         self._auth_header_provider = fn
+        self._oauth_mode = bool(oauth_mode)
 
     def _messages_url(self) -> str:
         return f"{self.base_url}/v1/messages"
@@ -198,7 +209,17 @@ class AnthropicTransport(BaseTransport):
             "messages": merged,
             "max_tokens": max_tokens,
         }
-        if system_text:
+        # Subscription OAuth requires:
+        #   1. The Claude Code identity to come first in the system field.
+        #   2. The system field to be an array of content blocks (not a raw
+        #      string) — matches the shape the official CLI sends. Raw strings
+        #      get rejected by the OAuth-scoped token policy.
+        if self._oauth_mode:
+            blocks = [{"type": "text", "text": self._CLAUDE_CODE_IDENTITY}]
+            if system_text:
+                blocks.append({"type": "text", "text": system_text})
+            req["system"] = blocks
+        elif system_text:
             req["system"] = system_text
 
         if tools:

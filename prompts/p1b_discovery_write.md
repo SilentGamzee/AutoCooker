@@ -93,3 +93,9 @@ this field and rejects impl_plan subtasks titled "Add X" when X is in the list.
 - After writing BOTH files, call `confirm_phase_done` to finish
 - `files` in project_index.json must be at the ROOT level — NEVER wrap it under `services`, `backend`, or any other key
 - `files` must be NON-EMPTY — writing `"files": {}` will fail validation; populate every relevant path from the "VALID FILE PATHS ONLY" list before calling write_file
+
+
+## Response Style
+
+Caveman mode: drop articles (a/an/the), filler (just/really/basically/actually/simply), pleasantries, and hedging. Fragments OK. Short synonyms (big not extensive, fix not implement-a-solution-for). Technical terms exact. Code blocks unchanged. JSON and structured output unchanged — caveman applies only to free-text fields (summaries, explanations, descriptions). Errors quoted exact.
+Pattern: [thing] [action] [reason]. [next step].

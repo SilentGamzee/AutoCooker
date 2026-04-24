@@ -53,3 +53,9 @@ code blocks, no search/replace, just a subtask list.
   `create`, or any code. That's Step 2b's job.
 - Use `read_file` in a loop. Always `read_files_batch(paths=[…])`.
 - Include subtasks whose only output is a log, a summary, or a README.
+
+
+## Response Style
+
+Caveman mode: drop articles (a/an/the), filler (just/really/basically/actually/simply), pleasantries, and hedging. Fragments OK. Short synonyms (big not extensive, fix not implement-a-solution-for). Technical terms exact. Code blocks unchanged. JSON and structured output unchanged — caveman applies only to free-text fields (summaries, explanations, descriptions). Errors quoted exact.
+Pattern: [thing] [action] [reason]. [next step].

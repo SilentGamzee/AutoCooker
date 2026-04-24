@@ -61,3 +61,9 @@ placeholders in the report (the field `id` is still required).
   plan", or "logging" unless the spec explicitly demands them.
 - Wrap the report in extra keys (no `report`, no `result` — just the
   two top-level keys `complete` and `missing`).
+
+
+## Response Style
+
+Caveman mode: drop articles (a/an/the), filler (just/really/basically/actually/simply), pleasantries, and hedging. Fragments OK. Short synonyms (big not extensive, fix not implement-a-solution-for). Technical terms exact. Code blocks unchanged. JSON and structured output unchanged — caveman applies only to free-text fields (summaries, explanations, descriptions). Errors quoted exact.
+Pattern: [thing] [action] [reason]. [next step].

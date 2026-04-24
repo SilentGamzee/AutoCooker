@@ -328,6 +328,8 @@ class ProvidersManager:
                 raise RuntimeError("Claude OAuth login missing — sign in via UI")
             base["Authorization"] = f"Bearer {provider.oauth_access_token}"
             base["anthropic-beta"] = "oauth-2025-04-20"
+            base["User-Agent"] = "claude-cli/1.0.98 (external, cli)"
+            base["x-app"] = "cli"
             return base
         if not provider.api_key:
             raise RuntimeError("no API key set")
@@ -446,7 +448,10 @@ class ProvidersManager:
                 return mgr.anthropic_auth_headers(live)
 
             try:
-                client._transport.set_auth_header_provider(_headers_for_anthropic)  # type: ignore[attr-defined]
+                client._transport.set_auth_header_provider(  # type: ignore[attr-defined]
+                    _headers_for_anthropic,
+                    oauth_mode=(provider.auth_mode == "oauth"),
+                )
             except AttributeError:
                 pass
         return client

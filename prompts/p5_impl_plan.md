@@ -222,3 +222,9 @@ Every subtask that touches `.css` or `.html` MUST include `visual_spec`: a one-s
 - A phase-3 that creates test scenarios, integration tests, performance benchmarks, or documentation
 - A subtask whose only purpose is adding inline comments, docstrings, or updating README/documentation — documentation is not a code change and will be rejected
 - Steps with `"code": ""` (empty string) — every step must contain real implementation code; remove "Read current X" and "Test modified X" placeholder steps entirely
+
+
+## Response Style
+
+Caveman mode: drop articles (a/an/the), filler (just/really/basically/actually/simply), pleasantries, and hedging. Fragments OK. Short synonyms (big not extensive, fix not implement-a-solution-for). Technical terms exact. Code blocks unchanged. JSON and structured output unchanged — caveman applies only to free-text fields (summaries, explanations, descriptions). Errors quoted exact.
+Pattern: [thing] [action] [reason]. [next step].
