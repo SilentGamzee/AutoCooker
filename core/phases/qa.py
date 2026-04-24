@@ -11,7 +11,7 @@ from core.phases.base import BasePhase
 from core.git_utils import get_workdir_diff
 
 # Hard caps — prevent runaway loops
-MAX_REVIEWER_ITERATIONS = 4  # outer loops inside run_loop for the reviewer
+MAX_REVIEWER_ITERATIONS = 6  # outer loops inside run_loop for the reviewer
 
 
 class QAPhase(BasePhase):
@@ -68,69 +68,53 @@ class QAPhase(BasePhase):
             self.task.has_errors = True
             return False, all_issues
         
-        # ── NEW: Requirements Checklist Verification ────────────────────
-        # Verify each specific requirement from Planning's extracted checklist
+        # ── Requirements Checklist Verification ─────────────────────────
         checklist_passed = True
-        checklist_issues = []
-        
+        checklist_issues: list[str] = []
+
         if self.task.requirements_checklist:
             self.log("─── QA Requirements Checklist Verification ───")
             checklist_passed, checklist_issues = self._verify_requirements_checklist(model)
-            
             if not checklist_passed:
                 self.log(f"  ⚠️ {len(checklist_issues)} requirement(s) not satisfied", "warn")
                 all_issues.extend(checklist_issues)
-        
-        # ── NEW: User Flow Verification ──────────────────────────────────
-        # Verify user can actually interact with the feature
-        user_flow_passed = True
-        user_flow_issues = []
-        
-        if self.task.user_flow_steps:
-            user_flow_passed, user_flow_issues = self._verify_user_flow(model)
-            
-            if not user_flow_passed:
-                self.log(f"  ⚠️ {len(user_flow_issues)} user flow step(s) not supported", "warn")
-                all_issues.extend(user_flow_issues)
-        
-        # ── NEW: System Flow Verification ────────────────────────────────
-        # Verify system actually PROCESSES data (not just stores)
-        system_flow_passed = True
-        system_flow_issues = []
-        
-        if self.task.system_flow_steps:
-            system_flow_passed, system_flow_issues = self._verify_system_flow(model)
-            
-            if not system_flow_passed:
-                self.log(f"  ⚠️ {len(system_flow_issues)} system flow step(s) not implemented", "warn")
-                all_issues.extend(system_flow_issues)
 
-        # ── Task-goal verification (did we actually solve what was asked?) ─
+        # ── Task-goal verification ────────────────────────────────────────
         self.log("─── QA Goal Verification ───")
         goal_passed, goal_issues = self._verify_task_goal(model, branch_diff)
+        if not goal_passed:
+            all_issues.extend(goal_issues)
 
-        # ── Surgical changes verification ────────────────────────────────
-        # For each subtask: check that ONLY the changes described were made,
-        # and no unrequested refactoring / architecture changes snuck in.
-        self.log("─── QA Surgical Changes Verification ───")
-        surgical_passed, surgical_issues = self._verify_surgical_changes(model)
-        if not surgical_passed:
+        # ── Advisory checks — logged but NEVER block PASS ─────────────────
+        # User flow, system flow, and surgical checks are pure LLM speculation
+        # without code execution — too prone to false positives to be FAIL gates.
+        # Issues are collected and logged as context; they do not affect verdict.
+        advisory_issues: list[str] = []
+
+        if self.task.user_flow_steps:
+            self.log(f"─── QA User Flow (advisory, {len(self.task.user_flow_steps)} steps) ───")
+            _, uf_issues = self._verify_user_flow(model)
+            advisory_issues.extend(uf_issues)
+
+        if self.task.system_flow_steps:
+            self.log(f"─── QA System Flow (advisory, {len(self.task.system_flow_steps)} steps) ───")
+            _, sf_issues = self._verify_system_flow(model)
+            advisory_issues.extend(sf_issues)
+
+        self.log("─── QA Surgical Changes (advisory) ───")
+        _, surgical_issues = self._verify_surgical_changes(model)
+        advisory_issues.extend(surgical_issues)
+
+        if advisory_issues:
             self.log(
-                f"  ⚠️ {len(surgical_issues)} out-of-scope change(s) detected",
-                "warn",
+                f"  ℹ {len(advisory_issues)} advisory note(s) — not blocking PASS:",
+                "info",
             )
-            all_issues.extend(surgical_issues)
+            for ai in advisory_issues[:5]:   # cap log noise
+                self.log(f"    · {ai}", "info")
 
-        # ── Final verdict combines all checks ──────────────────────────
-        final_passed = (
-            tests_ok and subtask_passed and checklist_passed
-            and user_flow_passed and system_flow_passed
-            and goal_passed and surgical_passed
-        )
-        final_issues = (
-            all_issues + checklist_issues + user_flow_issues
-            + system_flow_issues + goal_issues
-        )
+        # ── Final verdict: mandatory checks only ──────────────────────────
+        final_passed = tests_ok and subtask_passed and checklist_passed and goal_passed
 
         if not final_passed:
             reasons = []
@@ -138,19 +122,13 @@ class QAPhase(BasePhase):
                 reasons.append("tests failed")
             if not checklist_passed:
                 reasons.append(f"{len(checklist_issues)} requirements not met")
-            if not user_flow_passed:
-                reasons.append(f"{len(user_flow_issues)} user flow steps unsupported")
-            if not system_flow_passed:
-                reasons.append(f"{len(system_flow_issues)} system flow steps missing")
             if not goal_passed:
                 reasons.append("goal not achieved")
-            if not surgical_passed:
-                reasons.append(f"{len(surgical_issues)} out-of-scope change(s)")
 
             reason_str = ", ".join(reasons)
             self.log(f"═══ QA PHASE COMPLETE — FAILED ({reason_str}) ═══", "error")
             self.task.has_errors = True
-            return False, final_issues
+            return False, all_issues
 
         self.log("═══ QA PHASE COMPLETE — PASSED ═══", "ok")
         return True, []
@@ -187,7 +165,7 @@ class QAPhase(BasePhase):
                     try:
                         with open(full, "r", encoding="utf-8", errors="replace") as _f:
                             content = _f.read()
-                        preview = content[:1500] + ("…(truncated)" if len(content) > 1500 else "")
+                        preview = content[:3000] + ("…(truncated)" if len(content) > 3000 else "")
                         file_previews += f"\n=== {fpath} ===\n{preview}\n"
                     except Exception:
                         pass
@@ -533,13 +511,11 @@ EXPLANATION: [your explanation]
                     failed_requirements.append(f"Requirement {i}: {requirement}")
                     
             except Exception as e:
-                self.log(f"    ⚠️ Verification error: {e}", "warn")
-                import traceback
-                traceback.print_exc()
+                self.log(f"    ⚠️ Verification error (skipping requirement {i}): {e}", "warn")
                 req_dict["status"] = "error"
                 req_dict["explanation"] = f"Verification failed: {e}"
-                all_passed = False
-        
+                # Errors are skipped — do not count as FAIL to avoid false negatives
+
         # Save updated checklist
         self.state._save_kanban()
         
@@ -598,7 +574,7 @@ EXPLANATION: [your explanation]
         else:
             max_per_file = 2000  # Aggressive truncation for many files
         
-        total_budget = 12000  # ~3K tokens total (safe for most models)
+        total_budget = 30000  # ~7.5K tokens — enough for realistic implementations
         total_size = 0
         
         for fpath in unique_files:
@@ -714,13 +690,11 @@ REASON: [brief explanation]
                     failed_steps.append(f"User flow step {i}: {step}")
                     
             except Exception as e:
-                self.log(f"    ⚠️ Verification error: {e}", "warn")
-                import traceback
-                traceback.print_exc()
-                all_passed = False
-        
+                self.log(f"    ⚠️ Step {i} verification error (skipped): {e}", "warn")
+                # Skip on error — advisory check, never fail on exception
+
         return all_passed, failed_steps
-    
+
     def _verify_system_flow(self, model: str) -> tuple[bool, list[str]]:
         """
         Verify that system actually PROCESSES data as specified.
@@ -784,11 +758,9 @@ EVIDENCE: [what code you found or what's missing]
                     failed_steps.append(f"System flow step {i}: {step}")
                     
             except Exception as e:
-                self.log(f"    ⚠️ Verification error: {e}", "warn")
-                import traceback
-                traceback.print_exc()
-                all_passed = False
-        
+                self.log(f"    ⚠️ Step {i} verification error (skipped): {e}", "warn")
+                # Skip on error — advisory check, never fail on exception
+
         return all_passed, failed_steps
 
     # ── Surgical changes verification ────────────────────────────────

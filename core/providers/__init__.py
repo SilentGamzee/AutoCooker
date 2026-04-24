@@ -45,6 +45,13 @@ class ProviderConfig:
     base_url: str
     api_key: str = ""
     is_active: bool = True
+    max_parallel: int = 0   # 0 = unlimited; >0 = max concurrent tasks on this provider
+    # Anthropic only — "api_key" (default) or "oauth" (Claude.ai subscription login)
+    auth_mode: str = "api_key"
+    oauth_access_token: str = ""
+    oauth_refresh_token: str = ""
+    oauth_expires_at: int = 0          # unix seconds; 0 = unknown
+    oauth_account_email: str = ""      # display only
 
     def to_dict(self) -> dict:
         return {
@@ -54,19 +61,32 @@ class ProviderConfig:
             "base_url": self.base_url,
             "api_key": self.api_key,
             "is_active": self.is_active,
+            "max_parallel": self.max_parallel,
+            "auth_mode": self.auth_mode,
+            "oauth_access_token": self.oauth_access_token,
+            "oauth_refresh_token": self.oauth_refresh_token,
+            "oauth_expires_at": self.oauth_expires_at,
+            "oauth_account_email": self.oauth_account_email,
         }
 
+    @staticmethod
+    def _mask(value: str) -> str:
+        if not value:
+            return ""
+        if len(value) > 9:
+            return value[:5] + "*" * (len(value) - 9) + value[-4:]
+        return "*" * len(value)
+
     def to_dict_ui(self) -> dict:
-        """Return dict with masked api_key for UI display."""
+        """Return dict with masked secrets for UI display."""
         d = self.to_dict()
-        if d["api_key"]:
-            key = d["api_key"]
-            if len(key) > 9:
-                d["api_key_masked"] = key[:5] + "*" * (len(key) - 9) + key[-4:]
-            else:
-                d["api_key_masked"] = "*" * len(key)
-        else:
-            d["api_key_masked"] = ""
+        d["api_key_masked"] = self._mask(d["api_key"])
+        d["oauth_access_token_masked"] = self._mask(d["oauth_access_token"])
+        d["oauth_refresh_token_masked"] = self._mask(d["oauth_refresh_token"])
+        d["oauth_signed_in"] = bool(d["oauth_access_token"])
+        d.pop("oauth_access_token", None)
+        d.pop("oauth_refresh_token", None)
+        d["max_parallel"] = self.max_parallel
         return d
 
     @staticmethod
@@ -78,6 +98,12 @@ class ProviderConfig:
             base_url=d.get("base_url", ""),
             api_key=d.get("api_key", ""),
             is_active=d.get("is_active", True),
+            max_parallel=int(d.get("max_parallel", 0)),
+            auth_mode=d.get("auth_mode", "api_key"),
+            oauth_access_token=d.get("oauth_access_token", ""),
+            oauth_refresh_token=d.get("oauth_refresh_token", ""),
+            oauth_expires_at=int(d.get("oauth_expires_at", 0) or 0),
+            oauth_account_email=d.get("oauth_account_email", ""),
         )
 
 
@@ -94,11 +120,12 @@ _DEFAULTS = [
 ]
 
 # Known base URLs per type (used by UI to pre-fill the URL field)
+# max_parallel: default parallel task limit (0 = unlimited)
 PROVIDER_DEFAULTS = {
-    "lmstudio":  {"base_url": "http://localhost:1234", "name": "LM Studio"},
-    "omniroute": {"base_url": "https://api.omni-route.com", "name": "OmniRoute"},
-    "gemini":    {"base_url": "https://generativelanguage.googleapis.com/v1beta/openai", "name": "Gemini"},
-    "anthropic": {"base_url": "https://api.anthropic.com", "name": "Anthropic Claude"},
+    "lmstudio":  {"base_url": "http://localhost:1234",                               "name": "LM Studio",      "max_parallel": 0},
+    "omniroute": {"base_url": "https://api.omni-route.com",                          "name": "OmniRoute",      "max_parallel": 0},
+    "gemini":    {"base_url": "https://generativelanguage.googleapis.com/v1beta/openai", "name": "Gemini",     "max_parallel": 2},
+    "anthropic": {"base_url": "https://api.anthropic.com",                           "name": "Anthropic Claude","max_parallel": 0},
 }
 
 
@@ -150,7 +177,8 @@ class ProvidersManager:
                     return p
         return None
 
-    def add(self, type_: str, name: str, base_url: str, api_key: str = "") -> ProviderConfig:
+    def add(self, type_: str, name: str, base_url: str, api_key: str = "",
+            max_parallel: int = 0, auth_mode: str = "api_key") -> ProviderConfig:
         p = ProviderConfig(
             id=str(uuid.uuid4()),
             type=type_,
@@ -158,6 +186,8 @@ class ProvidersManager:
             base_url=base_url.rstrip("/"),
             api_key=api_key,
             is_active=True,
+            max_parallel=max_parallel,
+            auth_mode=auth_mode,
         )
         with self._lock:
             self._providers.append(p)
@@ -183,7 +213,8 @@ class ProvidersManager:
                     return p.is_active
         return None
 
-    def update(self, provider_id: str, name: str = None, base_url: str = None, api_key: str = None) -> Optional[ProviderConfig]:
+    def update(self, provider_id: str, name: str = None, base_url: str = None, api_key: str = None,
+               max_parallel: int = None, auth_mode: str = None) -> Optional[ProviderConfig]:
         """Update mutable fields of a provider. Pass None to leave unchanged."""
         with self._lock:
             for p in self._providers:
@@ -194,6 +225,39 @@ class ProvidersManager:
                         p.base_url = base_url.rstrip("/")
                     if api_key is not None:
                         p.api_key = api_key
+                    if max_parallel is not None:
+                        p.max_parallel = max(0, int(max_parallel))
+                    if auth_mode is not None:
+                        p.auth_mode = auth_mode
+                    self._save()
+                    return p
+        return None
+
+    def set_oauth_tokens(self, provider_id: str, access_token: str, refresh_token: str,
+                         expires_at: int, account_email: str = "") -> Optional[ProviderConfig]:
+        """Persist OAuth tokens on a provider and flip auth_mode to 'oauth'."""
+        with self._lock:
+            for p in self._providers:
+                if p.id == provider_id:
+                    p.auth_mode = "oauth"
+                    p.oauth_access_token = access_token
+                    p.oauth_refresh_token = refresh_token
+                    p.oauth_expires_at = int(expires_at or 0)
+                    if account_email:
+                        p.oauth_account_email = account_email
+                    self._save()
+                    return p
+        return None
+
+    def clear_oauth_tokens(self, provider_id: str) -> Optional[ProviderConfig]:
+        with self._lock:
+            for p in self._providers:
+                if p.id == provider_id:
+                    p.auth_mode = "api_key"
+                    p.oauth_access_token = ""
+                    p.oauth_refresh_token = ""
+                    p.oauth_expires_at = 0
+                    p.oauth_account_email = ""
                     self._save()
                     return p
         return None
@@ -237,15 +301,13 @@ class ProvidersManager:
 
     def _fetch_anthropic_models(self, provider: ProviderConfig) -> list[str]:
         """Fetch model list from the Anthropic /v1/models endpoint."""
-        if not provider.api_key:
-            print(f"[ProvidersManager] fetch_models {provider.name}: no API key set", flush=True)
+        try:
+            headers = self.anthropic_auth_headers(provider)
+        except RuntimeError as e:
+            print(f"[ProvidersManager] fetch_models {provider.name}: {e}", flush=True)
             return []
         base = provider.base_url.rstrip("/")
         url = f"{base}/v1/models"
-        headers = {
-            "x-api-key": provider.api_key,
-            "anthropic-version": "2023-06-01",
-        }
         try:
             r = requests.get(url, headers=headers, timeout=8)
             r.raise_for_status()
@@ -253,6 +315,49 @@ class ProvidersManager:
         except Exception as e:
             print(f"[ProvidersManager] fetch_models {provider.name}: {e}", flush=True)
             return []
+
+    def anthropic_auth_headers(self, provider: ProviderConfig) -> dict:
+        """Produce auth headers for Anthropic API, refreshing OAuth token when near expiry.
+
+        Raises RuntimeError if credentials are missing.
+        """
+        base = {"anthropic-version": "2023-06-01", "content-type": "application/json"}
+        if provider.auth_mode == "oauth":
+            self._ensure_fresh_oauth(provider)
+            if not provider.oauth_access_token:
+                raise RuntimeError("Claude OAuth login missing — sign in via UI")
+            base["Authorization"] = f"Bearer {provider.oauth_access_token}"
+            base["anthropic-beta"] = "oauth-2025-04-20"
+            return base
+        if not provider.api_key:
+            raise RuntimeError("no API key set")
+        base["x-api-key"] = provider.api_key
+        return base
+
+    def _ensure_fresh_oauth(self, provider: ProviderConfig, skew: int = 60) -> None:
+        """Refresh the OAuth access token if it will expire within `skew` seconds."""
+        import time as _t
+        if not provider.oauth_refresh_token:
+            return
+        if provider.oauth_expires_at and provider.oauth_expires_at - int(_t.time()) > skew:
+            return
+        try:
+            from core.providers.anthropic_oauth import refresh_tokens
+            tokens = refresh_tokens(provider.oauth_refresh_token)
+        except Exception as e:
+            print(f"[ProvidersManager] OAuth refresh failed for {provider.name}: {e}", flush=True)
+            return
+        self.set_oauth_tokens(
+            provider.id,
+            access_token=tokens["access_token"],
+            refresh_token=tokens.get("refresh_token") or provider.oauth_refresh_token,
+            expires_at=tokens["expires_at"],
+            account_email=provider.oauth_account_email,
+        )
+        # Mutate the passed-in object so the caller sees fresh values without a re-read.
+        provider.oauth_access_token = tokens["access_token"]
+        provider.oauth_refresh_token = tokens.get("refresh_token") or provider.oauth_refresh_token
+        provider.oauth_expires_at = tokens["expires_at"]
 
     def _fetch_gemini_models(self, provider: ProviderConfig) -> list[str]:
         """Fetch model list via the native Gemini REST API.
@@ -325,12 +430,26 @@ class ProvidersManager:
     def _make_client(self, provider: ProviderConfig) -> "OllamaClient":
         from core.ollama_client import OllamaClient
         auth_style = self._AUTH_STYLES.get(provider.type, "bearer")
-        return OllamaClient(
+        client = OllamaClient(
             base_url=provider.base_url,
             api_key=provider.api_key,
             read_timeout=self._read_timeout_for(provider),
             auth_style=auth_style,
         )
+        # For Anthropic, give transport a live callback so OAuth tokens stay fresh.
+        if provider.type == "anthropic":
+            mgr = self
+            pid = provider.id
+
+            def _headers_for_anthropic() -> dict:
+                live = mgr.get_by_id(pid) or provider
+                return mgr.anthropic_auth_headers(live)
+
+            try:
+                client._transport.set_auth_header_provider(_headers_for_anthropic)  # type: ignore[attr-defined]
+            except AttributeError:
+                pass
+        return client
 
     @staticmethod
     def _normalize_model_id(model_id: str) -> str:

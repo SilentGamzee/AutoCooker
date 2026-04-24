@@ -457,6 +457,26 @@
     </div>
     <div class="modal-providers-body">
 
+      <!-- Claude OAuth code-paste panel -->
+      <div class="prov-oauth-panel hidden" id="prov-oauth-panel" style="border:1px solid var(--border,#2b2b33);padding:12px;border-radius:6px;margin-bottom:12px;background:rgba(88,101,242,0.08)">
+        <div class="prov-section-label" style="margin-top:0">Claude sign-in</div>
+        <div id="prov-oauth-instructions" style="margin-bottom:8px;font-size:13px;line-height:1.4">
+          Browser opened claude.ai for sign-in. Approve access, then copy the authorization code shown (format <code>code#state</code>) and paste it here.
+        </div>
+        <div class="prov-form-row">
+          <div class="prov-form-field prov-form-field--grow">
+            <label class="field-label">Authorization code</label>
+            <input type="text" id="prov-oauth-code" class="inp" placeholder="e.g. abc123…#xyz" autocomplete="off" spellcheck="false" />
+          </div>
+        </div>
+        <div class="prov-form-error hidden" id="prov-oauth-error"></div>
+        <div class="prov-form-actions" style="display:flex;gap:8px;align-items:center">
+          <a href="#" id="prov-oauth-reopen" onclick="reopenClaudeAuthUrl();return false;" style="font-size:12px;margin-right:auto">Re-open browser</a>
+          <button class="btn-ghost btn-sm" onclick="cancelClaudeSignIn()">Cancel</button>
+          <button class="btn-primary btn-sm" onclick="submitClaudeCode()">Submit code</button>
+        </div>
+      </div>
+
       <!-- Provider list -->
       <div class="prov-section-label">Configured providers</div>
       <div class="prov-list" id="prov-list">
@@ -487,10 +507,29 @@
             <input type="text" id="prov-url" class="inp" placeholder="http://localhost:1234" />
           </div>
         </div>
+        <div class="prov-form-row hidden" id="prov-auth-mode-row">
+          <div class="prov-form-field prov-form-field--grow">
+            <label class="field-label">Authentication</label>
+            <label class="prov-auth-radio"><input type="radio" name="prov-auth-mode" value="api_key" checked onchange="onProviderAuthModeChange()"> API key</label>
+            <label class="prov-auth-radio"><input type="radio" name="prov-auth-mode" value="oauth" onchange="onProviderAuthModeChange()"> Sign in with Claude (subscription)</label>
+          </div>
+        </div>
         <div class="prov-form-row" id="prov-key-row">
           <div class="prov-form-field prov-form-field--grow">
             <label class="field-label">API Key <span class="prov-key-hint">sk-…</span></label>
             <input type="password" id="prov-key" class="inp" placeholder="sk-963d3…dbc1" autocomplete="off" />
+          </div>
+        </div>
+        <div class="prov-form-row hidden" id="prov-oauth-row">
+          <div class="prov-form-field prov-form-field--grow">
+            <label class="field-label">Claude account</label>
+            <div id="prov-oauth-status" class="prov-key-hint">After adding the provider, click “Sign in with Claude” in its row.</div>
+          </div>
+        </div>
+        <div class="prov-form-row">
+          <div class="prov-form-field">
+            <label class="field-label">Max parallel tasks <span class="prov-key-hint">0 = unlimited</span></label>
+            <input type="number" id="prov-max-parallel" class="inp" min="0" max="20" placeholder="0" style="width:90px" />
           </div>
         </div>
         <div class="prov-form-error hidden" id="prov-form-error"></div>

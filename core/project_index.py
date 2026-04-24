@@ -52,8 +52,21 @@ _EXT_TO_LANG = {
 _IMAGE_EXTS   = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico", ".bmp"}
 _CONFIG_EXTS  = {".json", ".yaml", ".yml", ".toml", ".ini", ".env", ".cfg", ".conf"}
 _DOC_EXTS     = {".md", ".rst", ".txt"}
-_SKIP_DIRS    = {"__pycache__", "node_modules", ".git", ".claude", "dist", "build",
-                 ".venv", "venv", ".env", "env", "site-packages"}
+_SKIP_DIRS    = {
+    # AutoCooker system dirs
+    ".tasks", ".claude",
+    # VCS
+    ".git", ".svn", ".hg",
+    # IDE / editor
+    ".idea", ".vscode", ".vs",
+    # Python
+    "__pycache__", ".venv", "venv", ".env", "env", "site-packages",
+    ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox",
+    # JS / Node
+    "node_modules", "dist", "build", ".next", ".nuxt", ".output",
+    # Misc build / cache
+    ".cache", ".parcel-cache", ".turbo", "coverage", ".nyc_output",
+}
 _SKIP_EXTS    = {".pyc", ".pyo", ".class", ".o", ".so", ".dll", ".exe",
                  ".lock", ".log", ".DS_Store"}
 
@@ -1288,7 +1301,8 @@ class CrossDepsAnalyzer:
             ".lock",  # package-lock.json etc
         }
         ext = os.path.splitext(rel)[1].lower()
-        return ext in skip_exts or rel.startswith((".tasks", ".git"))
+        first_segment = rel.replace("\\", "/").split("/")[0]
+        return ext in skip_exts or first_segment in _SKIP_DIRS
 
 
 def analyze_cross_deps(project_path: str, file_paths: list[str]) -> dict:

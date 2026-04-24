@@ -91,9 +91,35 @@ OLLAMA    = OllamaClient()
 # Pipeline guard — prevents concurrent runs without holding a lock
 # during the entire pipeline execution (which blocked eel's event loop).
 # _PIPELINE_GATE is held only during the brief check in start_task/restart_task.
-_PIPELINE_GATE     = threading.Lock()
-MAX_CONCURRENT_TASKS = 3                # Maximum number of concurrent tasks
-_RUNNING_TASKS     = set()              # Set of task IDs currently running
+_PIPELINE_GATE        = threading.Lock()
+MAX_CONCURRENT_TASKS  = 3                    # Maximum number of concurrent tasks
+_RUNNING_TASKS        = set()               # Set of task IDs currently running
+_RUNNING_PER_PROVIDER: dict[str, int] = {}  # provider_id → active task count
+_QUEUE_EVENT          = threading.Event()   # Signaled when a slot opens
+
+
+def _get_provider_for_task(task) -> "Optional[ProviderConfig]":
+    """Return the provider for this task's planning model (used for slot counting).
+    Uses fast pattern matching — no HTTP calls."""
+    from typing import Optional as _Opt
+    model_id = (task.models or {}).get("planning", "") if task else ""
+    if not model_id:
+        return None
+    m = model_id.lower()
+    for p in PROVIDERS.get_active():
+        if p.type == "gemini" and ("gemini" in m or "learnlm" in m):
+            return p
+        if p.type == "anthropic" and m.startswith("claude"):
+            return p
+    return None  # local/unknown providers — no per-provider limit applied
+
+
+def _has_provider_capacity(provider) -> bool:
+    """True if provider has free parallel task slots (0 = unlimited)."""
+    limit = provider.max_parallel if provider else 0
+    if not limit:
+        return True
+    return _RUNNING_PER_PROVIDER.get(provider.id, 0) < limit
 
 # ── Auto-restore last working directory ───────────────────────────
 # Load settings first so recent_dirs and last_working_dir are available
@@ -204,11 +230,12 @@ def get_models_by_provider() -> dict:
 
 @eel.expose
 def add_provider(cfg: dict) -> dict:
-    """Add a new provider. cfg: {type, name, base_url, api_key}"""
+    """Add a new provider. cfg: {type, name, base_url, api_key, auth_mode}"""
     type_ = cfg.get("type", "lmstudio")
     name  = (cfg.get("name") or "").strip()
     url   = (cfg.get("base_url") or "").strip()
     key   = (cfg.get("api_key") or "").strip()
+    auth_mode = (cfg.get("auth_mode") or "api_key").strip() or "api_key"
 
     if not name:
         return {"ok": False, "error": "Provider name is required"}
@@ -216,8 +243,16 @@ def add_provider(cfg: dict) -> dict:
         return {"ok": False, "error": "Base URL is required"}
     if type_ in ("omniroute", "gemini") and not key:
         return {"ok": False, "error": f"API key is required for {type_.capitalize()}"}
+    # Anthropic: API key required only when auth_mode == "api_key".
+    # OAuth providers get tokens from the sign-in flow instead.
+    if type_ == "anthropic" and auth_mode == "api_key" and not key:
+        return {"ok": False, "error": "API key is required for Anthropic (or switch to 'Sign in with Claude')"}
 
-    p = PROVIDERS.add(type_=type_, name=name, base_url=url, api_key=key)
+    max_parallel = max(0, int(cfg.get("max_parallel", 0) or 0))
+    p = PROVIDERS.add(
+        type_=type_, name=name, base_url=url, api_key=key,
+        max_parallel=max_parallel, auth_mode=auth_mode,
+    )
     return {"ok": True, "provider": p.to_dict_ui()}
 
 
@@ -238,13 +273,87 @@ def update_provider(provider_id: str, cfg: dict) -> dict:
     p = PROVIDERS.get_by_id(provider_id)
     if not p:
         return {"ok": False, "error": "Provider not found"}
+
+    auth_mode_raw = cfg.get("auth_mode")
+    auth_mode = auth_mode_raw.strip() if isinstance(auth_mode_raw, str) and auth_mode_raw.strip() else None
+    effective_auth = auth_mode or p.auth_mode
+
     if p.type in ("omniroute", "gemini"):
-        # After update, the effective key is api_key if provided, else the existing one
         effective_key = api_key if api_key is not None else p.api_key
         if not effective_key:
             return {"ok": False, "error": f"API key is required for {p.type.capitalize()}"}
+    if p.type == "anthropic" and effective_auth == "api_key":
+        effective_key = api_key if api_key is not None else p.api_key
+        if not effective_key:
+            return {"ok": False, "error": "API key is required for Anthropic (or switch to 'Sign in with Claude')"}
 
-    updated = PROVIDERS.update(provider_id, name=name, base_url=url, api_key=api_key)
+    max_parallel_raw = cfg.get("max_parallel")
+    max_parallel = max(0, int(max_parallel_raw)) if max_parallel_raw is not None else None
+    updated = PROVIDERS.update(
+        provider_id, name=name, base_url=url, api_key=api_key,
+        max_parallel=max_parallel, auth_mode=auth_mode,
+    )
+    if not updated:
+        return {"ok": False, "error": "Provider not found"}
+    return {"ok": True, "provider": updated.to_dict_ui()}
+
+
+# ─── Claude OAuth (subscription login) ───────────────────────────
+
+@eel.expose
+def start_claude_oauth(provider_id: str) -> dict:
+    """Open the browser at claude.ai for OAuth login. Returns {ok, auth_url}."""
+    p = PROVIDERS.get_by_id(provider_id)
+    if not p:
+        return {"ok": False, "error": "Provider not found"}
+    if p.type != "anthropic":
+        return {"ok": False, "error": "OAuth login only available for Anthropic providers"}
+    try:
+        from core.providers import anthropic_oauth
+        result = anthropic_oauth.start_login(provider_id)
+        return {"ok": True, "auth_url": result["auth_url"]}
+    except Exception as e:
+        return {"ok": False, "error": f"Failed to start login: {e}"}
+
+
+@eel.expose
+def complete_claude_oauth(provider_id: str, code: str) -> dict:
+    """Exchange the pasted authorization code for tokens and persist them.
+
+    Returns {ok, email} on success.
+    """
+    p = PROVIDERS.get_by_id(provider_id)
+    if not p:
+        return {"ok": False, "error": "Provider not found"}
+    try:
+        from core.providers import anthropic_oauth
+        tokens = anthropic_oauth.submit_code(provider_id, code)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    PROVIDERS.set_oauth_tokens(
+        provider_id,
+        access_token=tokens["access_token"],
+        refresh_token=tokens["refresh_token"],
+        expires_at=tokens["expires_at"],
+        account_email=tokens.get("account_email", ""),
+    )
+    return {"ok": True, "email": tokens.get("account_email", "")}
+
+
+@eel.expose
+def cancel_claude_oauth(provider_id: str) -> dict:
+    try:
+        from core.providers import anthropic_oauth
+        anthropic_oauth.cancel_login(provider_id)
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@eel.expose
+def logout_claude_oauth(provider_id: str) -> dict:
+    """Clear OAuth tokens and revert to API-key mode."""
+    updated = PROVIDERS.clear_oauth_tokens(provider_id)
     if not updated:
         return {"ok": False, "error": "Provider not found"}
     return {"ok": True, "provider": updated.to_dict_ui()}
@@ -385,22 +494,15 @@ def save_corrections(task_id: str, corrections: str) -> dict:
     return {"ok": True}
 
 
-@eel.expose
-def start_task(task_id: str) -> dict:
-    """Run the pipeline for a task in a background thread."""
-    print("[MAIN] start_task:", task_id, flush=True)
-    task = STATE.get_task(task_id)
-    if not task:
-        return {"ok": False, "error": "Task not found"}
+def _launch_pipeline(task_id: str) -> None:
+    """Spawn the pipeline thread for task_id.
 
-    # Atomically check + mark running so no two pipelines start simultaneously.
-    # _PIPELINE_GATE is held only during the brief check in start_task/restart_task.
-    with _PIPELINE_GATE:
-        if len(_RUNNING_TASKS) >= MAX_CONCURRENT_TASKS:
-            return {"ok": False, "error": f"Maximum number of concurrent tasks ({MAX_CONCURRENT_TASKS}) reached."}
-        if task_id in _RUNNING_TASKS:
-            return {"ok": False, "error": "Task is already running. Abort it first."}
-        _RUNNING_TASKS.add(task_id)
+    Caller MUST have already added task_id to _RUNNING_TASKS and incremented
+    _RUNNING_PER_PROVIDER (under _PIPELINE_GATE) before calling this function.
+    """
+    task = STATE.get_task(task_id)
+    provider = _get_provider_for_task(task)
+    provider_id = provider.id if provider else None
 
     def run():
         try:
@@ -411,6 +513,11 @@ def start_task(task_id: str) -> dict:
         finally:
             with _PIPELINE_GATE:
                 _RUNNING_TASKS.discard(task_id)
+                if provider_id is not None:
+                    _RUNNING_PER_PROVIDER[provider_id] = max(
+                        0, _RUNNING_PER_PROVIDER.get(provider_id, 0) - 1
+                    )
+            _QUEUE_EVENT.set()  # wake up queue processor — a slot just opened
 
     def _run_pipeline():
         STATE.active_task_id = task_id
@@ -844,7 +951,91 @@ def start_task(task_id: str) -> dict:
             STATE.active_task_id = ""
 
     threading.Thread(target=run, daemon=True).start()
+
+
+@eel.expose
+def start_task(task_id: str) -> dict:
+    """Run the pipeline for a task. Queues it if the provider is at capacity."""
+    print("[MAIN] start_task:", task_id, flush=True)
+    task = STATE.get_task(task_id)
+    if not task:
+        return {"ok": False, "error": "Task not found"}
+
+    with _PIPELINE_GATE:
+        if task_id in _RUNNING_TASKS:
+            return {"ok": False, "error": "Task is already running. Abort it first."}
+
+        provider = _get_provider_for_task(task)
+        global_ok   = len(_RUNNING_TASKS) < MAX_CONCURRENT_TASKS
+        provider_ok = _has_provider_capacity(provider)
+
+        if not global_ok or not provider_ok:
+            # Queue instead of rejecting
+            if task.column != "queue":
+                task.column = "queue"
+                STATE._save_kanban()
+                reason = "provider limit" if (not provider_ok) else "global limit"
+                task.add_log(f"  ⏳ Queued — waiting for {reason} to free up", "system", "info")
+                _push_board()
+            return {"ok": True, "queued": True}
+
+        _RUNNING_TASKS.add(task_id)
+        if provider:
+            _RUNNING_PER_PROVIDER[provider.id] = _RUNNING_PER_PROVIDER.get(provider.id, 0) + 1
+
+    _launch_pipeline(task_id)
     return {"ok": True}
+
+
+def _process_queue() -> None:
+    """Check the queue column and start tasks that have free provider slots."""
+    if not STATE.working_dir:
+        return
+    queued = [t for t in STATE.kanban_tasks if t.column == "queue"]
+    if not queued:
+        return
+
+    board_changed = False
+    for task in queued:
+        # Provider lookup outside the lock (no HTTP, pattern-based only)
+        provider = _get_provider_for_task(task)
+
+        launched = False
+        with _PIPELINE_GATE:
+            if len(_RUNNING_TASKS) >= MAX_CONCURRENT_TASKS:
+                break  # global limit reached — stop checking further
+            if task.id in _RUNNING_TASKS:
+                continue
+            if not _has_provider_capacity(provider):
+                continue  # this provider is at capacity; try next task
+
+            _RUNNING_TASKS.add(task.id)
+            if provider:
+                _RUNNING_PER_PROVIDER[provider.id] = _RUNNING_PER_PROVIDER.get(provider.id, 0) + 1
+            launched = True
+
+        if launched:
+            print(f"[QUEUE] Launching queued task {task.id}", flush=True)
+            _launch_pipeline(task.id)
+            board_changed = True
+
+    if board_changed:
+        _gevent_safe(_push_board)
+
+
+def _queue_processor() -> None:
+    """Background thread: process the queue whenever a pipeline slot opens."""
+    while True:
+        _QUEUE_EVENT.wait(timeout=15)  # also poll every 15 s as a safety net
+        _QUEUE_EVENT.clear()
+        try:
+            _process_queue()
+        except Exception:
+            traceback.print_exc()
+
+
+# Start queue processor (daemon — exits with the process)
+threading.Thread(target=_queue_processor, daemon=True, name="queue-processor").start()
 
 
 @eel.expose

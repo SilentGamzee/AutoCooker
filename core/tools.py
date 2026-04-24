@@ -408,6 +408,12 @@ class ToolExecutor:
         # present in working_dir (e.g. workdir not populated for this path),
         # read from fallback_read_root. Writes always go to working_dir.
         self.fallback_read_root = os.path.realpath(fallback_read_root) if fallback_read_root else None
+        # True when working_dir lives inside .tasks/ (coding/QA workdir).
+        # Files there are task-specific copies — must not pollute the global
+        # FileCache; stale content would survive workdir deletion and leak into
+        # the next planning run.
+        _wd_parts = self.working_dir.replace("\\", "/").split("/")
+        self._in_task_workdir: bool = ".tasks" in _wd_parts
         self.cache = cache
         # Hook cache eviction → purge session_read_files so [ALREADY READ] never
         # lies about content availability.
@@ -497,6 +503,21 @@ class ToolExecutor:
             rel = os.path.basename(abs_path)
         return rel.replace("\\", "/")
 
+    @staticmethod
+    def _is_task_internal(rel: str) -> bool:
+        """Return True when rel lives under .tasks/ (task metadata — not a project file)."""
+        return rel.replace("\\", "/").startswith(".tasks/")
+
+    def _skip_global_cache(self, rel: str) -> bool:
+        """Return True when file content must NOT enter the global FileCache.
+
+        Two cases:
+        - rel starts with .tasks/  → task metadata file read from project root
+        - executor operates inside .tasks/ workdir → task-specific copy of a
+          project file; must not survive workdir deletion into subsequent phases
+        """
+        return self._in_task_workdir or self._is_task_internal(rel)
+
     def _validate_path(self, path: str, operation: str) -> str:
         """Validate path using sandbox if enabled."""
         if self.sandbox:
@@ -544,7 +565,8 @@ class ToolExecutor:
         try:
             with open(read_path, "r", encoding="utf-8", errors="replace") as f:
                 content = f.read()
-            self.cache.update_content(rel, content)
+            if not self._skip_global_cache(rel):
+                self.cache.update_content(rel, content)
             if self.on_content_cached:
                 self.on_content_cached(rel, content)
             # Register in session dedup cache
@@ -608,11 +630,13 @@ class ToolExecutor:
             full = os.path.join(abs_path, name)
             kind = "DIR " if os.path.isdir(full) else "FILE"
             entries.append(f"{kind}  {name}")
-        # Refresh cache for this subtree
-        self.cache.update_file_paths(
-            self.working_dir,
-            subdir=os.path.relpath(abs_path, self.working_dir) if abs_path != self.working_dir else "",
-        )
+        # Refresh cache for this subtree (skip for workdir executors — workdir
+        # path entries would appear as stale project skeleton after workdir deletion)
+        if not self._in_task_workdir:
+            self.cache.update_file_paths(
+                self.working_dir,
+                subdir=os.path.relpath(abs_path, self.working_dir) if abs_path != self.working_dir else "",
+            )
         return "\n".join(entries) if entries else "(empty directory)"
 
     def _write_file(self, args: dict) -> str:
@@ -702,7 +726,8 @@ class ToolExecutor:
             with open(abs_path, "w", encoding="utf-8") as f:
                 f.write(content)
             path_rel = self._to_rel(abs_path)
-            self.cache.update_content(path_rel, content)
+            if not self._skip_global_cache(path_rel):
+                self.cache.update_content(path_rel, content)
             if self.on_content_cached:
                 self.on_content_cached(path_rel, content)
             if self.on_file_written:
@@ -759,7 +784,8 @@ class ToolExecutor:
             with open(abs_path, "w", encoding="utf-8") as f:
                 f.write(updated)
             path_rel = self._to_rel(abs_path)
-            self.cache.update_content(path_rel, updated)
+            if not self._skip_global_cache(path_rel):
+                self.cache.update_content(path_rel, updated)
             if self.on_content_cached:
                 self.on_content_cached(path_rel, updated)
             if self.on_file_written:

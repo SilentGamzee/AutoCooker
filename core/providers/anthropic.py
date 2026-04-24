@@ -29,6 +29,14 @@ class AnthropicTransport(BaseTransport):
     - Consecutive user msgs  → merged into one (Anthropic requires alternating turns)
     """
 
+    # Optional callback injected by ProvidersManager — returns fresh auth headers
+    # (supports OAuth token refresh). If unset, falls back to static x-api-key.
+    _auth_header_provider = None
+
+    def set_auth_header_provider(self, fn) -> None:
+        """Inject a callable that returns a fresh auth header dict per call."""
+        self._auth_header_provider = fn
+
     def _messages_url(self) -> str:
         return f"{self.base_url}/v1/messages"
 
@@ -36,6 +44,11 @@ class AnthropicTransport(BaseTransport):
         return f"{self.base_url}/v1/models"
 
     def _auth_headers(self) -> dict:
+        if self._auth_header_provider is not None:
+            headers = dict(self._auth_header_provider())
+            headers.setdefault("anthropic-version", ANTHROPIC_API_VERSION)
+            headers.setdefault("content-type", "application/json")
+            return headers
         return {
             "x-api-key": self.api_key,
             "anthropic-version": ANTHROPIC_API_VERSION,
@@ -73,14 +86,14 @@ class AnthropicTransport(BaseTransport):
 
     def list_models(self, session: requests.Session) -> list[str]:
         """Return Claude model IDs via the Anthropic models endpoint."""
-        if not self.api_key:
+        try:
+            headers = self._auth_headers()
+        except RuntimeError:
+            return []
+        if self._auth_header_provider is None and not self.api_key:
             return []
         try:
-            resp = session.get(
-                self._models_url(),
-                headers=self._auth_headers(),
-                timeout=8,
-            )
+            resp = session.get(self._models_url(), headers=headers, timeout=8)
             resp.raise_for_status()
             return [m["id"] for m in resp.json().get("data", [])]
         except Exception as e:

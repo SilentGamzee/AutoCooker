@@ -803,7 +803,7 @@ function renderLogs(logs) {
   const activePhase = activeTab ? activeTab.dataset.phase : 'all';
   showBucket(activePhase);
 
-  scrollLogsToBottom();
+  scrollLogsToBottom(true);
 }
 
 function updatePhaseStatus(phase, entries) {
@@ -826,7 +826,7 @@ function switchLogPhase(btn, phase) {
   document.querySelectorAll('.log-phase-tab').forEach(b => b.classList.remove('active'));
   btn.classList.add('active');
   showBucket(phase);
-  scrollLogsToBottom();
+  scrollLogsToBottom(true);
 }
 
 function getLogEntryClass(type) {
@@ -925,10 +925,11 @@ function appendLogEntry(entry) {
   scrollLogsToBottom();
 }
 
-function scrollLogsToBottom() {
-  // Scroll the visible bucket's parent panel
+function scrollLogsToBottom(force = false) {
   const panel = document.getElementById('log-entries-panel');
-  if (panel) panel.scrollTop = panel.scrollHeight;
+  if (!panel) return;
+  const atBottom = panel.scrollHeight - panel.scrollTop - panel.clientHeight < 40;
+  if (force || atBottom) panel.scrollTop = panel.scrollHeight;
 }
 
 // ─── Files Tab ───────────────────────────────────────────────────
@@ -1078,7 +1079,7 @@ function switchMTab(btn, tab) {
   }
   // Scroll logs to bottom when opening
   if (tab === 'logs') {
-    setTimeout(scrollLogsToBottom, 50);
+    setTimeout(() => scrollLogsToBottom(true), 50);
   }
 }
 
@@ -1312,10 +1313,17 @@ async function renderProviderList() {
     const activeClass = p.is_active ? 'prov-active' : 'prov-inactive';
     const activeLabel = p.is_active ? 'Active' : 'Inactive';
     const typeLabel   = typeLabels[p.type] || p.type;
-    const keyInfo = p.api_key_masked
-      ? `<span class="prov-key-badge">${esc(p.api_key_masked)}</span>`
-      : '';
-    const needsKey = (p.type === 'omniroute' || p.type === 'gemini' || p.type === 'anthropic');
+    const isOAuth = (p.type === 'anthropic' && p.auth_mode === 'oauth');
+    let keyInfo = '';
+    if (isOAuth) {
+      const who = p.oauth_account_email ? esc(p.oauth_account_email) : 'Claude subscription';
+      keyInfo = p.oauth_signed_in
+        ? `<span class="prov-key-badge" title="Signed in via Claude OAuth">🔑 ${who}</span>`
+        : `<span class="prov-key-badge" style="opacity:.6">not signed in</span>`;
+    } else if (p.api_key_masked) {
+      keyInfo = `<span class="prov-key-badge">${esc(p.api_key_masked)}</span>`;
+    }
+    const needsKey = (p.type === 'omniroute' || p.type === 'gemini' || (p.type === 'anthropic' && !isOAuth));
     return `
       <div class="prov-item ${activeClass}" data-id="${esc(p.id)}" id="prov-item-${esc(p.id)}">
         <div class="prov-item-view">
@@ -1325,10 +1333,18 @@ async function renderProviderList() {
               <span class="prov-type-badge">${esc(typeLabel)}</span>
               <span class="prov-url">${esc(p.base_url)}</span>
               ${keyInfo}
+              ${p.max_parallel ? `<span class="prov-parallel-badge" title="Max parallel tasks">${p.max_parallel} parallel</span>` : ''}
             </div>
           </div>
           <div class="prov-item-actions">
             <span class="prov-status-dot ${activeClass}" title="${activeLabel}"></span>
+            ${p.type === 'anthropic' ? (
+              isOAuth
+                ? (p.oauth_signed_in
+                    ? `<button class="prov-toggle-btn" onclick="signOutClaude('${esc(p.id)}')" title="Sign out">Sign out</button>`
+                    : `<button class="prov-toggle-btn" onclick="signInClaude('${esc(p.id)}')" title="Sign in via claude.ai">Sign in with Claude</button>`)
+                : `<button class="prov-toggle-btn" onclick="switchToClaudeOAuth('${esc(p.id)}')" title="Switch to OAuth login">Use Claude login</button>`
+            ) : ''}
             <button class="prov-edit-btn" onclick="openProviderEdit('${esc(p.id)}')" title="Edit">✎</button>
             <button class="prov-toggle-btn" onclick="toggleProvider('${esc(p.id)}')" title="${p.is_active ? 'Deactivate' : 'Activate'}">
               ${p.is_active ? 'Deactivate' : 'Activate'}
@@ -1413,23 +1429,37 @@ async function saveProviderEdit(id) {
 }
 
 const PROVIDER_DEFAULTS = {
-  lmstudio:   { url: 'http://localhost:1234',                                       needsKey: false },
-  omniroute:  { url: 'https://api.omni-route.com',                                 needsKey: true  },
-  gemini:     { url: 'https://generativelanguage.googleapis.com/v1beta/openai',     needsKey: true  },
-  anthropic:  { url: 'https://api.anthropic.com',                                  needsKey: true  },
+  lmstudio:   { url: 'http://localhost:1234',                                       needsKey: false, maxParallel: 0 },
+  omniroute:  { url: 'https://api.omni-route.com',                                 needsKey: true,  maxParallel: 0 },
+  gemini:     { url: 'https://generativelanguage.googleapis.com/v1beta/openai',     needsKey: true,  maxParallel: 2 },
+  anthropic:  { url: 'https://api.anthropic.com',                                  needsKey: true,  maxParallel: 0 },
 };
 
 function onProviderTypeChange() {
   const type     = document.getElementById('prov-type').value;
   const keyRow   = document.getElementById('prov-key-row');
   const urlInput = document.getElementById('prov-url');
+  const authRow  = document.getElementById('prov-auth-mode-row');
   const def      = PROVIDER_DEFAULTS[type] || PROVIDER_DEFAULTS.lmstudio;
+
+  // Anthropic gets an extra auth-mode selector (API key vs Sign in with Claude).
+  if (authRow) {
+    if (type === 'anthropic') {
+      authRow.classList.remove('hidden');
+      const apiKeyRadio = document.querySelector('input[name="prov-auth-mode"][value="api_key"]');
+      if (apiKeyRadio) apiKeyRadio.checked = true;
+    } else {
+      authRow.classList.add('hidden');
+    }
+  }
 
   if (def.needsKey) {
     keyRow.classList.remove('hidden');
   } else {
     keyRow.classList.add('hidden');
   }
+  // Re-apply auth-mode visibility after we reset key row
+  onProviderAuthModeChange();
 
   // Only auto-fill URL if the field is empty or still holds another provider's default
   const currentIsDefault = Object.values(PROVIDER_DEFAULTS).some(d => d.url === urlInput.value);
@@ -1437,17 +1467,43 @@ function onProviderTypeChange() {
     urlInput.value = def.url;
   }
   urlInput.placeholder = def.url;
+  const mpEl = document.getElementById('prov-max-parallel');
+  if (mpEl && (mpEl.value === '' || Object.values(PROVIDER_DEFAULTS).some(d => String(d.maxParallel) === mpEl.value))) {
+    mpEl.value = def.maxParallel || '';
+  }
+}
+
+function onProviderAuthModeChange() {
+  const type = document.getElementById('prov-type').value;
+  const mode = (document.querySelector('input[name="prov-auth-mode"]:checked') || {}).value || 'api_key';
+  const keyRow   = document.getElementById('prov-key-row');
+  const oauthRow = document.getElementById('prov-oauth-row');
+  if (type !== 'anthropic') {
+    if (oauthRow) oauthRow.classList.add('hidden');
+    return;
+  }
+  if (mode === 'oauth') {
+    keyRow.classList.add('hidden');
+    if (oauthRow) oauthRow.classList.remove('hidden');
+  } else {
+    keyRow.classList.remove('hidden');
+    if (oauthRow) oauthRow.classList.add('hidden');
+  }
 }
 
 async function addProvider() {
   const errEl = document.getElementById('prov-form-error');
   errEl.classList.add('hidden');
 
+  const type = document.getElementById('prov-type').value;
+  const authMode = (document.querySelector('input[name="prov-auth-mode"]:checked') || {}).value || 'api_key';
   const cfg = {
-    type:     document.getElementById('prov-type').value,
-    name:     document.getElementById('prov-name').value.trim(),
-    base_url: document.getElementById('prov-url').value.trim(),
-    api_key:  document.getElementById('prov-key').value.trim(),
+    type,
+    name:         document.getElementById('prov-name').value.trim(),
+    base_url:     document.getElementById('prov-url').value.trim(),
+    api_key:      document.getElementById('prov-key').value.trim(),
+    max_parallel: parseInt(document.getElementById('prov-max-parallel').value || '0', 10) || 0,
+    auth_mode:    (type === 'anthropic') ? authMode : 'api_key',
   };
 
   let res;
@@ -1465,9 +1521,10 @@ async function addProvider() {
   }
 
   // Clear form
-  document.getElementById('prov-name').value = '';
-  document.getElementById('prov-url').value  = '';
-  document.getElementById('prov-key').value  = '';
+  document.getElementById('prov-name').value         = '';
+  document.getElementById('prov-url').value          = '';
+  document.getElementById('prov-key').value          = '';
+  document.getElementById('prov-max-parallel').value = '';
 
   await _refreshAfterProviderChange();
 }
@@ -1488,6 +1545,94 @@ async function removeProvider(providerId) {
     res = await eel.remove_provider(providerId)();
   } catch (e) { alert('Error: ' + e); return; }
   if (!res || !res.ok) { alert((res && res.error) || 'Remove failed'); return; }
+  await _refreshAfterProviderChange();
+}
+
+// ─── Claude OAuth (subscription login) ────────────────────────────
+
+async function switchToClaudeOAuth(providerId) {
+  // Flip the provider to OAuth mode (api_key stays but unused), then open login.
+  let res;
+  try {
+    res = await eel.update_provider(providerId, { auth_mode: 'oauth' })();
+  } catch (e) { alert('Error: ' + e); return; }
+  if (!res || !res.ok) { alert((res && res.error) || 'Update failed'); return; }
+  await renderProviderList();
+  await signInClaude(providerId);
+}
+
+let _claudeOAuthState = { providerId: null, authUrl: '' };
+
+async function signInClaude(providerId) {
+  let start;
+  try {
+    start = await eel.start_claude_oauth(providerId)();
+  } catch (e) { alert('Error: ' + e); return; }
+  if (!start || !start.ok) { alert((start && start.error) || 'Failed to start login'); return; }
+
+  _claudeOAuthState = { providerId, authUrl: start.auth_url || '' };
+  const panel = document.getElementById('prov-oauth-panel');
+  const errEl = document.getElementById('prov-oauth-error');
+  const codeInput = document.getElementById('prov-oauth-code');
+  if (errEl) { errEl.classList.add('hidden'); errEl.textContent = ''; }
+  if (codeInput) { codeInput.value = ''; }
+  if (panel) {
+    panel.classList.remove('hidden');
+    panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    setTimeout(() => codeInput && codeInput.focus(), 80);
+  }
+}
+
+function reopenClaudeAuthUrl() {
+  if (_claudeOAuthState.authUrl) {
+    window.open(_claudeOAuthState.authUrl, '_blank');
+  }
+}
+
+async function cancelClaudeSignIn() {
+  const pid = _claudeOAuthState.providerId;
+  _claudeOAuthState = { providerId: null, authUrl: '' };
+  const panel = document.getElementById('prov-oauth-panel');
+  if (panel) panel.classList.add('hidden');
+  if (pid) {
+    try { await eel.cancel_claude_oauth(pid)(); } catch (e) {}
+  }
+}
+
+async function submitClaudeCode() {
+  const pid = _claudeOAuthState.providerId;
+  const codeInput = document.getElementById('prov-oauth-code');
+  const errEl = document.getElementById('prov-oauth-error');
+  const code = (codeInput && codeInput.value || '').trim();
+  if (!pid) { alert('No login flow in progress'); return; }
+  if (!code) {
+    if (errEl) { errEl.textContent = 'Paste the authorization code first'; errEl.classList.remove('hidden'); }
+    return;
+  }
+  let result;
+  try {
+    result = await eel.complete_claude_oauth(pid, code)();
+  } catch (e) {
+    if (errEl) { errEl.textContent = 'Error: ' + e; errEl.classList.remove('hidden'); }
+    return;
+  }
+  if (!result || !result.ok) {
+    if (errEl) { errEl.textContent = (result && result.error) || 'Sign-in failed'; errEl.classList.remove('hidden'); }
+    return;
+  }
+  const panel = document.getElementById('prov-oauth-panel');
+  if (panel) panel.classList.add('hidden');
+  _claudeOAuthState = { providerId: null, authUrl: '' };
+  await _refreshAfterProviderChange();
+}
+
+async function signOutClaude(providerId) {
+  if (!confirm('Sign out of Claude for this provider?')) return;
+  let res;
+  try {
+    res = await eel.logout_claude_oauth(providerId)();
+  } catch (e) { alert('Error: ' + e); return; }
+  if (!res || !res.ok) { alert((res && res.error) || 'Sign-out failed'); return; }
   await _refreshAfterProviderChange();
 }
 
