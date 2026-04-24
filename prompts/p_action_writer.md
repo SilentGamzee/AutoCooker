@@ -59,14 +59,21 @@ no `insert_after`, no "insert at line 42".
 }
 ```
 
-**C) Append to end of file — empty `search`:**
+**C) Append near end of file — anchor on the LAST existing block:**
+Empty `search` is REJECTED. To add code near the end of the file, pick a
+verbatim anchor (last function/class definition, the `if __name__ ==
+"__main__":` guard, or the final real line) and include it unchanged in
+both `search` and `replace`, with the new code next to it:
 ```json
 {
   "step": 2,
-  "action": "Register new eel function at bottom",
+  "action": "Add helper after the last existing function",
   "file": "main.py",
   "blocks": [
-    {"search": "", "replace": "\n# registered above\n"}
+    {
+      "search": "def shutdown() -> None:\n    \"\"\"Graceful shutdown hook.\"\"\"\n    STATE.persist()",
+      "replace": "def shutdown() -> None:\n    \"\"\"Graceful shutdown hook.\"\"\"\n    STATE.persist()\n\n\ndef register_boot_hooks() -> None:\n    \"\"\"New helper invoked from main().\"\"\"\n    # …\n    return None"
+    }
   ]
 }
 ```
@@ -78,7 +85,7 @@ no `insert_after`, no "insert at line 42".
 ### R1 — `files_to_modify` or `files_to_create` is MANDATORY
 At least one real project file. Rejected if both are empty.
 
-### R2 — Every `search` must be UNIQUE in the target file
+### R2 — Every `search` must be UNIQUE in the target file. Empty `search` is REJECTED.
 If the applier finds `search` zero times → rejected.
 If it finds `search` ≥ 2 times → rejected (ambiguous).
 **Fix:** include more surrounding context verbatim — aim for ≥ 3 distinctive

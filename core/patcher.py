@@ -173,11 +173,20 @@ def validate_block_quality(block: dict) -> tuple[bool, str]:
     search = block["search"]
     replace = block["replace"]
 
-    # Empty search = append mode. Must have meaningful replace.
+    # Empty search is rejected. Blind append is a footgun — the LLM has
+    # previously added code that referenced symbols not present in the
+    # target file (e.g. @eel.expose or STATE in a module that imports
+    # neither). Force an explicit anchor even for "append near the end":
+    # copy the last real declaration or closing block verbatim and include
+    # it in both search and replace.
     if search == "":
-        if not replace.strip():
-            return False, "append-mode block (empty search) has empty replace"
-        return True, "OK (append)"
+        return False, (
+            "search is empty — append-mode is disabled. Pick a verbatim "
+            "anchor from the file (e.g. the last function/class/if-__main__ "
+            "block or an existing closing line) and include it unchanged "
+            "in both `search` and `replace`, adding the new code next to it. "
+            "This forces the patch to land at a verified location."
+        )
 
     # Non-empty search must have enough context to be unique.
     if len(search) < MIN_SEARCH_CHARS:

@@ -210,13 +210,10 @@ def validate_action_file(
                 ))
                 continue
 
-            # Rule #3b — non-empty search must match uniquely in the target file.
-            # Skip if:
-            #  - append mode (empty search)
-            #  - new-file creation
-            #  - target file missing (caught by rule #6 above)
-            if search == "":
-                continue
+            # Rule #3b — search must match uniquely in the target file.
+            # Empty search is now rejected by validate_block_quality above;
+            # nothing to skip here. Skip only for new-file creation or when
+            # the target file is missing (already reported).
             if is_new_file:
                 continue
             if not target_file:
