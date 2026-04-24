@@ -20,7 +20,7 @@ sys.stderr.reconfigure(line_buffering=True)
 import eel
 
 from core.state import AppState, KanbanTask, COLUMNS, TaskAbortedError
-from core.ollama_client import OllamaClient, shutdown_all_clients
+from core.ollama_client import OllamaClient, shutdown_all_clients, ProviderQuotaExhaustedError
 from core import providers as _providers_mod
 from core.eel_bridge import call as _eel_bridge_call, setup as _eel_bridge_setup
 from core.phases.planning import PlanningPhase
@@ -165,6 +165,29 @@ def _push_task(task: KanbanTask):
     STATE._save_kanban()
     task_dict = task.to_dict_ui()
     _gevent_safe(lambda: eel.task_updated(task_dict))
+
+
+def _preserve_resume_point(task: KanbanTask) -> None:
+    """Record which phase was running so the user can Continue from there.
+
+    Called on abort / quota exhaustion / non-fatal crash — any path where the
+    task didn't complete but its partial state on disk (spec.json,
+    implementation_plan.json, subtasks.json, workdir/) is still valid.
+    """
+    in_progress = None
+    for phase in ("planning", "coding", "qa"):
+        if task.phase_status.get(phase) == "in_progress":
+            in_progress = phase
+            break
+    if in_progress is None:
+        # Nothing was mid-flight — pick the first phase that isn't done.
+        for phase in ("planning", "coding", "qa"):
+            if task.phase_status.get(phase) != "done":
+                in_progress = phase
+                break
+    if in_progress:
+        task.resume_from_phase = in_progress
+        task.can_resume = True
 
 
 def _format_qa_as_corrections(
@@ -902,6 +925,21 @@ def _launch_pipeline(task_id: str) -> None:
             task.add_log("■ Task aborted by user", "system", "warn")
             task.column = "human_review"
             task.tags = list(set(task.tags + ["Aborted"]))
+            # Preserve resume point so Continue resumes from the phase that was
+            # running when the user aborted (not from scratch).
+            _preserve_resume_point(task)
+
+        except ProviderQuotaExhaustedError as e:
+            task.add_log(
+                f"■ Provider quota exhausted — aborting task.\n{e}\n"
+                "No other Claude provider available with remaining quota. "
+                "Click Continue once your provider's limit resets.",
+                "system", "error",
+            )
+            task.column = "human_review"
+            task.has_errors = True
+            task.tags = list(set(task.tags + ["Rate Limit", "Needs Review"]))
+            _preserve_resume_point(task)
         
         except (TypeError, AttributeError, NameError, ValueError, KeyError, IndexError) as e:
             # Python code errors - bugs in our code, not Ollama/runtime issues

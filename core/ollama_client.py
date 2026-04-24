@@ -24,6 +24,30 @@ from core.state import FileCache
 from core.providers.base import UrllibResponse
 
 
+class ProviderQuotaExhaustedError(RuntimeError):
+    """Raised when an LLM provider signals a non-transient rate limit / quota
+    exhaustion. Pipeline treats this as fatal (skips retries, aborts the task)
+    because waiting won't help within the current session.
+    """
+    def __init__(self, message: str, provider_hint: str = ""):
+        super().__init__(message)
+        self.provider_hint = provider_hint
+
+
+# Heuristics for distinguishing "real quota exhausted" 429s (where retrying is
+# pointless) from transient burst-limit 429s. If any phrase matches in the
+# response body, we fail fast instead of exhausting the retry schedule.
+_QUOTA_EXHAUSTED_MARKERS = (
+    "would exceed your account's rate limit",
+    "quota exceeded",
+    "daily limit",
+    "monthly limit",
+    "usage limit",
+    "credit balance",
+    "insufficient credit",
+)
+
+
 def _create_transport(auth_style: str, base_url: str, api_key: str):
     """Instantiate the correct provider transport based on auth_style."""
     if auth_style == "gemini_native":
@@ -348,6 +372,14 @@ class OllamaClient:
                     status = getattr(getattr(_e, "response", None), "status_code", 0)
                     if status == 429:
                         self._rl_note_429(log_fn=log_fn)
+                        try:
+                            _body_txt = (getattr(_e, "response", None).text if getattr(_e, "response", None) is not None else "") or ""
+                        except Exception:
+                            _body_txt = ""
+                        if any(m in _body_txt.lower() for m in _QUOTA_EXHAUSTED_MARKERS):
+                            raise ProviderQuotaExhaustedError(
+                                f"Provider quota exhausted (HTTP 429): {_body_txt[:300]}"
+                            ) from _e
                     if status in (429, 502, 503, 504) and _attempt < _max_attempts:
                         import random as _rnd, time as _time
                         hint = self._rl_parse_server_delay(_e) if status == 429 else None
@@ -364,6 +396,10 @@ class OllamaClient:
                             )
                         _time.sleep(backoff)
                         continue
+                    if status == 429:
+                        raise ProviderQuotaExhaustedError(
+                            f"HTTP 429 after {_max_attempts} attempts — provider rate-limited: {_e}"
+                        ) from _e
                     raise
             if resp is None:
                 raise RuntimeError("complete(): no response after retries")
@@ -753,6 +789,22 @@ class OllamaClient:
                         raise RuntimeError(f"Ollama 500 error - {error_msg}") from e
                     if status == 429:
                         self._rl_note_429(log_fn=log_fn)
+                        # Inspect body: if provider says the quota / daily limit
+                        # is exhausted (not a transient burst), abort now — no
+                        # amount of retry within this session will help.
+                        try:
+                            _body_txt = (getattr(e, "response", None).text if getattr(e, "response", None) is not None else "") or ""
+                        except Exception:
+                            _body_txt = ""
+                        _body_lc = _body_txt.lower()
+                        if any(m in _body_lc for m in _QUOTA_EXHAUSTED_MARKERS):
+                            msg = (
+                                f"Provider quota exhausted (HTTP 429): "
+                                f"{_body_txt[:300]}"
+                            )
+                            if log_fn:
+                                log_fn(f"[Ollama] {msg} — aborting, no retries.", "error")
+                            raise ProviderQuotaExhaustedError(msg) from e
                     # 5xx uses the 429 schedule but caps at 4 attempts (less urgent).
                     _this_max = _max_attempts if status == 429 else min(_max_attempts, 4)
                     if status in (429, 502, 503, 504) and _attempt < _this_max:
@@ -773,6 +825,13 @@ class OllamaClient:
                             )
                         _time.sleep(backoff)
                         continue
+                    # 429 retries exhausted — treat as quota-exhausted so the
+                    # pipeline aborts instead of the outer run_loop swallowing
+                    # it and retrying the whole step.
+                    if status == 429:
+                        raise ProviderQuotaExhaustedError(
+                            f"HTTP 429 after {_this_max} attempts — provider rate-limited: {e}"
+                        ) from e
                     raise RuntimeError(f"Ollama HTTP {status} error: {e}") from e
                 except requests.exceptions.ReadTimeout as e:
                     import time as _time, random as _rnd
