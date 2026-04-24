@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -92,17 +93,22 @@ class FileCache:
         # Callback(rel_path) fired when a path is evicted entirely (from both tiers).
         # Used by ToolExecutor to purge its session_read_files dedup.
         self.on_evict: Optional[Callable[[str], None]] = None
+        # Reentrant lock guards _hot/_cold mutations so parallel 2b workers
+        # can read/write the same cache without racing on OrderedDict ops
+        # (move_to_end, popitem). RLock — some methods call each other.
+        self._lock = threading.RLock()
 
     # ── Back-compat dict-like view ───────────────────────────────
     @property
     def file_contents(self) -> dict[str, str]:
         """Read-only merged view for legacy callers (hot + cold, hot last = most recent)."""
-        merged: dict[str, str] = {}
-        for k, v in self._cold.items():
-            merged[k] = v
-        for k, v in self._hot.items():
-            merged[k] = v
-        return merged
+        with self._lock:
+            merged: dict[str, str] = {}
+            for k, v in self._cold.items():
+                merged[k] = v
+            for k, v in self._hot.items():
+                merged[k] = v
+            return merged
 
     def update_file_paths(self, root: str, subdir: str = "") -> list[str]:
         self._root = root
@@ -126,52 +132,57 @@ class FileCache:
     # ── Tier management ──────────────────────────────────────────
     def _promote(self, rel_path: str, content: str) -> None:
         """Put file in hot tier (most recently used). Evict LRU hot→cold if over limit."""
-        self._cold.pop(rel_path, None)
-        if rel_path in self._hot:
-            self._hot.move_to_end(rel_path)
+        with self._lock:
+            self._cold.pop(rel_path, None)
+            if rel_path in self._hot:
+                self._hot.move_to_end(rel_path)
+                self._hot[rel_path] = content
+                return
             self._hot[rel_path] = content
-            return
-        self._hot[rel_path] = content
-        while len(self._hot) > self.HOT_LIMIT:
-            old_key, old_val = self._hot.popitem(last=False)
-            self._cold[old_key] = old_val
-            self._cold.move_to_end(old_key)
-        self._evict_cold_if_full()
+            while len(self._hot) > self.HOT_LIMIT:
+                old_key, old_val = self._hot.popitem(last=False)
+                self._cold[old_key] = old_val
+                self._cold.move_to_end(old_key)
+            self._evict_cold_if_full()
 
     def _evict_cold_if_full(self) -> None:
-        while len(self._cold) > self.COLD_LIMIT:
-            evicted_key, _ = self._cold.popitem(last=False)
-            if self.on_evict:
-                try:
-                    self.on_evict(evicted_key)
-                except Exception:
-                    pass
+        with self._lock:
+            while len(self._cold) > self.COLD_LIMIT:
+                evicted_key, _ = self._cold.popitem(last=False)
+                if self.on_evict:
+                    try:
+                        self.on_evict(evicted_key)
+                    except Exception:
+                        pass
 
     def update_content(self, rel_path: str, content: str) -> None:
         self._promote(rel_path, content)
 
     def get_content(self, rel_path: str) -> Optional[str]:
-        if rel_path in self._hot:
-            self._hot.move_to_end(rel_path)
-            return self._hot[rel_path]
-        if rel_path in self._cold:
-            # Touch in cold tier; do not auto-promote on read — only on explicit use.
-            self._cold.move_to_end(rel_path)
-            return self._cold[rel_path]
-        return None
+        with self._lock:
+            if rel_path in self._hot:
+                self._hot.move_to_end(rel_path)
+                return self._hot[rel_path]
+            if rel_path in self._cold:
+                # Touch in cold tier; do not auto-promote on read — only on explicit use.
+                self._cold.move_to_end(rel_path)
+                return self._cold[rel_path]
+            return None
 
     def has_content(self, rel_path: str) -> bool:
-        return rel_path in self._hot or rel_path in self._cold
+        with self._lock:
+            return rel_path in self._hot or rel_path in self._cold
 
     def purge(self, rel_path: str) -> None:
         """Remove from both tiers. Caller-initiated eviction."""
-        removed = False
-        if rel_path in self._hot:
-            del self._hot[rel_path]
-            removed = True
-        if rel_path in self._cold:
-            del self._cold[rel_path]
-            removed = True
+        with self._lock:
+            removed = False
+            if rel_path in self._hot:
+                del self._hot[rel_path]
+                removed = True
+            if rel_path in self._cold:
+                del self._cold[rel_path]
+                removed = True
         if removed and self.on_evict:
             try:
                 self.on_evict(rel_path)
@@ -185,25 +196,28 @@ class FileCache:
         return "\n".join(self.file_paths) if self.file_paths else "(no files cached yet)"
 
     def hot_paths(self) -> list[str]:
-        return list(self._hot.keys())
+        with self._lock:
+            return list(self._hot.keys())
 
     def cold_paths(self) -> list[str]:
-        return list(self._cold.keys())
+        with self._lock:
+            return list(self._cold.keys())
 
     def get_hot_for_prompt(self, max_chars: int = 12000, per_file_cap: int = 3000) -> list[tuple[str, str]]:
         """Return [(path, rendered_content)] for prompt injection, fitting under max_chars total."""
-        out: list[tuple[str, str]] = []
-        used = 0
-        # Iterate from most-recently-used (hot end) to oldest.
-        for path in reversed(list(self._hot.keys())):
-            content = self._hot[path]
-            snippet = content[:per_file_cap]
-            entry_len = len(path) + len(snippet) + 16  # headers/fences
-            if used + entry_len > max_chars and out:
-                break
-            out.append((path, snippet))
-            used += entry_len
-        return out
+        with self._lock:
+            out: list[tuple[str, str]] = []
+            used = 0
+            # Iterate from most-recently-used (hot end) to oldest.
+            for path in reversed(list(self._hot.keys())):
+                content = self._hot[path]
+                snippet = content[:per_file_cap]
+                entry_len = len(path) + len(snippet) + 16  # headers/fences
+                if used + entry_len > max_chars and out:
+                    break
+                out.append((path, snippet))
+                used += entry_len
+            return out
 
     def skeleton(self, rel_path: str, content: Optional[str] = None) -> str:
         """Compact structural view: signatures, keys, headings. Used for cold files."""
@@ -300,7 +314,7 @@ class KanbanTask:
     title: str
     description: str
     column: str = "planning"
-    models: dict = field(default_factory=lambda: {"planning": "", "coding": "", "qa": ""})
+    models: dict = field(default_factory=lambda: {"planning": "", "coding": "", "qa": "", "indexing": ""})
     git_branch: str = "main"
     project_path: str = ""
     task_dir: str = ""

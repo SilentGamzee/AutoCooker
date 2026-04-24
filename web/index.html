@@ -142,6 +142,10 @@
           <label class="field-label">QA model</label>
           <select id="new-qa-model" class="inp inp-sel" onchange="checkNewTaskProviderStatus()"></select>
         </div>
+        <div class="model-field">
+          <label class="field-label">Indexing model (cheap)</label>
+          <select id="new-indexing-model" class="inp inp-sel" onchange="checkNewTaskProviderStatus()"></select>
+        </div>
       </div>
       <div class="provider-warn hidden" id="new-task-provider-warn"></div>
 
@@ -286,6 +290,10 @@
               <div class="ov-model-row">
                 <label class="field-label">QA</label>
                 <select id="ov-edit-qa-model" class="inp inp-sel"></select>
+              </div>
+              <div class="ov-model-row">
+                <label class="field-label">Indexing</label>
+                <select id="ov-edit-indexing-model" class="inp inp-sel"></select>
               </div>
             </div>
           </div>

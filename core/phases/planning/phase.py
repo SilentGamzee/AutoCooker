@@ -120,11 +120,15 @@ class PlanningPhase(SpecMixin, ActionsMixin, CritiqueMixin, LegacyStepsMixin, Lo
         import threading as _threading
         _index_error: list = []
 
+        # Indexing is described-by-LLM per-file — use a cheap model if configured,
+        # else fall back to the planning model.
+        index_model = (self.task.models.get("indexing") or "").strip() or model
+
         def _run_index():
             try:
                 self._project_index.scan_and_update(
                     ollama=self.ollama,
-                    model=model,
+                    model=index_model,
                     log_fn=self.log,
                     max_files_to_describe=10,
                 )

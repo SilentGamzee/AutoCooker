@@ -36,9 +36,11 @@ READ_FILES_BATCH = {
     "function": {
         "name": "read_files_batch",
         "description": (
-            "Read multiple files at once in a single call. "
-            "Always prefer this over calling read_file one file at a time. "
-            "Returns each file's content separated by a header line."
+            "Read multiple files at once. Returns each file's content separated by a header line. "
+            "BUDGET-CAPPED: total output is capped ~80K chars and each file ~12K chars head. "
+            "For large files or deeper regions, call read_file_range with explicit line range "
+            "instead of re-batching. Only batch files you actually need right now; overflow paths "
+            "return a stub."
         ),
         "parameters": {
             "type": "object",
@@ -576,14 +578,43 @@ class ToolExecutor:
             return f"ERROR reading file: {e}"
 
     def _read_files_batch(self, args: dict) -> str:
-        """Read multiple files at once. Applies same dedup as _read_file per path."""
+        """Read multiple files at once. Applies same dedup as _read_file per path.
+
+        Budget-capped: TOTAL_CAP across all files in one call, PER_FILE_HEAD hard cap
+        per file, PER_FILE_FLOOR guaranteed minimum so later files don't silently
+        vanish. Overflow paths emit a stub header pointing at read_file_range.
+        """
         paths = args.get("paths", [])
         if not paths:
             return "ERROR: 'paths' array is empty"
+        TOTAL_CAP = 80_000
+        PER_FILE_HEAD = 12_000
+        PER_FILE_FLOOR = 2_000
         parts: list[str] = []
-        for path_raw in paths:
-            result = self._read_file({"path": path_raw})
-            parts.append(f"=== {path_raw} ===\n{result}")
+        remaining = TOTAL_CAP
+        for i, path_raw in enumerate(paths):
+            body = self._read_file({"path": path_raw})
+            orig = len(body)
+            if orig > PER_FILE_HEAD:
+                body = body[:PER_FILE_HEAD] + (
+                    f"\n...[truncated — {orig - PER_FILE_HEAD} chars. "
+                    f"Use read_file_range for more]"
+                )
+            slot = max(PER_FILE_FLOOR, remaining)
+            if len(body) > slot:
+                body = body[:slot] + (
+                    f"\n...[batch budget exhausted — full size {orig}]"
+                )
+            parts.append(f"=== {path_raw} ===\n{body}")
+            remaining -= len(body)
+            if remaining <= 0:
+                for extra in paths[i + 1:]:
+                    parts.append(
+                        f"=== {extra} ===\n"
+                        "[skipped — batch budget exhausted; "
+                        "call read_file_range with explicit line range]"
+                    )
+                break
         return "\n\n".join(parts)
 
     def _read_file_range(self, args: dict) -> str:

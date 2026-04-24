@@ -399,6 +399,7 @@ async function saveTaskEdit() {
     planning_model: document.getElementById('ov-edit-planning-model').value,
     coding_model:   document.getElementById('ov-edit-coding-model').value,
     qa_model:       document.getElementById('ov-edit-qa-model').value,
+    indexing_model: document.getElementById('ov-edit-indexing-model').value,
     phases,
   };
 
@@ -419,6 +420,7 @@ function _populateOvModelSelects(task) {
     'ov-edit-planning-model': task.models?.planning || '',
     'ov-edit-coding-model':   task.models?.coding   || '',
     'ov-edit-qa-model':       task.models?.qa       || '',
+    'ov-edit-indexing-model': task.models?.indexing || '',
   };
   const activeProviders = Object.values(cachedModelsByProvider).filter(p => p.is_active);
 
@@ -459,6 +461,7 @@ async function submitTaskModal() {
     planning_model: document.getElementById('new-planning-model').value,
     coding_model:   document.getElementById('new-coding-model').value,
     qa_model:       document.getElementById('new-qa-model').value,
+    indexing_model: document.getElementById('new-indexing-model').value,
     phases,
   };
 
@@ -548,7 +551,7 @@ function populateModal(task) {
   document.getElementById('ov-branch').textContent  = task.git_branch || '—';
   document.getElementById('ov-path').textContent    = task.project_path || '—';
   document.getElementById('ov-models').textContent  =
-    `Planning: ${task.models?.planning || '—'}  |  Coding: ${task.models?.coding || '—'}  |  QA: ${task.models?.qa || '—'}`;
+    `Planning: ${task.models?.planning || '—'}  |  Coding: ${task.models?.coding || '—'}  |  QA: ${task.models?.qa || '—'}  |  Indexing: ${task.models?.indexing || '(planning)'}`;
   const phaseLabels = { planning:'Planning', coding:'Coding', qa:'QA' };
   document.getElementById('ov-phases-view').textContent =
     (task.phases_selected || ['planning','coding','qa']).map(p => phaseLabels[p] || p).join(' → ');
@@ -1673,7 +1676,7 @@ async function reloadModels() {
  * Each provider becomes an <optgroup>.
  */
 function populateModelSelects(modelsByProvider) {
-  const IDS = ['new-planning-model','new-coding-model','new-qa-model'];
+  const IDS = ['new-planning-model','new-coding-model','new-qa-model','new-indexing-model'];
   const activeProviders = Object.values(modelsByProvider).filter(p => p.is_active);
   const totalModels = activeProviders.reduce((s, p) => s + p.models.length, 0);
 
@@ -1711,6 +1714,7 @@ function checkNewTaskProviderStatus() {
     document.getElementById('new-planning-model')?.value,
     document.getElementById('new-coding-model')?.value,
     document.getElementById('new-qa-model')?.value,
+    document.getElementById('new-indexing-model')?.value,
   ].filter(Boolean);
 
   // Build map of model -> provider for ALL providers (including inactive)

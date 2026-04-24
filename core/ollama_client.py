@@ -581,19 +581,37 @@ class OllamaClient:
                 }
                 messages = [first_msg, compress_note] + recent
 
-            # History compaction: shrink bulky tool results older than 4 messages.
-            # Large read_file / list_directory results duplicate info that the
-            # model has already processed; replace body with a pointer, keep the
-            # tool_call_id so the turn remains structurally valid.
-            if len(messages) > 6:
-                for _mi in range(1, len(messages) - 4):
+            # History compaction: tiered by tool-result size.
+            # HUGE payloads (e.g. 500K read_files_batch dumps) get elided after
+            # a single follow-up message — keeping them alive across 3-4 rounds
+            # is the main token-burn pathology. BULK and SMALL tiers age out
+            # more gradually so near-recent small reads stay intact for local
+            # reasoning. tool_call_id is preserved so turn structure remains
+            # valid.
+            _HUGE  = 30_000
+            _BULK  = 5_000
+            _SMALL = 1_500
+            if len(messages) > 3:
+                _last_idx = len(messages) - 1
+                for _mi in range(1, _last_idx):
                     _m = messages[_mi]
                     if _m.get("role") != "tool":
                         continue
                     _content = _m.get("content") or ""
-                    if isinstance(_content, str) and len(_content) > 1500:
+                    if not isinstance(_content, str):
+                        continue
+                    if _content.startswith("[elided"):
+                        continue
+                    _clen = len(_content)
+                    _age  = _last_idx - _mi
+                    _elide = (
+                        (_clen > _HUGE  and _age > 1) or
+                        (_clen > _BULK  and _age > 3) or
+                        (_clen > _SMALL and _age > 4)
+                    )
+                    if _elide:
                         _m["content"] = (
-                            f"[elided — original tool result was {len(_content)} chars; "
+                            f"[elided — original tool result was {_clen} chars; "
                             "cached files remain visible in system prompt]"
                         )
 

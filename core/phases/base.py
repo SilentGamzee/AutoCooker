@@ -48,6 +48,7 @@ def load_prompt(filename: str) -> str:
 
 class BasePhase:
     def __init__(self, state: AppState, task: KanbanTask, phase_name: str):
+        import threading as _threading
         self.state = state
         self.task = task
         self.phase_name = phase_name   # "planning" | "coding" | "qa"
@@ -58,6 +59,11 @@ class BasePhase:
             self.ollama = _providers_mod.get().make_client_for_model(model_id)
         except Exception:
             self.ollama = OllamaClient()
+        # Memoized rendered-file-section cache for parallel 2b workers.
+        # Key: (rel_path, max_lines). Value: pre-rendered numbered block string.
+        # Lives per-phase-instance so entries persist across a run's subtasks.
+        self._file_section_cache: dict = {}
+        self._file_section_lock = _threading.Lock()
 
     # ── Gevent-safe eel dispatcher ────────────────────────────────
     @staticmethod

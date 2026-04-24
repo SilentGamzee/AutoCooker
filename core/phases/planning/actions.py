@@ -236,6 +236,13 @@ class ActionsMixin:
             "info",
         )
 
+        # Pre-render the union of modify_paths once — parallel workers hit the
+        # memo in _render_file_section instead of each re-opening disk.
+        union_paths: list[str] = []
+        for e in entries:
+            union_paths.extend(list(e.get("files_to_modify") or []))
+        self._prewarm_file_sections(wd, union_paths, max_lines=150)
+
         def _one(entry: dict) -> tuple[str, bool]:
             label = str(entry.get("id") or "?")
             ok = False
@@ -287,7 +294,7 @@ class ActionsMixin:
 
         issue_paths = self._extract_paths_from_issues(issues) if issues else []
         file_contents_section = self._load_top_file_contents(
-            wd, top_n=5, max_lines=200, extra_paths=issue_paths
+            wd, top_n=3, max_lines=120, extra_paths=issue_paths
         )
         existing_files = "\n".join(
             f"  {p}" for p in self.state.cache.file_paths[:80]
@@ -413,7 +420,7 @@ class ActionsMixin:
 
         # Inject JUST this subtask's existing files (focused context).
         file_contents_section = self._load_top_file_contents(
-            wd, top_n=0, max_lines=400, extra_paths=modify_paths
+            wd, top_n=0, max_lines=150, extra_paths=modify_paths
         )
 
         # Relevant critic issues for THIS file (targeted-mode retries).
@@ -649,6 +656,62 @@ class ActionsMixin:
                     out.append(rel)
         return out
 
+    def _render_file_section(
+        self, project_path: str, rel_path: str, max_lines: int
+    ) -> str:
+        """Render one file's numbered content block. Memoized across parallel
+        2b workers via self._file_section_cache so overlapping modify_paths
+        (e.g. two subtasks editing the same file) don't re-open disk.
+        """
+        key = (rel_path, int(max_lines))
+        with self._file_section_lock:
+            cached = self._file_section_cache.get(key)
+        if cached is not None:
+            return cached
+
+        abs_path = os.path.join(project_path, rel_path)
+        if not os.path.isfile(abs_path):
+            return ""
+        try:
+            with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
+                raw_lines = f.readlines()
+            total = len(raw_lines)
+            shown = raw_lines[:max_lines]
+            # Char-cap fallback: wide lines can blow up a 150-line slice to 30K+.
+            PER_FILE_CHAR_CAP = 6000
+            raw_text_len = sum(len(ln) for ln in shown)
+            if raw_text_len > PER_FILE_CHAR_CAP and shown:
+                keep = max(1, len(shown) * PER_FILE_CHAR_CAP // raw_text_len)
+                shown = shown[:keep]
+            numbered = "".join(
+                f"{i + 1:4d}: {ln}" for i, ln in enumerate(shown)
+            )
+            if len(shown) < total:
+                numbered += (
+                    f"\n     ... ({total - len(shown)} more lines — "
+                    f"call read_file_range('{rel_path}', start, end) "
+                    f"for specific regions)\n"
+                )
+            section = f"=== {rel_path} (total {total} lines) ===\n{numbered}\n"
+        except Exception:
+            return ""
+
+        with self._file_section_lock:
+            self._file_section_cache[key] = section
+        return section
+
+    def _prewarm_file_sections(
+        self, project_path: str, rel_paths: list[str], max_lines: int
+    ) -> None:
+        """Render the union of paths once before fanning out parallel workers,
+        so each worker reads from memo instead of the disk."""
+        seen: set[str] = set()
+        for rel in rel_paths:
+            norm = str(rel).replace("\\", "/").lstrip("./")
+            if norm and norm not in seen:
+                seen.add(norm)
+                self._render_file_section(project_path, norm, max_lines)
+
     def _load_top_file_contents(
         self,
         project_path: str,
@@ -679,23 +742,9 @@ class ActionsMixin:
 
         sections = []
         for rel_path in merged:
-            abs_path = os.path.join(project_path, rel_path)
-            if not os.path.isfile(abs_path):
-                continue
-            try:
-                with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
-                    raw_lines = f.readlines()
-                total = len(raw_lines)
-                shown = raw_lines[:max_lines]
-                # Format with line numbers so the LLM can use exact line refs in code.line
-                numbered = "".join(
-                    f"{i + 1:4d}: {ln}" for i, ln in enumerate(shown)
-                )
-                if total > max_lines:
-                    numbered += f"\n     ... ({total - max_lines} more lines — call read_file('{rel_path}') for full content)\n"
-                sections.append(f"=== {rel_path} (total {total} lines) ===\n{numbered}\n")
-            except Exception:
-                continue
+            section = self._render_file_section(project_path, rel_path, max_lines)
+            if section:
+                sections.append(section)
 
         if not sections:
             return ""

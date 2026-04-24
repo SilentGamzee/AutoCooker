@@ -445,6 +445,7 @@ def add_task(cfg: dict) -> dict:
             "planning": cfg.get("planning_model", "llama3.1"),
             "coding":   cfg.get("coding_model",   "llama3.1"),
             "qa":       cfg.get("qa_model",        "llama3.1"),
+            "indexing": cfg.get("indexing_model", ""),
         },
         git_branch=cfg.get("git_branch", "main") or "main",
         project_path=cfg.get("project_path") or STATE.working_dir,
@@ -476,6 +477,7 @@ def update_task(task_id: str, cfg: dict) -> dict:
         "planning": cfg.get("planning_model", task.models.get("planning", "")),
         "coding":   cfg.get("coding_model",   task.models.get("coding", "")),
         "qa":       cfg.get("qa_model",        task.models.get("qa", "")),
+        "indexing": cfg.get("indexing_model", task.models.get("indexing", "")),
     }
     task.phases_selected = cfg.get("phases", task.phases_selected)
     task.updated_at = time.strftime("%Y-%m-%dT%H:%M:%S")
