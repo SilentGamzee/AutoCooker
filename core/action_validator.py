@@ -245,6 +245,36 @@ def validate_action_file(
                     f"{target_file}. First line: {head!r}. Add more "
                     f"surrounding context so the match is unique."
                 ))
+            else:
+                _region = data.get("region") or {}
+                _r_file = (_region.get("file") or "").replace("\\", "/").lstrip("./")
+                _t_norm = target_file.replace("\\", "/").lstrip("./")
+                if (isinstance(_region, dict)
+                        and _r_file
+                        and _r_file == _t_norm
+                        and _region.get("start_line")
+                        and _region.get("end_line")):
+                    try:
+                        _r_start = int(_region["start_line"])
+                        _r_end = int(_region["end_line"])
+                    except Exception:
+                        _r_start = _r_end = 0
+                    if _r_start > 0 and _r_end >= _r_start:
+                        idx = target_content.find(search)
+                        if idx >= 0:
+                            line_no = target_content.count("\n", 0, idx) + 1
+                            SLACK = 5
+                            if line_no < _r_start - SLACK or line_no > _r_end + SLACK:
+                                issues.append(_issue(
+                                    fname,
+                                    f"Step {i} block {j}: search matched at line "
+                                    f"{line_no} in {target_file}, but the subtask's "
+                                    f"declared region is L{_r_start}-{_r_end}. "
+                                    f"Patch must stay inside the region (±{SLACK} "
+                                    f"lines for anchor preservation). Move the "
+                                    f"change to the correct region or update "
+                                    f"`region` in the outline."
+                                ))
 
     return issues
 

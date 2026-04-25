@@ -24,11 +24,19 @@ code blocks, no search/replace, just a subtask list.
       "title": "Short imperative title",
       "files_to_modify": ["rel/path/to/file.py"],
       "files_to_create": [],
-      "brief": "1-2 sentences: what this subtask does and why."
+      "brief": "1-2 sentences: what this subtask does and why.",
+      "region": {
+        "file": "rel/path/to/file.py",
+        "anchor_symbol": "ClassName.method or #element-id or .css-selector",
+        "start_line": 386,
+        "end_line": 457
+      }
     }
   ]
 }
 ```
+
+`region` is OPTIONAL for files modified by exactly one subtask, REQUIRED for shared files (see below).
 
 ## Rules
 
@@ -47,6 +55,30 @@ code blocks, no search/replace, just a subtask list.
 - **Ordering matters**: data/state before backend, backend before
   frontend, HTML before JS that binds to it, CSS last.
 - **Do NOT write any other file here** — only `subtasks_outline.json`.
+
+## Shared-file regions — MANDATORY when ≥2 subtasks share a file
+
+If a single file appears in `files_to_modify` of two or more subtasks, EACH such subtask MUST include a `region` object:
+
+- `anchor_symbol` — pick from the `outline` of that file in the project index (formats like `KanbanTask`, `KanbanTask.to_dict`, `#new-task-modal`, `.attachment-list`). Use a symbol within the area you intend to patch.
+- `start_line` / `end_line` — absolute line numbers covering the area. Use the line range shown in the project index outline (`@ L386-457`) and extend by ≤10 lines if needed.
+
+Hard rules for regions on shared files:
+
+- Regions of subtasks targeting the same file MUST NOT overlap. Leave at least 1 line of gap between them.
+- Order subtasks by ascending `start_line` for the same file.
+- If you cannot identify two non-overlapping regions, MERGE the work into a single subtask instead.
+
+Example — two subtasks touching `web/index.html`:
+
+```json
+{"id": "T-002", "files_to_modify": ["web/index.html"],
+ "region": {"file": "web/index.html", "anchor_symbol": "#new-task-modal",
+            "start_line": 120, "end_line": 180}}
+{"id": "T-004", "files_to_modify": ["web/index.html"],
+ "region": {"file": "web/index.html", "anchor_symbol": "#task-detail-modal",
+            "start_line": 240, "end_line": 310}}
+```
 
 ## DO NOT
 - Emit `implementation_steps`, `blocks`, `search`, `replace`,

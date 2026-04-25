@@ -368,8 +368,18 @@
             <span class="lpt-count" id="lpt-count-qa">0</span>
           </button>
         </div>
-        <!-- Right scrollable entries panel -->
-        <div class="log-entries-panel" id="log-entries-panel"></div>
+        <!-- Right column: token summary + scrollable entries panel -->
+        <div class="log-right-column">
+          <div class="log-token-summary" id="log-token-summary">
+            <span class="lts-label">Tokens:</span>
+            <span class="lts-item">prompt <b id="lts-prompt">0</b></span>
+            <span class="lts-item">completion <b id="lts-completion">0</b></span>
+            <span class="lts-item">total <b id="lts-total">0</b></span>
+            <span class="lts-item">cache hit <b id="lts-cache-hit">0%</b></span>
+            <span class="lts-item">requests <b id="lts-requests">0</b></span>
+          </div>
+          <div class="log-entries-panel" id="log-entries-panel"></div>
+        </div>
       </div>
 
       <!-- Files -->

@@ -225,6 +225,8 @@ class ProjectIndex:
                 "description":  existing.get("description", ""),
                 "symbols":      static["symbols"],
                 "imports":      static["imports"],
+                "outline":      static.get("outline", []),
+                "total_lines":  static.get("total_lines", 0),
                 "used_by":      existing.get("used_by", []),
                 "test_files":   _find_test_files(rel, self.data),
                 "type":         _file_type(rel),
@@ -319,10 +321,13 @@ class ProjectIndex:
         ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
         return ranked[:top_n]
 
-    def format_for_prompt(self, files: Optional[list[str]] = None) -> str:
+    def format_for_prompt(self, files: Optional[list[str]] = None, *, with_outline: bool = False) -> str:
         """
         Compact text summary of index entries for use in Ollama prompts.
         One line per file: path | description | symbols | imports
+        If with_outline=True, append outline (symbol @ line range) for each
+        file — lets the model jump straight to read_file_range without an
+        exploratory read_file call.
         """
         entries = files or list(self.data.keys())
         lines = []
@@ -334,12 +339,25 @@ class ProjectIndex:
             sym  = ", ".join(e.get("symbols", [])[:8])
             imp  = ", ".join(e.get("imports", [])[:6])
             desc = e.get("description", "")
-            line = f"{rel} | {desc}"
+            tl   = e.get("total_lines") or 0
+            head = f"{rel}" + (f" ({tl} lines)" if tl else "")
+            line = f"{head} | {desc}"
             if sym:
                 line += f" | symbols: {sym}"
             if imp:
                 line += f" | imports: {imp}"
             lines.append(line)
+            if with_outline:
+                outline = e.get("outline") or []
+                for o in outline[:25]:
+                    nm = o.get("name", "?")
+                    kind = o.get("kind", "")
+                    a = o.get("line", 0)
+                    b = o.get("end_line", a)
+                    span = f"L{a}" if a == b else f"L{a}-{b}"
+                    lines.append(f"    [{kind}] {nm} @ {span}")
+                if len(outline) > 25:
+                    lines.append(f"    …[{len(outline) - 25} more]")
         return "\n".join(lines)
 
     def validate(self, log_fn: Callable[[str], None]) -> tuple[bool, list[str]]:
@@ -458,7 +476,9 @@ class ProjectIndex:
                 "description":  description or existing.get("description", ""),
                 "symbols":      static["symbols"],
                 "imports":      static["imports"],
-                "used_by":      existing.get("used_by", []),   # rebuilt separately
+                "outline":      static.get("outline", []),
+                "total_lines":  static.get("total_lines", 0),
+                "used_by":      existing.get("used_by", []),
                 "test_files":   _find_test_files(rel, self.data),
                 "type":         _file_type(rel),
                 "lang":         _file_lang(rel),
@@ -556,17 +576,21 @@ def _extract_static_info(abs_path: str) -> dict:
     ext = os.path.splitext(abs_path)[1].lower()
     symbols: list[str] = []
     imports: list[str] = []
+    outline: list[dict] = []  # [{name, kind, line, end_line}]
+    total_lines = 0
 
     try:
         with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
             content = f.read()
     except Exception:
-        return {"symbols": symbols, "imports": imports}
+        return {"symbols": symbols, "imports": imports, "outline": outline, "total_lines": 0}
+
+    total_lines = content.count("\n") + 1
 
     if ext == ".py":
-        symbols, imports = _extract_python(content)
+        symbols, imports, outline = _extract_python(content)
     elif ext in (".js", ".ts", ".jsx", ".tsx"):
-        symbols, imports = _extract_js(content)
+        symbols, imports, outline = _extract_js(content)
     elif ext in (".java", ".kt"):
         symbols, imports = _extract_java(content)
     elif ext in (".go",):
@@ -581,45 +605,101 @@ def _extract_static_info(abs_path: str) -> dict:
             pass
     elif ext in (".html", ".htm"):
         symbols, imports = _extract_html(content)
+        outline = _extract_html_outline(content)
     elif ext in (".css", ".scss"):
-        # CSS class/id selectors
         symbols = re.findall(r'[.#]([a-zA-Z][\w-]*)\s*\{', content)[:20]
+        outline = _extract_css_outline(content)
 
-    return {"symbols": list(dict.fromkeys(symbols))[:25],
-            "imports": list(dict.fromkeys(imports))[:25]}
+    return {
+        "symbols":      list(dict.fromkeys(symbols))[:25],
+        "imports":      list(dict.fromkeys(imports))[:25],
+        "outline":      outline[:60],
+        "total_lines":  total_lines,
+    }
 
 
-def _extract_python(content: str) -> tuple[list[str], list[str]]:
+def _extract_python(content: str) -> tuple[list[str], list[str], list[dict]]:
     symbols: list[str] = []
     imports: list[str] = []
+    outline: list[dict] = []
     try:
         tree = ast.parse(content)
-        for node in ast.walk(tree):
+        for node in ast.iter_child_nodes(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                end = getattr(node, "end_lineno", node.lineno) or node.lineno
+                kind = "class" if isinstance(node, ast.ClassDef) else "func"
+                outline.append({
+                    "name": node.name, "kind": kind,
+                    "line": node.lineno, "end_line": end,
+                })
                 if not node.name.startswith("_"):
                     symbols.append(node.name)
+                if isinstance(node, ast.ClassDef):
+                    for sub in node.body:
+                        if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                            sub_end = getattr(sub, "end_lineno", sub.lineno) or sub.lineno
+                            outline.append({
+                                "name": f"{node.name}.{sub.name}",
+                                "kind": "method",
+                                "line": sub.lineno, "end_line": sub_end,
+                            })
+                            if not sub.name.startswith("_"):
+                                symbols.append(sub.name)
             elif isinstance(node, ast.Import):
                 for alias in node.names:
                     imports.append(alias.name.split(".")[0])
             elif isinstance(node, ast.ImportFrom):
                 if node.module:
-                    # Keep relative import resolution: store full dotted path
                     imports.append(node.module)
     except SyntaxError:
         pass
-    return symbols, imports
+    return symbols, imports, outline
 
 
-def _extract_js(content: str) -> tuple[list[str], list[str]]:
-    symbols = re.findall(
-        r'(?:export\s+)?(?:function|class|const|let|var)\s+([A-Za-z_$][\w$]*)',
-        content
+def _extract_js(content: str) -> tuple[list[str], list[str], list[dict]]:
+    symbols: list[str] = []
+    outline: list[dict] = []
+    sym_re = re.compile(
+        r'^\s*(?:export\s+)?(?:async\s+)?(function|class|const|let|var)\s+([A-Za-z_$][\w$]*)'
     )
+    for i, ln in enumerate(content.splitlines(), 1):
+        m = sym_re.match(ln)
+        if m:
+            kind = "class" if m.group(1) == "class" else (
+                "func" if m.group(1) == "function" else "var")
+            name = m.group(2)
+            symbols.append(name)
+            outline.append({"name": name, "kind": kind, "line": i, "end_line": i})
     imports = re.findall(
         r"""(?:import|require)\s*(?:[^'"]*from\s*)?['"]([\w@./\\-]+)['"]""",
         content
     )
-    return symbols[:25], imports[:25]
+    return symbols[:25], imports[:25], outline[:60]
+
+
+def _extract_html_outline(content: str) -> list[dict]:
+    out: list[dict] = []
+    pat = re.compile(r'<([A-Za-z][\w\-]*)\b[^>]*\bid\s*=\s*["\']([^"\']+)["\']')
+    for i, ln in enumerate(content.splitlines(), 1):
+        for m in pat.finditer(ln):
+            out.append({"name": f"#{m.group(2)}", "kind": "element",
+                        "line": i, "end_line": i})
+            if len(out) >= 60:
+                return out
+    return out
+
+
+def _extract_css_outline(content: str) -> list[dict]:
+    out: list[dict] = []
+    pat = re.compile(r'^\s*([.#][\w\-]+(?:\s*[,>+~]\s*[.#][\w\-]+)*)\s*\{')
+    for i, ln in enumerate(content.splitlines(), 1):
+        m = pat.match(ln)
+        if m:
+            out.append({"name": m.group(1).strip(), "kind": "selector",
+                        "line": i, "end_line": i})
+            if len(out) >= 60:
+                break
+    return out
 
 
 def _extract_java(content: str) -> tuple[list[str], list[str]]:

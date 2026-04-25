@@ -54,6 +54,7 @@ For appending near end of file: anchor on last existing function/`if __name__` g
 - **R4** — `search` VERBATIM from current file. Indent/quotes/every char exact. Only trailing whitespace fuzzy-matched.
 - **R5** — `replace` is ONLY source code. No outer JSON braces leaking (`}"`, `"}`, `],` at end → mis-escaped quote, re-emit).
 - **R6** — No `...`, `# existing code`, `# TODO`, `# rest of`. No Review/Analyze/Test subtasks — every action produces real code.
+- **R7** — If the message contains a `REGION ANCHOR` block, every `search` MUST match lines within that region (±5 line slack at the boundary for anchor preservation). The pre-fetched region view shown in the message is the ground truth — copy `search` from it byte-for-byte. Do NOT patch outside the declared lines; another subtask owns the rest of the file.
 
 ---
 

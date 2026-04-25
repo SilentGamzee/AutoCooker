@@ -38,6 +38,37 @@ function task_log_added(taskId, logEntry) {
   scrollLogsToBottom();
 }
 
+eel.expose(task_tokens_updated);
+function task_tokens_updated(taskId, usage) {
+  if (activeTaskId !== taskId) return;
+  renderTokenSummary(usage);
+}
+
+function fmtNum(n) {
+  n = Number(n) || 0;
+  if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M';
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+  return String(n);
+}
+
+function renderTokenSummary(usage) {
+  usage = usage || {};
+  const prompt = usage.prompt || 0;
+  const completion = usage.completion || 0;
+  const total = usage.total || 0;
+  const cacheRead = usage.cache_read || 0;
+  const requests = usage.requests || 0;
+  const cacheCreate = usage.cache_create || 0;
+  const totalInput = prompt + cacheRead + cacheCreate;
+  const hitPct = totalInput > 0 ? Math.round(cacheRead / totalInput * 100) : 0;
+  const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+  set('lts-prompt', fmtNum(prompt));
+  set('lts-completion', fmtNum(completion));
+  set('lts-total', fmtNum(total));
+  set('lts-cache-hit', hitPct + '%');
+  set('lts-requests', fmtNum(requests));
+}
+
 // Live-updating single-line progress. Backend emits these for long-running
 // streams (LLM token stream) instead of spamming a new log row per event.
 // Same progress_id = overwrite; no progress_id = promote to normal log.
@@ -593,6 +624,7 @@ function populateModal(task) {
 
   // Logs tab
   renderLogs(task.logs || []);
+  renderTokenSummary(task.token_usage || {});
 }
 
 function computeProgress(task) {
@@ -862,22 +894,49 @@ function buildLogEntry(entry, container) {
   const msg  = entry.msg  || '';
   const typeClass = getLogEntryClass(type);
 
-  // Collapse long tool_result entries
-  if (type === 'tool_result' && msg.length > 120) {
+  // Collapsible tool_result entries: summary line + expandable body
+  if (type === 'tool_result') {
+    const nlIdx = msg.indexOf('\n');
+    const summary = nlIdx >= 0 ? msg.slice(0, nlIdx) : msg;
+    const body = nlIdx >= 0 ? msg.slice(nlIdx + 1) : '';
+
     const row = document.createElement('div');
-    row.className = `log-entry type-${typeClass}`;
-    const toggle = document.createElement('div');
-    toggle.className = 'log-result-toggle';
-    const body = document.createElement('div');
-    body.className = 'log-result-body';
-    body.textContent = msg;
-    toggle.innerHTML = `<span>▸ Show output</span>`;
-    toggle.onclick = () => {
-      const open = body.classList.toggle('open');
-      toggle.querySelector('span').textContent = open ? '▾ Hide output' : '▸ Show output';
-    };
-    row.appendChild(toggle);
-    row.appendChild(body);
+    row.className = `log-entry log-collapsible type-${typeClass}`;
+
+    const ts = document.createElement('div');
+    ts.className = 'log-ts';
+    ts.textContent = entry.ts || '';
+
+    const main = document.createElement('div');
+    main.className = 'log-collapsible-main';
+
+    const header = document.createElement('div');
+    header.className = 'log-collapsible-header';
+    const caret = document.createElement('span');
+    caret.className = 'log-caret';
+    caret.textContent = body ? '▸' : '·';
+    const summaryEl = document.createElement('span');
+    summaryEl.className = 'log-msg log-collapsible-summary';
+    summaryEl.textContent = summary;
+    header.appendChild(caret);
+    header.appendChild(summaryEl);
+    main.appendChild(header);
+
+    let bodyEl = null;
+    if (body) {
+      bodyEl = document.createElement('pre');
+      bodyEl.className = 'log-collapsible-body';
+      bodyEl.textContent = body;
+      main.appendChild(bodyEl);
+      header.style.cursor = 'pointer';
+      header.onclick = () => {
+        const open = bodyEl.classList.toggle('open');
+        caret.textContent = open ? '▾' : '▸';
+      };
+    }
+
+    row.appendChild(ts);
+    row.appendChild(main);
     container.appendChild(row);
     return;
   }

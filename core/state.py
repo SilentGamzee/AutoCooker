@@ -383,6 +383,18 @@ class KanbanTask:
     provider_error: str = ""     # human-readable error about inactive providers
     has_provider_error: bool = False
 
+    # ══════════════════════════════════════════════════════
+    # Token usage (accumulated across all LLM calls in this task)
+    # ══════════════════════════════════════════════════════
+    token_usage: dict = field(default_factory=lambda: {
+        "prompt": 0,
+        "completion": 0,
+        "total": 0,
+        "cache_read": 0,
+        "cache_create": 0,
+        "requests": 0,
+    })
+
     def to_dict(self) -> dict:
         return {
             "id": self.id, "title": self.title, "description": self.description,
@@ -421,6 +433,8 @@ class KanbanTask:
             # Provider validation
             "provider_error": self.provider_error,
             "has_provider_error": self.has_provider_error,
+            # Token usage
+            "token_usage": self.token_usage,
         }
 
     def to_dict_ui(self) -> dict:
@@ -439,6 +453,28 @@ class KanbanTask:
         self.logs.append({"ts": ts, "phase": phase, "type": t, "msg": msg})
         print(f"[{ts}][{phase}][{t}] {msg}", flush=True)
         self.updated_at = time.strftime("%Y-%m-%dT%H:%M:%S")
+        self._maybe_accumulate_tokens(msg)
+
+    _TOKEN_RE = re.compile(
+        r"tokens:\s*prompt=(\d+),\s*completion=(\d+),\s*total=(\d+)"
+        r"(?:\s*\(cache_read=(\d+),\s*cache_create=(\d+)\))?"
+    )
+
+    def _maybe_accumulate_tokens(self, msg: str) -> None:
+        if "tokens:" not in msg or "prompt=" not in msg:
+            return
+        m = self._TOKEN_RE.search(msg)
+        if not m:
+            return
+        prompt, completion, total = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        cache_read = int(m.group(4) or 0)
+        cache_create = int(m.group(5) or 0)
+        self.token_usage["prompt"] += prompt
+        self.token_usage["completion"] += completion
+        self.token_usage["total"] += total
+        self.token_usage["cache_read"] += cache_read
+        self.token_usage["cache_create"] += cache_create
+        self.token_usage["requests"] += 1
 
     def subtask_progress(self) -> int:
         if not self.subtasks:

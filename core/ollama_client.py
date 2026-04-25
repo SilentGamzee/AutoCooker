@@ -776,8 +776,8 @@ class OllamaClient:
             # their results are re-derivable. Tools producing audit-trail
             # output (test_runner, confirm_*) stay verbatim until the size
             # tiers force elision.
-            _HUGE  = 30_000
-            _BULK  = 5_000
+            _HUGE  = 8_000
+            _BULK  = 3_000
             _SMALL = 1_500
             if len(messages) > 3:
                 # Build tool_call_id → tool_name map so we can apply the
@@ -807,7 +807,7 @@ class OllamaClient:
                     _tname = _id_to_tool.get(_m.get("tool_call_id", ""), "")
                     _is_compactable = _tname in COMPACTABLE_TOOLS
                     # Compactable tools age out one tier earlier.
-                    if _is_compactable and _age > 2:
+                    if _is_compactable and _age > 1:
                         _m["content"] = TIME_BASED_MC_CLEARED_MESSAGE
                         continue
                     _elide = (
@@ -857,11 +857,11 @@ class OllamaClient:
                 )
                 messages.append({"role": "user", "content": nudge})
 
+            nudge = ""
             if not disable_write_nudge and _rounds_without_write >= 5:
                 already_read = ", ".join(sorted(_files_read)[:5])
                 if already_read:
                     already_read = f"[{already_read}{'...' if len(_files_read) > 5 else ''}]"
-                nudge = ""
                 if _rounds_without_write == 5:
                     nudge = (
                         f"⚠️ You've spent {_round} rounds reading but haven't written any files yet. "
@@ -876,13 +876,17 @@ class OllamaClient:
                         "You MUST call write_file or modify_file in THIS round. "
                         "If task is already complete, call confirm_task_done instead."
                     )
-                if nudge:
-                    messages.append({"role": "user", "content": nudge})
+            # Volatile per-round nudges (write-nudge, history summary, last
+            # validation reason). These are rebuilt fresh every round and
+            # appended only to the outgoing payload — never persisted into
+            # `messages` — so the stable prefix can be cached.
+            _transient_tail: list[dict] = []
+            if nudge:
+                _transient_tail.append({"role": "user", "content": nudge})
 
             if len(tool_call_history) > 0:
-                # Компактный summary вместо полных словарей (было: tool_call_history[-30:])
                 history_lines = []
-                for h in tool_call_history[-15:]:
+                for h in tool_call_history[-8:]:
                     name = h.get("tool_name", "?")
                     status = h.get("status", "?")
                     args = h.get("arguments", {})
@@ -901,29 +905,16 @@ class OllamaClient:
                     + "\n".join(history_lines)
                     + "\nUse this to understand what's already done. Don't repeat completed work."
                 )
-                messages.append({"role": "user", "content": history_message})
+                _transient_tail.append({"role": "user", "content": history_message})
 
             if _last_validation_reason:
-                validation_message = (
-                    f"Last validation failure reason: {_last_validation_reason}. "
-                )
-                messages.append({"role": "user", "content": validation_message})
-
-            # Инжектировать только новые файлы (не те, что уже были в предыдущих раундах)
-            new_read_files = {
-                path: info["content"]
-                for path, info in last_read_files.items()
-                if path not in _injected_files
-            }
-            if new_read_files:
-                messages.append({
+                _transient_tail.append({
                     "role": "user",
-                    "content": (
-                        f"Files read this round: {new_read_files}\n"
-                        "Use as context only."
-                    )
+                    "content": f"Last validation failure reason: {_last_validation_reason}. ",
                 })
-                _injected_files.update(new_read_files.keys())
+
+            for path, info in last_read_files.items():
+                _injected_files.add(path)
 
             # Build messages list: system prompt as first message (OpenAI format),
             # not as a top-level "system" field (Ollama-only, rejected by Gemini etc.)
@@ -949,6 +940,9 @@ class OllamaClient:
                 final_messages = cleaned
             if _effective_system and (not final_messages or final_messages[0].get("role") != "system"):
                 final_messages = [{"role": "system", "content": _effective_system}] + final_messages
+
+            if _transient_tail:
+                final_messages = list(final_messages) + _transient_tail
 
             payload: dict = {
                 "model": model,
@@ -1505,6 +1499,20 @@ class OllamaClient:
                     history_record["error"] = error_text
                 tool_call_history.append(history_record)
 
+                if log_fn:
+                    _result_str = str(result)
+                    _result_lines = _result_str.count("\n") + 1
+                    _RESULT_LOG_CAP = 4000
+                    if len(_result_str) > _RESULT_LOG_CAP:
+                        _result_log_body = (
+                            _result_str[:_RESULT_LOG_CAP]
+                            + f"\n…[truncated {len(_result_str) - _RESULT_LOG_CAP} chars]"
+                        )
+                    else:
+                        _result_log_body = _result_str
+                    _summary = f"{tool_name} → {call_status} ({len(_result_str)} chars, {_result_lines} lines)"
+                    log_fn(f"[Tool ◄] {_summary}\n{_result_log_body}", "tool_result")
+
                 tool_message = {"role": "tool", "content": str(result)}
                 if tc.get("id"):
                     tool_message["tool_call_id"] = tc["id"]
@@ -1522,9 +1530,6 @@ class OllamaClient:
                 call_key = (tool_name, json.dumps(raw_args, sort_keys=True))
                 if call_key == _last_call:
                     _repeat_count += 1
-                    if _repeat_count >= REPEAT_LIMIT:
-                        _repeat_count = 0
-                        _last_call = ("", "")
                 else:
                     _last_call = call_key
                     _repeat_count = 1
@@ -1566,11 +1571,12 @@ class OllamaClient:
                         )
                     return "", _tool_calls_made
 
-                if _repeat_count >= REPEAT_LIMIT:
+                _read_repeat_threshold = 2 if tool_name in ("read_file", "read_files_batch") else REPEAT_LIMIT
+                if _repeat_count >= _read_repeat_threshold:
                     if log_fn:
                         log_fn(
                             f"[WARN] Tool '{tool_name}' called {_repeat_count}× in a row "
-                            "with identical args — breaking inner loop.",
+                            f"with identical args (threshold {_read_repeat_threshold}) — breaking inner loop.",
                             "warn",
                         )
                     return "", _tool_calls_made

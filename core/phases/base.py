@@ -196,6 +196,9 @@ class BasePhase:
         task_id = self.task.id
         entry   = self.task.logs[-1]
         self._gevent_safe(lambda: eel.task_log_added(task_id, entry))
+        if "tokens:" in msg and "prompt=" in msg:
+            usage = dict(self.task.token_usage)
+            self._gevent_safe(lambda: eel.task_tokens_updated(task_id, usage))
 
     def progress(self, msg: str, progress_id: str = "llm-stream", log_type: str = "info"):
         """
@@ -385,20 +388,59 @@ class BasePhase:
     # Project Context Methods (Relevance Filtering)
     # ══════════════════════════════════════════════════════════════════
 
+    def _lazy_fill_outline(self, files_dict: dict) -> None:
+        """Populate `outline` and `total_lines` for index entries missing them.
+
+        Older index files have only flat `symbols` lists. Refresh static info
+        on read so prompts always carry line-anchored outlines without
+        forcing a full re-scan.
+        """
+        from core.project_index import _extract_static_info as _ext
+        project_root = self.task.project_path or self.state.working_dir
+        for rel, info in list(files_dict.items()):
+            if not isinstance(info, dict):
+                continue
+            if info.get("outline"):
+                continue
+            abs_path = os.path.join(project_root, rel)
+            if not os.path.isfile(abs_path):
+                continue
+            try:
+                static = _ext(abs_path)
+            except Exception:
+                continue
+            if static.get("outline"):
+                info["outline"] = static["outline"]
+            if static.get("total_lines"):
+                info["total_lines"] = static["total_lines"]
+
     def _load_project_index_file(self) -> dict | None:
-        """Load project_index.json from task_dir or project root."""
+        """Load project_index.json from task_dir or project root.
+
+        ProjectIndex.save writes a flat top-level path-keyed dict; downstream
+        code expects either {"files": {...}} or {"services": {...}}. Detect
+        bare-flat shape and wrap it as {"files": {...}} so the rest of the
+        pipeline works unchanged.
+        """
         import json
-        
         paths_to_try = [
             os.path.join(self.task.task_dir, "project_index.json"),
             os.path.join(self.task.project_path or self.state.working_dir, "project_index.json"),
         ]
-        
         for path in paths_to_try:
             if os.path.isfile(path):
                 try:
                     with open(path, "r", encoding="utf-8") as f:
-                        return json.load(f)
+                        raw = json.load(f)
+                    if isinstance(raw, dict) and raw and "services" not in raw and "files" not in raw:
+                        if all(isinstance(v, dict) for v in raw.values()):
+                            self._lazy_fill_outline(raw)
+                            return {"files": raw}
+                    if isinstance(raw, dict):
+                        files = raw.get("files")
+                        if isinstance(files, dict):
+                            self._lazy_fill_outline(files)
+                    return raw
                 except Exception as e:
                     print(f"[WARN] Failed to load {path}: {e}", flush=True)
         return None
@@ -474,6 +516,27 @@ class BasePhase:
         """Filter files by keyword matching in path/description/symbols."""
         matches = []
 
+        # Bare-flat format produced by ProjectIndex.save: top-level keys are
+        # file paths directly. Detect and route through the same matcher.
+        if project_index and "services" not in project_index and "files" not in project_index:
+            for file_path, file_info in project_index.items():
+                if not isinstance(file_info, dict):
+                    continue
+                path_lower = file_path.lower()
+                if any(kw in path_lower for kw in keywords):
+                    matches.append(file_path); continue
+                desc = (file_info.get("description") or "").lower()
+                if any(kw in desc for kw in keywords):
+                    matches.append(file_path); continue
+                symbols = file_info.get("symbols") or []
+                if any(any(kw in s.lower() for kw in keywords) for s in symbols if isinstance(s, str)):
+                    matches.append(file_path); continue
+                outline = file_info.get("outline") or []
+                if any(any(kw in (o.get("name") or "").lower() for kw in keywords)
+                       for o in outline if isinstance(o, dict)):
+                    matches.append(file_path)
+            return matches
+
         # New flat format: {files: {path: {description, symbols, language}}}
         flat_files = project_index.get("files")
         if isinstance(flat_files, dict):
@@ -540,9 +603,17 @@ class BasePhase:
         compact_index = []
         all_paths: set[str] = set()
 
+        # Bare-flat format (top-level path → meta dict)
+        if project_index and "services" not in project_index and "files" not in project_index:
+            for file_path, file_info in project_index.items():
+                if not isinstance(file_info, dict):
+                    continue
+                desc = file_info.get("description", "No description")
+                compact_index.append(f"{file_path}: {desc}")
+                all_paths.add(file_path)
         # New flat format: {files: {path: {description, symbols, language}}}
-        flat_files = project_index.get("files")
-        if isinstance(flat_files, dict):
+        elif isinstance(project_index.get("files"), dict):
+            flat_files = project_index["files"]
             for file_path, file_info in flat_files.items():
                 if not isinstance(file_info, dict):
                     continue
@@ -631,11 +702,20 @@ Maximum {max_files} files."""
         """Format single file entry for token counting."""
         desc = file_info.get("description", "")
         symbols = file_info.get("symbols", [])
-        
-        formatted = f"**{file_path}**: {desc}"
-        if symbols:
+        outline = file_info.get("outline", [])
+        total_lines = file_info.get("total_lines", 0)
+
+        head = f"**{file_path}**" + (f" ({total_lines} lines)" if total_lines else "")
+        formatted = f"{head}: {desc}"
+        if outline:
+            for o in outline[:20]:
+                if not isinstance(o, dict):
+                    continue
+                a = o.get("line", 0); b = o.get("end_line", a)
+                span = f"L{a}" if a == b else f"L{a}-{b}"
+                formatted += f"\n  [{o.get('kind','')}] {o.get('name','?')} @ {span}"
+        elif symbols:
             formatted += f"\n  Symbols: [{', '.join(symbols[:5])}]"
-        
         return formatted
 
     def _prioritize_files(self, file_paths: list[str]) -> list[str]:
@@ -673,7 +753,25 @@ Maximum {max_files} files."""
         """Batch project index to fit within token limit."""
         batched = {"services": {}}
         current_tokens = 0
-        
+
+        # Files-flat shortcut — collapse into single synthetic service so the
+        # downstream formatter/section renderer doesn't need a separate path.
+        flat_files = project_index.get("files")
+        if isinstance(flat_files, dict):
+            svc = batched["services"].setdefault(
+                "project", {"type": "code", "files": {}}
+            )
+            for fp in relevant_files:
+                fi = flat_files.get(fp)
+                if not isinstance(fi, dict):
+                    continue
+                entry_tokens = self._count_tokens(self._format_single_file(fp, fi))
+                if current_tokens + entry_tokens > max_tokens:
+                    break
+                svc["files"][fp] = fi
+                current_tokens += entry_tokens
+            return batched
+
         services = project_index.get("services", {})
         
         if isinstance(services, dict):
@@ -774,15 +872,32 @@ Maximum {max_files} files."""
                 
                 desc = file_info.get("description", "No description")
                 symbols = file_info.get("symbols", [])
-                
-                lines.append(f"**{file_path}**: {desc}")
-                
-                if symbols and isinstance(symbols, list):
+                outline = file_info.get("outline", [])
+                total_lines = file_info.get("total_lines", 0)
+
+                head = f"**{file_path}**"
+                if total_lines:
+                    head += f" ({total_lines} lines)"
+                lines.append(f"{head}: {desc}")
+
+                if outline and isinstance(outline, list):
+                    for o in outline[:20]:
+                        if not isinstance(o, dict):
+                            continue
+                        nm = o.get("name", "?")
+                        kind = o.get("kind", "")
+                        a = o.get("line", 0)
+                        b = o.get("end_line", a)
+                        span = f"L{a}" if a == b else f"L{a}-{b}"
+                        lines.append(f"  [{kind}] {nm} @ {span}")
+                    if len(outline) > 20:
+                        lines.append(f"  …(+{len(outline) - 20} more symbols)")
+                elif symbols and isinstance(symbols, list):
                     symbols_str = ", ".join(str(s) for s in symbols[:5])
                     if len(symbols) > 5:
                         symbols_str += f" (+{len(symbols) - 5} more)"
                     lines.append(f"  Symbols: [{symbols_str}]")
-                
+
                 lines.append("")
         
         return "\n".join(lines)
@@ -987,6 +1102,53 @@ Token count: {token_count} / {config['max_total_tokens']}
             return f"(Could not read {file_path}: {e})"
 
     # ── Executor factory ─────────────────────────────────────────
+    def _maybe_publish_action_subtask(self, rel_path: str, content: str) -> None:
+        """When an action file (`actions/T*.json` under task_dir) is written,
+        parse it and append/update task.subtasks immediately so the UI reflects
+        progress without waiting for the full step6 load."""
+        import json as _json
+        norm = rel_path.replace("\\", "/")
+        if "/actions/" not in norm and not norm.startswith("actions/"):
+            return
+        if not norm.endswith(".json"):
+            return
+        try:
+            data = _json.loads(content) if isinstance(content, str) else content
+        except Exception:
+            return
+        if not isinstance(data, dict):
+            return
+        sid = str(data.get("id") or os.path.basename(norm).replace(".json", ""))
+        entry = {
+            "id":                   sid,
+            "title":                data.get("title", ""),
+            "description":          data.get("description", ""),
+            "files_to_create":      data.get("files_to_create", []),
+            "files_to_modify":      data.get("files_to_modify", []),
+            "patterns_from":        data.get("patterns_from", []),
+            "implementation_steps": data.get("implementation_steps", []),
+            "visual_spec":          data.get("visual_spec", ""),
+            "status":               data.get("status", "pending"),
+            "action_file":          os.path.join(self.task.task_dir, norm.lstrip("/")),
+        }
+        existing = self.task.subtasks or []
+        replaced = False
+        for i, s in enumerate(existing):
+            if str(s.get("id")) == sid:
+                existing[i] = entry
+                replaced = True
+                break
+        if not replaced:
+            existing.append(entry)
+            existing.sort(key=lambda s: str(s.get("id", "")))
+        self.task.subtasks = existing
+        try:
+            self.state.save_subtasks_for_task(self.task)
+        except Exception:
+            pass
+        task_dict = self.task.to_dict_ui()
+        self._gevent_safe(lambda: eel.task_updated(task_dict))
+
     def _make_executor(self, wd: str, **kwargs) -> "ToolExecutor":
         """
         Create a ToolExecutor pre-wired with:
@@ -1004,10 +1166,24 @@ Token count: {token_count} / {config['max_total_tokens']}
         def _cache_content(rel_path: str, content: str):
             task.cache_content(rel_path, content)
 
+        def _on_file_written(rel_path: str, content: str):
+            try:
+                self._maybe_publish_action_subtask(rel_path, content)
+            except Exception as _e:
+                if _DEBUG: print(f"[publish_subtask] {_e}", flush=True)
+
+        # If caller supplied their own on_file_written, chain it.
+        _user_hook = kwargs.pop("on_file_written", None)
+        def _composite_on_file_written(rel_path: str, content: str):
+            _on_file_written(rel_path, content)
+            if callable(_user_hook):
+                _user_hook(rel_path, content)
+
         return ToolExecutor(
             working_dir=wd,
             cache=self.state.cache,
             on_content_cached=_cache_content,
+            on_file_written=_composite_on_file_written,
             log_fn=self.log,
             # Sandbox always anchored to task_dir; project_path for read-only reference
             sandbox=create_sandbox(
@@ -1347,6 +1523,25 @@ Token count: {token_count} / {config['max_total_tokens']}
                             "JSON does NOT support // or /* */ comments.\n"
                             "Remove ALL comments and write pure JSON.\n\n"
                         )
+
+                if tool_calls_made > 0 and "not written" in (reason or "").lower():
+                    import re as _re_nw
+                    m_nw = _re_nw.search(r"([A-Za-z0-9_./\\-]+\.json)\s*not\s*written", reason or "")
+                    target_path = m_nw.group(1) if m_nw else "the action JSON"
+                    retry_msg += (
+                        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        "🛑 STOP READING — START WRITING\n"
+                        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                        f"You spent {tool_calls_made} tool call(s) without producing {target_path}.\n"
+                        "All file content you need is already in the system prompt outline\n"
+                        "(symbols with line ranges) plus prior tool results in this thread.\n\n"
+                        "DO NOT call read_file on a path you have already read this session —\n"
+                        "the response will be a stub. If you need a specific region, call\n"
+                        f"read_file_range(path, start_line, end_line) ONCE, then write_file.\n\n"
+                        f"YOUR NEXT TOOL CALL MUST BE write_file FOR {target_path}.\n"
+                        "No more reads. No more text descriptions. Write the JSON now.\n"
+                        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                    )
 
                 if tool_calls_made == 0:
                     # If the validator said "<tool_name> not yet called",

@@ -554,6 +554,24 @@ class ToolExecutor:
                 f"[ALREADY READ] {rel} — content is in 'Relevant cached files'. "
                 f"Do NOT call read_file on this path again."
             )
+        if rel in self.session_read_files:
+            cached = self.session_read_files[rel]
+            total_lines = cached.count("\n") + 1
+            banner = (
+                f"[ALREADY READ] ‼️ STOP — read_file('{rel}') already returned content this session "
+                f"({total_lines} lines, {len(cached)} chars). Re-reading is wasted tokens.\n"
+                f"NEXT ACTION: either\n"
+                f"  (a) call read_file_range(path='{rel}', start_line=N, end_line=M) "
+                f"with concrete line numbers from the skeleton below, OR\n"
+                f"  (b) call write_file with the action JSON NOW — copy `search` blocks "
+                f"verbatim from the head/range view, do NOT invent them.\n"
+                f"Below is the SAME view as before (head + skeleton with line numbers); "
+                f"this is the last time read_file will return content for this path.\n\n"
+            )
+            READ_FILE_CAP = 12_000
+            if len(cached) > READ_FILE_CAP:
+                return banner + self._truncated_with_skeleton(rel, cached, READ_FILE_CAP)
+            return banner + cached
 
         # Primary: working_dir; fallback: fallback_read_root (e.g. project_path)
         read_path = abs_path if os.path.isfile(abs_path) else None
@@ -571,11 +589,77 @@ class ToolExecutor:
                 self.cache.update_content(rel, content)
             if self.on_content_cached:
                 self.on_content_cached(rel, content)
-            # Register in session dedup cache
             self.session_read_files[rel] = content
+            READ_FILE_CAP = 12_000
+            if len(content) > READ_FILE_CAP:
+                return self._truncated_with_skeleton(rel, content, READ_FILE_CAP)
             return content
         except Exception as e:
             return f"ERROR reading file: {e}"
+
+    def _truncated_with_skeleton(self, rel: str, content: str, head_cap: int) -> str:
+        """For big files: head with line numbers + skeleton (def/class @ line N) + hint.
+
+        Lets model spot target symbols and fetch exact line range via
+        read_file_range instead of re-reading the whole file.
+        """
+        import re as _re
+        all_lines = content.splitlines()
+        total_lines = len(all_lines)
+        # Head: first ~150 lines or head_cap chars, whichever smaller
+        head_lines: list[str] = []
+        head_chars = 0
+        for i, ln in enumerate(all_lines, 1):
+            piece = f"{i:4d}\t{ln}"
+            if head_chars + len(piece) + 1 > head_cap or i > 200:
+                break
+            head_lines.append(piece)
+            head_chars += len(piece) + 1
+        head_end_line = len(head_lines)
+
+        # Skeleton with line numbers for the rest
+        ext = os.path.splitext(rel)[1].lower()
+        skel: list[str] = []
+        if ext == ".py":
+            for i, ln in enumerate(all_lines, 1):
+                if i <= head_end_line:
+                    continue
+                if _re.match(r"^\s*(def |class |async def )", ln):
+                    skel.append(f"  L{i:>5}: {ln.rstrip()}")
+        elif ext in (".js", ".ts", ".tsx", ".jsx"):
+            for i, ln in enumerate(all_lines, 1):
+                if i <= head_end_line:
+                    continue
+                if _re.match(r"^\s*(export\s+)?(async\s+)?function\s+\w+", ln) or \
+                   _re.match(r"^\s*(export\s+)?class\s+\w+", ln) or \
+                   _re.match(r"^\s*(const|let|var)\s+\w+\s*=\s*(async\s*)?\(", ln):
+                    skel.append(f"  L{i:>5}: {ln.rstrip()}")
+        elif ext in (".md", ".markdown"):
+            for i, ln in enumerate(all_lines, 1):
+                if i <= head_end_line and ln.startswith("#"):
+                    continue
+                if ln.startswith("#"):
+                    skel.append(f"  L{i:>5}: {ln.rstrip()}")
+        SKEL_CAP = 200
+        if len(skel) > SKEL_CAP:
+            skel = skel[:SKEL_CAP] + [f"  …[{len(skel) - SKEL_CAP} more symbols omitted]"]
+
+        omitted = len(content) - head_chars
+        parts = [
+            f"=== {rel} (TRUNCATED: {len(content)} chars / {total_lines} lines, showing first {head_end_line} lines) ===",
+            "\n".join(head_lines),
+            f"\n--- [omitted ~{omitted} chars / lines {head_end_line + 1}–{total_lines}] ---",
+        ]
+        if skel:
+            parts.append(f"--- skeleton of remaining symbols (line numbers absolute) ---")
+            parts.append("\n".join(skel))
+        parts.append(
+            "\nTo see any omitted region call: read_file_range "
+            f"(path='{rel}', start_line=N, end_line=M). "
+            "Patch `search` blocks MUST be copied verbatim from the actual file content — "
+            "use read_file_range to fetch the exact lines you intend to modify."
+        )
+        return "\n".join(parts)
 
     def _read_files_batch(self, args: dict) -> str:
         """Read multiple files at once. Applies same dedup as _read_file per path.

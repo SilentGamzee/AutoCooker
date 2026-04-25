@@ -300,7 +300,11 @@ class ActionsMixin:
 
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        max_workers = min(len(entries), 4)
+        _auth = getattr(self.ollama, "auth_style", "")
+        if _auth == "anthropic":
+            max_workers = 1
+        else:
+            max_workers = min(len(entries), 4)
         self.log(
             f"─── 2b Write {len(entries)} subtasks in parallel "
             f"(max {max_workers} agents) ───",
@@ -326,11 +330,49 @@ class ActionsMixin:
                 ok = False
             return label, ok
 
+        # Split entries: those touching files modified by ≥2 subtasks must
+        # serialize per-file so concurrent workers can't race on the same
+        # source view (same `region` slice would still be safe but separate
+        # subtasks in the same file may swap order under parallel scheduling).
+        from collections import defaultdict, Counter
+        modify_counts: Counter[str] = Counter()
+        for e in entries:
+            for fp in (e.get("files_to_modify") or []):
+                norm = str(fp).replace("\\", "/").lstrip("./")
+                modify_counts[norm] += 1
+        independent: list[dict] = []
+        shared_groups: dict[str, list[dict]] = defaultdict(list)
+        for e in entries:
+            mods = [str(p).replace("\\", "/").lstrip("./")
+                    for p in (e.get("files_to_modify") or [])]
+            shared_owner = next((m for m in mods if modify_counts[m] >= 2), None)
+            if shared_owner:
+                shared_groups[shared_owner].append(e)
+            else:
+                independent.append(e)
+        for owner in shared_groups:
+            shared_groups[owner].sort(
+                key=lambda s: int(((s.get("region") or {}).get("start_line")) or 0)
+            )
+
         results: list[tuple[str, bool]] = []
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = {pool.submit(_one, e): e for e in entries}
+            futures = {pool.submit(_one, e): e for e in independent}
             for fut in as_completed(futures):
                 results.append(fut.result())
+        # Shared-file groups: one group can run in parallel with another, but
+        # entries WITHIN a group run sequentially.
+        if shared_groups:
+            def _run_group(group: list[dict]) -> list[tuple[str, bool]]:
+                out: list[tuple[str, bool]] = []
+                for e in group:
+                    out.append(_one(e))
+                return out
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futures = {pool.submit(_run_group, g): owner
+                           for owner, g in shared_groups.items()}
+                for fut in as_completed(futures):
+                    results.extend(fut.result())
 
         failed = [lbl for lbl, ok in results if not ok]
         if failed:
@@ -426,6 +468,56 @@ class ActionsMixin:
                             f"subtasks[{i}] files_to_modify has {fp!r} "
                             f"which is not in the project file list. Move it "
                             f"to files_to_create if it's new."
+                        )
+
+            # Shared-file region validation: every modify path appearing in ≥2
+            # subtasks must have a non-overlapping `region` per occurrence.
+            from collections import defaultdict
+            owners: dict[str, list[tuple[int, dict]]] = defaultdict(list)
+            for i, s in enumerate(subs):
+                for fp in (s.get("files_to_modify") or []):
+                    norm = str(fp).replace("\\", "/").lstrip("./")
+                    owners[norm].append((i, s))
+            for fpath, refs in owners.items():
+                if len(refs) < 2:
+                    continue
+                regions = []
+                for i, s in refs:
+                    region = s.get("region") or {}
+                    if (not isinstance(region, dict)
+                            or not region.get("start_line")
+                            or not region.get("end_line")):
+                        return False, (
+                            f"subtasks[{i}] ({s.get('id')}) shares file {fpath!r} "
+                            f"with another subtask but has no `region` "
+                            f"{{anchor_symbol, start_line, end_line}}. "
+                            f"Required when ≥2 subtasks modify the same file."
+                        )
+                    try:
+                        a = int(region["start_line"])
+                        b = int(region["end_line"])
+                    except Exception:
+                        return False, (
+                            f"subtasks[{i}] ({s.get('id')}) region.start_line/"
+                            f"end_line must be integers."
+                        )
+                    if a >= b:
+                        return False, (
+                            f"subtasks[{i}] ({s.get('id')}) region invalid: "
+                            f"start_line ({a}) >= end_line ({b})."
+                        )
+                    regions.append((a, b, i, s))
+                regions.sort(key=lambda r: r[0])
+                for j in range(1, len(regions)):
+                    prev = regions[j - 1]
+                    cur = regions[j]
+                    if cur[0] <= prev[1]:
+                        return False, (
+                            f"Shared file {fpath!r}: regions of subtasks "
+                            f"{prev[3].get('id')} (L{prev[0]}-{prev[1]}) and "
+                            f"{cur[3].get('id')} (L{cur[0]}-{cur[1]}) overlap. "
+                            f"Adjust line ranges so each subtask owns a "
+                            f"distinct slice (≥1 line gap)."
                         )
             return True, "OK"
 
@@ -598,6 +690,7 @@ class ActionsMixin:
             f"SPECIFICATION (for context):\n{spec_content[:2500]}\n\n"
             f"Project files list:\n{existing_files}\n\n"
         )
+        region_section = self._render_region_section(entry, wd)
         volatile_tail = (
             f"YOUR SINGLE SUBTASK:\n"
             f"  id:                {entry.get('id')}\n"
@@ -605,6 +698,7 @@ class ActionsMixin:
             f"  brief:             {entry.get('brief','')}\n"
             f"  files_to_modify:   {modify_paths}\n"
             f"  files_to_create:   {create_paths}\n\n"
+            f"{region_section}"
             f"{issues_section}"
             f"{siblings_section}"
             f"{file_contents_section}"
@@ -933,6 +1027,84 @@ class ActionsMixin:
             "KEY SOURCE FILES (line numbers shown — use them for code.line in each step):\n"
             + "\n".join(sections)
             + "\n"
+        )
+
+    def _render_region_section(self, entry: dict, wd: str) -> str:
+        """Pre-fetch the declared region (with ±20 line padding) so the model
+        can copy `search` blocks verbatim without an exploratory read_file.
+
+        Only fires when the subtask carries a `region` object from outline.
+        Padding leaves room for anchor preservation while staying inside
+        sibling subtask gaps.
+        """
+        region = entry.get("region") or {}
+        if not isinstance(region, dict):
+            return ""
+        rel_path = (region.get("file") or "").replace("\\", "/").lstrip("./")
+        if not rel_path:
+            mods = entry.get("files_to_modify") or []
+            if mods:
+                rel_path = str(mods[0]).replace("\\", "/").lstrip("./")
+        try:
+            start = int(region.get("start_line") or 0)
+            end = int(region.get("end_line") or 0)
+        except Exception:
+            return ""
+        if not rel_path or start <= 0 or end <= 0 or end < start:
+            return ""
+
+        anchor = region.get("anchor_symbol") or ""
+        PAD = 20
+        view_start = max(1, start - PAD)
+        view_end = end + PAD
+
+        project_root = self.task.project_path or self.state.working_dir
+        candidates = [
+            os.path.join(wd, rel_path),
+            os.path.join(project_root, rel_path),
+        ]
+        body_lines: list[str] = []
+        total_lines = 0
+        chosen_path = ""
+        for cp in candidates:
+            if os.path.isfile(cp):
+                try:
+                    with open(cp, "r", encoding="utf-8", errors="replace") as fh:
+                        all_lines = fh.read().splitlines()
+                    total_lines = len(all_lines)
+                    lo = min(view_start, max(1, total_lines))
+                    hi = min(view_end, total_lines)
+                    body_lines = [
+                        f"{idx:>5}\t{all_lines[idx - 1]}"
+                        for idx in range(lo, hi + 1)
+                    ]
+                    chosen_path = cp
+                    break
+                except Exception:
+                    continue
+        if not body_lines:
+            return (
+                f"REGION ANCHOR:\n"
+                f"  file:          {rel_path}\n"
+                f"  anchor_symbol: {anchor}\n"
+                f"  lines:         L{start}-L{end}\n"
+                f"  (file not readable from workdir; call "
+                f"read_file_range(path={rel_path!r}, start_line={start}, "
+                f"end_line={end}) once.)\n\n"
+            )
+
+        return (
+            f"REGION ANCHOR (your search/replace MUST stay within this slice):\n"
+            f"  file:          {rel_path} ({total_lines} lines total)\n"
+            f"  anchor_symbol: {anchor}\n"
+            f"  region:        L{start}-L{end} (±20 lines of context shown below)\n\n"
+            f"=== {rel_path} [L{view_start}-L{min(view_end, total_lines)}] ===\n"
+            + "\n".join(body_lines)
+            + f"\n=== end of region view ===\n\n"
+            f"Copy `search` blocks verbatim from the lines above. Do NOT "
+            f"patch outside L{start}-L{end} (±5 lines of slack for anchor "
+            f"preservation). For more context elsewhere call "
+            f"read_file_range with explicit lines once.\n\n"
         )
 
     def _cleanup_orphaned_actions(self, actions_dir: str, written_basenames: set[str]):
