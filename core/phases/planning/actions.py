@@ -377,18 +377,21 @@ class ActionsMixin:
         )
         rel_outline = self._rel(outline_path)
 
-        msg = (
+        stable_prefix = (
             f"Task: {self.task.title}\n"
             f"Description: {self.task.description}\n\n"
             f"SPECIFICATION:\n{spec_content}\n\n"
-            f"{crit_section}"
             f"{file_contents_section}"
             f"Project files available:\n{existing_files}\n\n"
             f"Write the subtask outline to: {rel_outline}\n"
             "Schema: {\"subtasks\": [{\"id\":\"T-001\",\"title\":\"...\","
             "\"files_to_modify\":[...],\"files_to_create\":[...],"
             "\"brief\":\"...\"}, ...]}\n"
-            "After write_file, call confirm_phase_done."
+            "After write_file, call confirm_phase_done.\n"
+        )
+        volatile_tail = crit_section
+        msg = stable_prefix + (
+            "\n<<<CACHE_BOUNDARY>>>\n" + volatile_tail if volatile_tail else ""
         )
 
         executor = self._make_planning_executor(wd)
@@ -495,28 +498,107 @@ class ActionsMixin:
         )
 
         # Relevant critic issues for THIS file (targeted-mode retries).
-        issues_lines: list[str] = []
+        # Cross-file fixes need both: issues filed against THIS file, AND
+        # issues against sibling files that constrain this file's choices
+        # (mismatched element IDs, function names, eel endpoints, CSS
+        # classes, schema field names). Without the related set the
+        # rewriter loses memory of what siblings declared and reintroduces
+        # the same mismatch on every iteration.
+        target_lines: list[str] = []
+        related_lines: list[str] = []
         for iss in (extra_issues or []):
-            iss_file = os.path.basename(str(iss.get("file") or "").replace("\\", "/"))
+            iss_file = os.path.basename(str(iss.get("file") or "").replace("\\", "/")).strip()
+            desc = str(iss.get("description") or "").strip()
+            sev = str(iss.get("severity") or "").strip() or "issue"
+            if not desc:
+                continue
             if iss_file == target_basename:
-                desc = str(iss.get("description") or "").strip()
-                if desc:
-                    issues_lines.append(f"  - {desc}")
+                target_lines.append(f"  - [{sev}] {desc}")
+            elif iss_file:
+                related_lines.append(f"  - [{sev}] {iss_file}: {desc}")
         issues_section = ""
-        if issues_lines:
-            issues_section = (
+        if target_lines:
+            issues_section += (
                 "CRITIC FEEDBACK FOR THIS FILE — address every item:\n"
-                + "\n".join(issues_lines) + "\n\n"
+                + "\n".join(target_lines) + "\n\n"
             )
+        if related_lines:
+            issues_section += (
+                "RELATED CRITIC FEEDBACK ON SIBLING FILES — your rewrite of "
+                f"{target_basename} MUST stay consistent with the names/IDs/"
+                "endpoints/CSS classes those siblings declare. Do not "
+                "rewrite siblings here, but align with them:\n"
+                + "\n".join(related_lines) + "\n\n"
+            )
+
+        # Sibling action files give the rewriter a concrete view of what
+        # element IDs, function names, eel endpoints, and CSS classes
+        # are already declared elsewhere. Only injected during targeted
+        # retries, AND only for siblings actually referenced by the
+        # critic's issue set — sending all 12 siblings on every retry
+        # was the dominant token waster on cross-file fix loops.
+        # Each sibling is capped at SIBLING_CAP chars: identifier names
+        # almost always live in the first 1.5-2KB (id/title/files +
+        # first one or two implementation_steps), so the cap preserves
+        # signal while cutting up to 80% of the block.
+        siblings_section = ""
+        if extra_issues:
+            SIBLING_CAP = 2000
+            wanted: set[str] = set()
+            for iss in extra_issues:
+                fn = os.path.basename(str(iss.get("file") or "").replace("\\", "/")).strip()
+                if fn.endswith(".json") and fn != target_basename:
+                    wanted.add(fn)
+                # Also pull sibling refs out of the description text:
+                # "T010 creates 'new-attach-preview' but T012 references ..."
+                desc = str(iss.get("description") or "")
+                for m in re.finditer(r"\bT-?\d{3}\b", desc):
+                    sib = m.group(0).replace("-", "") + ".json"
+                    if sib != target_basename:
+                        wanted.add(sib)
+
+            sibling_blocks: list[str] = []
+            try:
+                on_disk = sorted(f for f in os.listdir(actions_dir) if f.endswith(".json"))
+            except OSError:
+                on_disk = []
+            for fname in on_disk:
+                if fname == target_basename or fname not in wanted:
+                    continue
+                spath = os.path.join(actions_dir, fname)
+                try:
+                    with open(spath, "r", encoding="utf-8") as fh:
+                        body = fh.read()
+                except Exception:
+                    continue
+                if len(body) > SIBLING_CAP:
+                    body = body[:SIBLING_CAP] + "\n…(truncated for token budget)"
+                sibling_blocks.append(f"=== {fname} ===\n{body}")
+
+            if sibling_blocks:
+                siblings_section = (
+                    "SIBLING ACTION FILES (read-only — DO NOT rewrite, but "
+                    "align identifiers in your file with what these declare):\n"
+                    + "\n\n".join(sibling_blocks) + "\n\n"
+                )
 
         existing_files = "\n".join(
             f"  {p}" for p in self.state.cache.file_paths[:80]
             if not p.startswith(".tasks") and not p.startswith(".git")
         )
 
-        msg = (
+        # Order matters for prompt-cache hit rate. Stable prefix (same
+        # across all 13 parallel workers and across critique retries)
+        # comes first, then CACHE_BOUNDARY, then volatile per-worker
+        # / per-iteration content. Anthropic transport splits on the
+        # sentinel and marks the prefix with cache_control; other
+        # providers strip it.
+        stable_prefix = (
             f"Task: {self.task.title}\n\n"
             f"SPECIFICATION (for context):\n{spec_content[:2500]}\n\n"
+            f"Project files list:\n{existing_files}\n\n"
+        )
+        volatile_tail = (
             f"YOUR SINGLE SUBTASK:\n"
             f"  id:                {entry.get('id')}\n"
             f"  title:             {entry.get('title','')}\n"
@@ -524,12 +606,13 @@ class ActionsMixin:
             f"  files_to_modify:   {modify_paths}\n"
             f"  files_to_create:   {create_paths}\n\n"
             f"{issues_section}"
+            f"{siblings_section}"
             f"{file_contents_section}"
-            f"Project files list:\n{existing_files}\n\n"
             f"Write EXACTLY ONE action file at: {target_rel}\n"
             f"Do NOT write any other file. After the single write_file, "
             f"call confirm_phase_done."
         )
+        msg = stable_prefix + "\n<<<CACHE_BOUNDARY>>>\n" + volatile_tail
 
         executor = self._make_planning_executor(wd)
 

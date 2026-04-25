@@ -131,6 +131,23 @@ class QAPhase(BasePhase):
             return False, all_issues
 
         self.log("═══ QA PHASE COMPLETE — PASSED ═══", "ok")
+        # Session memory extraction — port of auto-claude-logic
+        # services/extractMemories. Lightweight summary of project-specific
+        # facts learned during this run, appended to .tasks/_session_memory.md
+        # for future planning phases to read.
+        try:
+            from core.session_memory import extract_and_append
+            extract_and_append(
+                project_root=os.getcwd(),
+                task_title=self.task.title or "",
+                task_description=self.task.description or "",
+                logs=self.task.logs,
+                ollama_client=self.ollama,
+                model=self.task.models.get("qa", "") or self.task.models.get("planning", ""),
+                log_fn=self.log,
+            )
+        except Exception as e:
+            self.log(f"[memory] extraction skipped: {e}", "warn")
         return True, []
 
     # ── Review ────────────────────────────────────────────────────────

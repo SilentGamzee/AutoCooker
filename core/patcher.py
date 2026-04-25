@@ -93,6 +93,33 @@ def _normalize_trailing_ws(s: str) -> str:
     return _TRAILING_WS_RE.sub(r"\1", s)
 
 
+# Curly/smart quote → straight quote table. LLMs sometimes auto-correct
+# straight ASCII quotes to typographic ones in `search`, breaking exact
+# match against the real file (which only has straight quotes). Port from
+# auto-claude-logic FileEditTool/utils.ts.
+_CURLY_QUOTE_MAP = {
+    "‘": "'",  # left single
+    "’": "'",  # right single
+    "‚": "'",  # single low-9
+    "‛": "'",  # single high-reversed-9
+    "“": '"',  # left double
+    "”": '"',  # right double
+    "„": '"',  # double low-9
+    "‟": '"',  # double high-reversed-9
+    "′": "'",  # prime
+    "″": '"',  # double prime
+}
+
+
+def _normalize_quotes(s: str) -> str:
+    if not s:
+        return s
+    for k, v in _CURLY_QUOTE_MAP.items():
+        if k in s:
+            s = s.replace(k, v)
+    return s
+
+
 def _try_unescape_over(s: str) -> str:
     """
     Best-effort reversal of LLM over-escaping. Only touches the specific
@@ -133,6 +160,17 @@ def _find_with_fuzz(haystack: str, needle: str) -> tuple[int, str, str]:
     if n_ws in h_ws:
         return _count_matches(h_ws, n_ws), h_ws, n_ws
 
+    # 2b. Curly/smart quote normalization (LLMs sometimes emit “” ‘’ where
+    # the source file has straight " '). Apply on needle only — file has
+    # canonical quotes.
+    n_q = _normalize_quotes(needle)
+    if n_q != needle:
+        if n_q in haystack:
+            return _count_matches(haystack, n_q), haystack, n_q
+        n_q_ws = _normalize_trailing_ws(n_q)
+        if n_q_ws in h_ws:
+            return _count_matches(h_ws, n_q_ws), h_ws, n_q_ws
+
     # 3. Over-escape fallback (only when the needle actually has backslash
     # sequences we know how to strip — otherwise skip, nothing to gain).
     if "\\" in needle:
@@ -144,6 +182,10 @@ def _find_with_fuzz(haystack: str, needle: str) -> tuple[int, str, str]:
             n_un_ws = _normalize_trailing_ws(n_un)
             if n_un_ws in h_ws:
                 return _count_matches(h_ws, n_un_ws), h_ws, n_un_ws
+            # 4b. + curly-quote normalization
+            n_un_q = _normalize_quotes(n_un)
+            if n_un_q != n_un and n_un_q in haystack:
+                return _count_matches(haystack, n_un_q), haystack, n_un_q
 
     return 0, haystack, needle
 

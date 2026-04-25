@@ -43,6 +43,20 @@ from core.phases.planning._helpers import (
 
 
 class CritiqueMixin:
+    def _clear_last_critique_issues(self) -> None:
+        """Remove last_critique_issues.json — call whenever critic PASSES.
+
+        File is the resume artefact for "human review → re-run planning".
+        Stale contents would make the next resume seed already-fixed issues
+        and waste the first targeted rewrite iteration.
+        """
+        path = os.path.join(self.task.task_dir, "last_critique_issues.json")
+        try:
+            if os.path.isfile(path):
+                os.remove(path)
+        except OSError as e:
+            self.log(f"  [WARN] Could not clear {path!r}: {e}", "warn")
+
     def _new_step3_critique(self, model: str) -> tuple[bool, list[dict]]:
         """
         Two-pass critique:
@@ -95,13 +109,14 @@ class CritiqueMixin:
 
         executor = self._make_planning_executor(wd)
 
-        msg = (
+        stable_prefix = (
             f"Task: {self.task.title}\n\n"
             f"SPECIFICATION:\n{spec_content}\n\n"
-            f"ACTION FILES:\n{actions_content}\n"
             f"PROJECT FILES (valid for files_to_modify):\n{existing_files}\n\n"
-            "Review all action files and submit a verdict with submit_critic_verdict."
+            "Review all action files and submit a verdict with submit_critic_verdict.\n"
         )
+        volatile_tail = f"ACTION FILES:\n{actions_content}\n"
+        msg = stable_prefix + "\n<<<CACHE_BOUNDARY>>>\n" + volatile_tail
 
         from core.tools import CRITIC_VERDICT_TOOL, READ_FILE, READ_FILES_BATCH, READ_FILE_RANGE, LIST_DIRECTORY
         critique_tools = [READ_FILE, READ_FILES_BATCH, READ_FILE_RANGE, LIST_DIRECTORY, CRITIC_VERDICT_TOOL]
@@ -187,10 +202,9 @@ class CritiqueMixin:
 
         executor = self._make_planning_executor(wd)
 
-        msg = (
+        stable_prefix = (
             f"Task: {self.task.title}\n\n"
             f"SPECIFICATION:\n{spec_content}\n\n"
-            f"ACTION FILES (the full plan — one subtask per file):\n{actions_content}\n"
             f"PROJECT FILES (use these paths when suggesting files_to_modify additions):\n"
             f"{existing_files}\n\n"
             f"Write dependency_report.json to: {self._rel(report_path)}\n\n"
@@ -199,8 +213,12 @@ class CritiqueMixin:
             "symbols that should live inside the project workspace — do not "
             "flag stdlib/pip/engine imports. If a referenced symbol is "
             "missing, set verdict='missing_deps' and list the exact files "
-            "that need to be added to that subtask's files_to_modify."
+            "that need to be added to that subtask's files_to_modify.\n"
         )
+        volatile_tail = (
+            f"ACTION FILES (the full plan — one subtask per file):\n{actions_content}\n"
+        )
+        msg = stable_prefix + "\n<<<CACHE_BOUNDARY>>>\n" + volatile_tail
 
         def validate():
             return validate_dependency_report(report_path)

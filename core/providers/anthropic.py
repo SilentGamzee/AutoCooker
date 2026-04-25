@@ -51,8 +51,48 @@ class AnthropicTransport(BaseTransport):
     def _messages_url(self) -> str:
         return f"{self.base_url}/v1/messages"
 
+    def _count_tokens_url(self) -> str:
+        return f"{self.base_url}/v1/messages/count_tokens"
+
     def _models_url(self) -> str:
         return f"{self.base_url}/v1/models"
+
+    def count_tokens(
+        self,
+        session: requests.Session,
+        model: str,
+        messages: list[dict],
+        tools: Optional[list] = None,
+        system: Optional[str] = None,
+        timeout=(5, 30),
+    ) -> Optional[int]:
+        """Pre-flight token count via Anthropic /v1/messages/count_tokens.
+
+        Returns input_tokens or None on failure. Lets callers shrink prompts
+        before paying for an actual generate call when context is tight.
+        """
+        try:
+            headers = self._auth_headers()
+        except RuntimeError:
+            return None
+        try:
+            anthro = self._openai_to_anthropic(messages, tools or [], 1024)
+            anthro["model"] = model
+            if system is not None:
+                anthro["system"] = system
+            anthro.pop("max_tokens", None)
+            anthro.pop("stream", None)
+            resp = session.post(
+                self._count_tokens_url(), json=anthro, headers=headers, timeout=timeout
+            )
+            if not resp.ok:
+                return None
+            data = resp.json()
+            v = data.get("input_tokens")
+            return int(v) if v is not None else None
+        except Exception as e:
+            print(f"[AnthropicTransport] count_tokens failed: {e}", flush=True)
+            return None
 
     def _auth_headers(self) -> dict:
         if self._auth_header_provider is not None:
@@ -127,6 +167,34 @@ class AnthropicTransport(BaseTransport):
         - Tool results are user-role messages with tool_result content blocks
         - Consecutive same-role messages must be merged (API requires alternating turns)
         """
+        # Sentinel used by callers (BasePhase + planning prompts) to mark
+        # the boundary between stable cacheable prefix and volatile tail
+        # inside user messages. Same string used for system splitting below.
+        _CACHE_SENTINEL_FOR_USER = "\n<<<CACHE_BOUNDARY>>>\n"
+        _CACHE_MARK_USER = {"type": "ephemeral"}
+
+        def _split_user_str_for_cache(text: str) -> object:
+            """If the user content carries CACHE_BOUNDARY, return a content
+            block list with cache_control on the prefix. Otherwise return
+            the original string unchanged.
+
+            Anthropic accepts up to 4 cache_control markers per request.
+            We rely on system-prompt + last-tool markers (2 used) and add
+            up to 2 more for user-message stable prefixes here."""
+            if _CACHE_SENTINEL_FOR_USER not in text:
+                return text
+            stable, volatile = text.split(_CACHE_SENTINEL_FOR_USER, 1)
+            blocks: list[dict] = []
+            if stable:
+                blocks.append({
+                    "type": "text",
+                    "text": stable,
+                    "cache_control": _CACHE_MARK_USER,
+                })
+            if volatile:
+                blocks.append({"type": "text", "text": volatile})
+            return blocks if blocks else text
+
         system_text: Optional[str] = None
         raw_messages: list[dict] = []
 
@@ -177,11 +245,13 @@ class AnthropicTransport(BaseTransport):
                     raw_messages.append({"role": "user", "content": [tool_result_block]})
                 continue
 
-            # user role — plain text or list of content blocks
+            # user role — plain text or list of content blocks. If the
+            # text carries the CACHE_BOUNDARY sentinel, split it into
+            # text blocks so the stable prefix can be marked for caching.
             if isinstance(content, list):
                 user_content: object = content
             else:
-                user_content = str(content)
+                user_content = _split_user_str_for_cache(str(content))
             raw_messages.append({"role": "user", "content": user_content})
 
         # Merge consecutive user messages (Anthropic requires strict alternation).

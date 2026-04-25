@@ -76,11 +76,18 @@ def _log_usage(
     response_text: str = "",
     tool_calls: Optional[list[dict]] = None,
     label: str = "LLM",
+    model: str = "",
+    cache_state: Optional[dict] = None,
 ) -> None:
     """Log token usage for an LLM response.
 
     If the provider returned a `usage` dict, log its values verbatim.
     Otherwise estimate from the request (prompt_messages) and the response text.
+
+    `cache_state` (optional) is a per-phase mutable dict carrying
+    `cache_hit_seen` (bool) for cache-break detection. After the first
+    cache_read>0 hit in a phase, any later call with cache_read==0 logs a
+    warning so we can spot prefix invalidation.
     """
     if log_fn is None:
         return
@@ -99,6 +106,45 @@ def _log_usage(
             f"total={total}{extra}",
             "info",
         )
+        # Cache-break detection: once we've seen a hit, a later miss means
+        # the cached prefix changed (volatile content slipped before the
+        # CACHE_BOUNDARY, prompt drifted, or TTL expired).
+        if cache_state is not None:
+            if cache_read > 0:
+                cache_state["cache_hit_seen"] = True
+            elif cache_state.get("cache_hit_seen") and prompt > 1000:
+                log_fn(
+                    f"[{label}] cache MISS after prior HIT — prefix invalidated "
+                    f"(prompt={prompt}, cache_read=0). Check for volatile content "
+                    "above CACHE_BOUNDARY.",
+                    "warn",
+                )
+        # Auto-compact threshold check.
+        if model and prompt > 0:
+            try:
+                from core.phases.base import calculate_token_warning_state
+                warn = calculate_token_warning_state(prompt, model)
+                if warn["is_above_autocompact"]:
+                    log_fn(
+                        f"[{label}] AUTOCOMPACT threshold crossed — prompt={prompt} "
+                        f"(window={warn['effective_window']}, left={warn['percent_left']}%). "
+                        "Trim history before next call.",
+                        "warn",
+                    )
+                elif warn["is_above_error"]:
+                    log_fn(
+                        f"[{label}] ERROR threshold — prompt={prompt} "
+                        f"({warn['percent_left']}% window left).",
+                        "warn",
+                    )
+                elif warn["is_above_warning"]:
+                    log_fn(
+                        f"[{label}] WARN threshold — prompt={prompt} "
+                        f"({warn['percent_left']}% window left).",
+                        "info",
+                    )
+            except Exception:
+                pass
         return
     # Fallback — estimate.
     est_prompt = _estimate_messages_tokens(prompt_messages or [])
@@ -113,6 +159,53 @@ def _log_usage(
         f"completion~{est_completion}, total~{est_prompt + est_completion}",
         "info",
     )
+
+
+# Compactable tools: their results age out aggressively in chat history.
+# Mirrors auto-claude-logic services/compact/microCompact.ts COMPACTABLE_TOOLS
+# whitelist. Reading a file again is cheap; preserving its text across 10
+# tool rounds is not. Tools NOT in this set (test_runner, write_file,
+# confirm_*) keep full content because their result is the audit trail.
+COMPACTABLE_TOOLS: set[str] = {
+    "read_file",
+    "read_files_batch",
+    "run_shell",
+    "grep",
+    "glob",
+    "web_fetch",
+    "web_search",
+    "list_files",
+    "list_dir",
+    "search_files",
+}
+
+# Time-based microcompact stub — replaces aged tool_result body. Mirrors
+# TIME_BASED_MC_CLEARED_MESSAGE.
+TIME_BASED_MC_CLEARED_MESSAGE = "[Old tool result content cleared — call the tool again if still needed]"
+
+
+def group_messages_by_api_round(messages: list[dict]) -> list[list[int]]:
+    """Group message indices by API round so trimming preserves tool_use/tool_result pairs.
+
+    Port of auto-claude-logic services/compact/grouping.ts. A boundary
+    fires at every new assistant message that has tool_calls. The matching
+    tool messages that follow stay glued to it. Useful for safe history
+    truncation: drop whole groups, never half-pairs.
+    """
+    if not messages:
+        return []
+    groups: list[list[int]] = []
+    current: list[int] = []
+    for i, m in enumerate(messages):
+        role = m.get("role")
+        if role == "assistant" and current:
+            groups.append(current)
+            current = [i]
+        else:
+            current.append(i)
+    if current:
+        groups.append(current)
+    return groups
 
 
 _QUOTA_EXHAUSTED_MARKERS = (
@@ -511,6 +604,7 @@ class OllamaClient:
                 response_text=result,
                 tool_calls=tool_calls,
                 label="LLM",
+                model=model,
             )
             if log_fn:
                 log_fn(f"[LM Studio] complete() done — response_len={len(result)}")
@@ -625,6 +719,15 @@ class OllamaClient:
             text = str(value)
             return text[:limit] + ("…" if len(text) > limit else "")
 
+        # Per-call cache-break detection state. Reset every chat_with_tools
+        # call: cache hit rate is meaningful within a single phase loop, not
+        # across phases (system prompt differs between phases).
+        self._cache_state = {"cache_hit_seen": False}
+        # Per-call counter of Gemini thought-stall retries. We append the
+        # anti-thinking nudge once; second stall propagates so the outer
+        # run_loop can fail-fast via diminishing-returns logic.
+        _gemini_stall_retries = 0
+
         _tool_calls_made = 0
         _rounds_without_write = 0
         _dedup_count = 0          # consecutive write_file DEDUP hits this session
@@ -667,17 +770,28 @@ class OllamaClient:
                 }
                 messages = [first_msg, compress_note] + recent
 
-            # History compaction: tiered by tool-result size.
-            # HUGE payloads (e.g. 500K read_files_batch dumps) get elided after
-            # a single follow-up message — keeping them alive across 3-4 rounds
-            # is the main token-burn pathology. BULK and SMALL tiers age out
-            # more gradually so near-recent small reads stay intact for local
-            # reasoning. tool_call_id is preserved so turn structure remains
-            # valid.
+            # History compaction: tiered by tool-result size + tool-name whitelist.
+            # Mirrors auto-claude-logic microCompact: COMPACTABLE_TOOLS
+            # (read_file, run_shell, grep, glob, web_*) age out fast because
+            # their results are re-derivable. Tools producing audit-trail
+            # output (test_runner, confirm_*) stay verbatim until the size
+            # tiers force elision.
             _HUGE  = 30_000
             _BULK  = 5_000
             _SMALL = 1_500
             if len(messages) > 3:
+                # Build tool_call_id → tool_name map so we can apply the
+                # COMPACTABLE_TOOLS whitelist while elision runs.
+                _id_to_tool: dict[str, str] = {}
+                for _am in messages:
+                    if _am.get("role") != "assistant":
+                        continue
+                    for _tc in (_am.get("tool_calls") or []):
+                        _tcid = _tc.get("id")
+                        _tname = ((_tc.get("function") or {}).get("name") or "")
+                        if _tcid and _tname:
+                            _id_to_tool[_tcid] = _tname
+
                 _last_idx = len(messages) - 1
                 for _mi in range(1, _last_idx):
                     _m = messages[_mi]
@@ -686,10 +800,16 @@ class OllamaClient:
                     _content = _m.get("content") or ""
                     if not isinstance(_content, str):
                         continue
-                    if _content.startswith("[elided"):
+                    if _content.startswith("[elided") or _content.startswith("[Old tool"):
                         continue
                     _clen = len(_content)
                     _age  = _last_idx - _mi
+                    _tname = _id_to_tool.get(_m.get("tool_call_id", ""), "")
+                    _is_compactable = _tname in COMPACTABLE_TOOLS
+                    # Compactable tools age out one tier earlier.
+                    if _is_compactable and _age > 2:
+                        _m["content"] = TIME_BASED_MC_CLEARED_MESSAGE
+                        continue
                     _elide = (
                         (_clen > _HUGE  and _age > 1) or
                         (_clen > _BULK  and _age > 3) or
@@ -810,16 +930,25 @@ class OllamaClient:
             #
             # BasePhase.build_system may embed a "<<<CACHE_BOUNDARY>>>" sentinel
             # separating the stable cacheable prefix from the volatile tail
-            # (recent logs). The Anthropic transport splits on this marker;
-            # every other provider must not see it — strip here.
+            # (recent logs). The Anthropic transport splits on this marker
+            # for both system AND user messages; every other provider must
+            # not see it — strip from system AND user content here.
             _effective_system = system
-            if _effective_system and self.auth_style != "anthropic":
-                _effective_system = _effective_system.replace(
-                    "\n<<<CACHE_BOUNDARY>>>\n", ""
-                )
+            _CB = "\n<<<CACHE_BOUNDARY>>>\n"
+            _strip_boundary = self.auth_style != "anthropic"
+            if _effective_system and _strip_boundary:
+                _effective_system = _effective_system.replace(_CB, "")
             final_messages = messages
-            if _effective_system and (not messages or messages[0].get("role") != "system"):
-                final_messages = [{"role": "system", "content": _effective_system}] + messages
+            if _strip_boundary and messages:
+                cleaned: list = []
+                for _m in messages:
+                    _c = _m.get("content")
+                    if isinstance(_c, str) and _CB in _c:
+                        _m = {**_m, "content": _c.replace(_CB, "")}
+                    cleaned.append(_m)
+                final_messages = cleaned
+            if _effective_system and (not final_messages or final_messages[0].get("role") != "system"):
+                final_messages = [{"role": "system", "content": _effective_system}] + final_messages
 
             payload: dict = {
                 "model": model,
@@ -978,6 +1107,56 @@ class OllamaClient:
                     if is_aborted and is_aborted():
                         raise RuntimeError("__ABORTED__")
                     raise RuntimeError(f"Ollama connection error: {e}") from e
+                except RuntimeError as e:
+                    # Gemini thought-stall: provider stream produced only
+                    # `"thought": true` parts and never emitted text or a
+                    # functionCall. The transport-level fallback already tried
+                    # non-stream once. At this layer we append an anti-thinking
+                    # nudge to the user message and retry ONCE; second stall
+                    # propagates so run_loop's diminishing-returns logic ends
+                    # the iteration cleanly.
+                    err_str = str(e)
+                    is_stall = (
+                        "__GEMINI_THOUGHT_STALL__" in err_str
+                        or "only thought parts" in err_str
+                    )
+                    if not is_stall:
+                        raise
+                    if _gemini_stall_retries >= 1:
+                        if log_fn:
+                            log_fn(
+                                "[Gemini] thought-stall recurred after nudge — "
+                                "propagating so outer loop can fail-fast.",
+                                "error",
+                            )
+                        raise
+                    _gemini_stall_retries += 1
+                    nudge = (
+                        "[SYSTEM] Previous attempt stalled in internal "
+                        "reasoning without producing a tool call. Respond "
+                        "ONLY with a single tool call. NO analysis text, "
+                        "NO explanation. If unsure which tool, call "
+                        "read_file on the most relevant file."
+                    )
+                    # Append to the persistent messages list AND rebuild
+                    # final_messages + payload so the next attempt actually
+                    # sends the nudge (payload was assembled before this
+                    # except block).
+                    messages.append({"role": "user", "content": nudge})
+                    final_messages = messages
+                    if _effective_system and (not messages or messages[0].get("role") != "system"):
+                        final_messages = [{"role": "system", "content": _effective_system}] + messages
+                    payload["messages"] = final_messages
+                    if log_fn:
+                        log_fn(
+                            "[Gemini] thought-stall detected — appending "
+                            "anti-thinking nudge and retrying once.",
+                            "warn",
+                        )
+                    _last_exc = e
+                    # Immediate retry — this is a model-behavior issue, not
+                    # a transient network one.
+                    continue
                 except BaseException as e:
                     error_str = str(e)
                     if "Channel Error" in error_str or "channel error" in error_str.lower():
@@ -1044,6 +1223,8 @@ class OllamaClient:
                 response_text=content,
                 tool_calls=model_tool_calls,
                 label="LLM",
+                model=model,
+                cache_state=getattr(self, "_cache_state", None),
             )
 
             # Surface truncation explicitly — small models often hit max_tokens

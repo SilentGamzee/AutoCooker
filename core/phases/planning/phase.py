@@ -183,6 +183,28 @@ class PlanningPhase(SpecMixin, ActionsMixin, CritiqueMixin, LegacyStepsMixin, Lo
         max_iterations = 5
         skip_action_loop = self._cp_at_or_after(resume_stage, "actions_done")
         resume_outline_flag = self._cp_at_or_after(resume_stage, "outline_done") and not skip_action_loop
+        # Resume after Human Review: re-load last critique verdict so the
+        # first iter goes straight to targeted-fix on the failing action
+        # files instead of accepting the stale on-disk actions and waiting
+        # for a fresh critique to surface the same issues again.
+        last_issues_path = os.path.join(self.task.task_dir, "last_critique_issues.json")
+        seeded_issues_for_resume: list[dict] = []
+        if resume_outline_flag and os.path.isfile(last_issues_path):
+            try:
+                with open(last_issues_path, "r", encoding="utf-8") as fh:
+                    seeded_issues_for_resume = list(json.load(fh) or [])
+            except Exception as e:
+                self.log(f"  [WARN] Could not load last_critique_issues.json: {e}", "warn")
+                seeded_issues_for_resume = []
+            if seeded_issues_for_resume:
+                self.log(
+                    f"  ↻ Resume: loaded {len(seeded_issues_for_resume)} unresolved "
+                    "critic issue(s) from previous run — first iter will run "
+                    "targeted-fix on the affected action files",
+                    "info",
+                )
+                critique_issues = seeded_issues_for_resume
+                critique_feedback = self._format_action_critique(seeded_issues_for_resume)
         if skip_action_loop:
             self.log("─── Steps 2/3/3b: Actions+Critique (skipped — resumed from checkpoint) ───", "info")
         elif resume_outline_flag:
@@ -192,7 +214,11 @@ class PlanningPhase(SpecMixin, ActionsMixin, CritiqueMixin, LegacyStepsMixin, Lo
             self.log(f"─── Step 2: Write Actions (iter {iteration+1}/{max_iterations}) ───")
             # Resume only applies on the very first iteration — subsequent
             # iterations are critique retries and need a full rebuild.
-            resume_this_iter = resume_outline_flag and iteration == 0
+            # Targeted-fix from seeded critic issues takes priority over
+            # plain "skip already-written files" resume.
+            resume_this_iter = (
+                resume_outline_flag and iteration == 0 and not seeded_issues_for_resume
+            )
             if not self._new_step2_write_actions(
                 model, critique_feedback, issues=critique_issues or None,
                 resume_outline=resume_this_iter,
@@ -206,6 +232,14 @@ class PlanningPhase(SpecMixin, ActionsMixin, CritiqueMixin, LegacyStepsMixin, Lo
             if not passed:
                 critique_feedback = self._format_action_critique(issues)
                 critique_issues = issues
+                # Persist unresolved issues so a future Human-Review resume
+                # can re-enter targeted-fix mode on the affected files
+                # instead of treating the on-disk actions as final.
+                try:
+                    with open(last_issues_path, "w", encoding="utf-8") as fh:
+                        json.dump(issues, fh, ensure_ascii=False, indent=2)
+                except Exception as e:
+                    self.log(f"  [WARN] Could not persist critique issues: {e}", "warn")
                 if iteration == max_iterations - 1:
                     self.log(
                         f"[FAIL] Critique still failing at iter {max_iterations} with "
@@ -214,6 +248,8 @@ class PlanningPhase(SpecMixin, ActionsMixin, CritiqueMixin, LegacyStepsMixin, Lo
                     )
                     return False
                 continue
+            else:
+                self._clear_last_critique_issues()
 
             # ── Step 3b: Dependency closure critic ──
             self.log(f"─── Step 3b: Dependency Closure (iter {iteration+1}/{max_iterations}) ───")
@@ -299,6 +335,7 @@ class PlanningPhase(SpecMixin, ActionsMixin, CritiqueMixin, LegacyStepsMixin, Lo
             self.log(f"─── Patch Step 3: Critique (iter {iteration+1}/3) ───")
             passed, issues = self._new_step3_critique(model)
             if passed:
+                self._clear_last_critique_issues()
                 break
 
         for name, fn in [
@@ -390,7 +427,9 @@ class PlanningPhase(SpecMixin, ActionsMixin, CritiqueMixin, LegacyStepsMixin, Lo
 
         self.log("─── Replan Step 3: Critique ───")
         passed, crit_issues = self._new_step3_critique(model)
-        if not passed:
+        if passed:
+            self._clear_last_critique_issues()
+        else:
             self.log(
                 f"[WARN] Replan critique raised {len(crit_issues)} issue(s); "
                 "continuing — mechanical apply will be the final check.",

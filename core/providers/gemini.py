@@ -11,6 +11,33 @@ from core.providers.base import BaseTransport, UrllibResponse
 _DEBUG = os.environ.get("AUTOCOOKER_DEBUG", "").lower() in ("1", "true", "yes")
 
 
+# ── Thought-stall watchdog config ───────────────────────────────────
+# Some Gemma/Gemini variants emit indefinite `"thought": true` parts
+# without ever producing text or functionCall. The stream then idles for
+# `idle_timeout` (300s) before erroring out. Watchdog short-circuits this:
+# if no non-thought part has arrived after STALL_SECS, raise
+# __GEMINI_THOUGHT_STALL__ so the wrapper can fall back to non-stream and
+# the caller can retry with an anti-thinking prompt nudge.
+def _gemini_thought_stall_secs() -> float:
+    raw = os.environ.get("AUTOCOOKER_GEMINI_THOUGHT_STALL_SECS", "30")
+    try:
+        v = float(raw)
+        return v if v > 0 else 30.0
+    except ValueError:
+        return 30.0
+
+
+def _gemini_force_nonstream() -> bool:
+    return os.environ.get("AUTOCOOKER_GEMINI_FORCE_NONSTREAM", "").lower() in (
+        "1", "true", "yes"
+    )
+
+
+# Sentinel exception string. Matched downstream by ollama_client to retry
+# with a stronger anti-thinking prompt.
+GEMINI_THOUGHT_STALL_TOKEN = "__GEMINI_THOUGHT_STALL__"
+
+
 class GeminiTransport(BaseTransport):
     """Transport for Google Gemini via the native generateContent API.
 
@@ -42,17 +69,39 @@ class GeminiTransport(BaseTransport):
         is_aborted: Optional[Callable[[], bool]] = None,
         timeout=None,
     ) -> UrllibResponse:
+        # Force-non-stream override: skip streaming entirely. Useful when a
+        # model family (e.g. some Gemma variants) keeps stalling in thought
+        # parts during streaming. Non-stream returns full response or errors
+        # immediately — no death-by-thought-dribble.
+        if _gemini_force_nonstream():
+            if log_fn:
+                log_fn("[Gemini] AUTOCOOKER_GEMINI_FORCE_NONSTREAM=1 — using non-stream", "info")
+            return self._non_stream_call(session, payload, timeout=timeout or (10, 300))
+
         if stream:
-            return self._stream_call(
-                session, payload,
-                connect_timeout=connect_timeout,
-                first_byte_timeout=first_byte_timeout,
-                idle_timeout=idle_timeout,
-                hard_timeout=hard_timeout,
-                log_fn=log_fn,
-                progress_fn=progress_fn,
-                is_aborted=is_aborted,
-            )
+            try:
+                return self._stream_call(
+                    session, payload,
+                    connect_timeout=connect_timeout,
+                    first_byte_timeout=first_byte_timeout,
+                    idle_timeout=idle_timeout,
+                    hard_timeout=hard_timeout,
+                    log_fn=log_fn,
+                    progress_fn=progress_fn,
+                    is_aborted=is_aborted,
+                )
+            except RuntimeError as e:
+                # Thought-stall fallback: retry once via non-stream. Caller's
+                # retry layer (ollama_client) will append anti-thinking
+                # nudge if the non-stream attempt also returns empty.
+                if GEMINI_THOUGHT_STALL_TOKEN in str(e):
+                    if log_fn:
+                        log_fn(
+                            "[Gemini] thought-stall — falling back to non-stream",
+                            "warn",
+                        )
+                    return self._non_stream_call(session, payload, timeout=(10, 300))
+                raise
         return self._non_stream_call(session, payload, timeout=timeout or (10, 120))
 
     def _stream_call(
@@ -117,6 +166,9 @@ class GeminiTransport(BaseTransport):
 
         text_parts: list[str] = []
         tool_calls: list[dict] = []
+        # Captured thought parts — kept (not discarded) so we can surface
+        # them in the empty-result error message and watchdog log.
+        thought_texts: list[str] = []
         finish_reason = "stop"
         model_name = model
 
@@ -133,20 +185,10 @@ class GeminiTransport(BaseTransport):
         _last_progress = [0.0]
         token_count = [0]
         thought_done = [False]
-
-        def _emit_progress(force: bool = False) -> None:
-            if not progress_fn:
-                return
-            now = _t.monotonic()
-            if not force and (now - _last_progress[0]) < _PROGRESS_INTERVAL:
-                return
-            _last_progress[0] = now
-            tc = token_count[0] or sum(len(t) for t in text_parts)
-            label = "done" if thought_done[0] else "thinking"
-            try:
-                progress_fn(f"[Gemini] streaming — {tc} tokens, thought={label}")
-            except Exception:
-                pass
+        # Throttled "still thinking" warn — fires once per 5s so user can
+        # see the stall in real time before the watchdog cuts the stream.
+        _STALL_SECS = _gemini_thought_stall_secs()
+        _last_thinking_warn = [0.0]
 
         _verbose = bool(os.environ.get("AUTOCOOKER_STREAM_DEBUG"))
 
@@ -174,6 +216,11 @@ class GeminiTransport(BaseTransport):
             parts = (cand.get("content") or {}).get("parts", []) or []
             for p in parts:
                 if p.get("thought"):
+                    # Capture thought text so we can include it in
+                    # diagnostic output later. Continue without flipping
+                    # thought_done — we still want a non-thought part.
+                    if p.get("text"):
+                        thought_texts.append(p["text"])
                     continue
                 thought_done[0] = True
                 if p.get("text"):
@@ -226,6 +273,40 @@ class GeminiTransport(BaseTransport):
                         log_fn(
                             f"[Gemini] streaming — first bytes after {now - _start:.1f}s",
                             "info",
+                        )
+                # Thought-only watchdog. If model has produced data but every
+                # part so far has been "thought", short-circuit before the
+                # idle_timeout (300s) wears out the planning step.
+                _elapsed_since_first = now - (_first_byte_at or now)
+                if (
+                    not thought_done[0]
+                    and thought_texts
+                    and _elapsed_since_first > _STALL_SECS
+                ):
+                    try:
+                        resp.close()
+                    except Exception:
+                        pass
+                    _summary = "".join(thought_texts)[:500]
+                    raise RuntimeError(
+                        f"{GEMINI_THOUGHT_STALL_TOKEN}: stalled in thoughts for "
+                        f"{_elapsed_since_first:.1f}s ({len(thought_texts)} thought parts, "
+                        f"~{token_count[0]} tokens). Last thought: {_summary!r}"
+                    )
+                # Throttled "still thinking" warn (every 5s) once thoughts
+                # exist but no real output. Disarms when thought_done flips.
+                if (
+                    not thought_done[0]
+                    and thought_texts
+                    and (now - _last_thinking_warn[0]) > 5.0
+                ):
+                    _last_thinking_warn[0] = now
+                    if log_fn:
+                        log_fn(
+                            f"[Gemini] still thinking after {_elapsed_since_first:.1f}s "
+                            f"({len(thought_texts)} parts, ~{token_count[0]} tokens) — "
+                            f"watchdog at {_STALL_SECS:.0f}s",
+                            "warn",
                         )
                 _total_bytes += len(chunk)
                 raw_chunks.append(chunk)
@@ -351,6 +432,20 @@ class GeminiTransport(BaseTransport):
                 raw_all = repr(b"".join(raw_chunks))
             _dbg("EMPTY RESULT — raw stream body follows:\n" + raw_all[:8000], "error")
             saw_finish = finish_reason != "stop" or any('"finishReason"' in e for e in raw_events)
+            thought_summary = "".join(thought_texts)[:500]
+            thought_blurb = (
+                f" thought_summary={thought_summary!r}"
+                if thought_summary else ""
+            )
+            if not saw_finish and thought_texts:
+                # Thought-only stream that closed without finishReason —
+                # raise the stall sentinel so the call() wrapper falls back
+                # to non-stream and caller can append anti-thinking nudge.
+                raise RuntimeError(
+                    f"{GEMINI_THOUGHT_STALL_TOKEN}: only thought parts after "
+                    f"{elapsed:.1f}s ({_total_bytes}B, {len(raw_events)} events, "
+                    f"{len(thought_texts)} thought parts).{thought_blurb}"
+                )
             detail = (
                 "stream ended with only thought parts and no finishReason"
                 if not saw_finish
@@ -358,7 +453,7 @@ class GeminiTransport(BaseTransport):
             )
             raise requests.exceptions.ReadTimeout(
                 f"[Gemini] empty response after {elapsed:.1f}s "
-                f"({_total_bytes}B, {len(raw_events)} events) — {detail}"
+                f"({_total_bytes}B, {len(raw_events)} events) — {detail}.{thought_blurb}"
             )
 
         if log_fn:

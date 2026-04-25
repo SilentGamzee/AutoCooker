@@ -53,6 +53,64 @@ CAVEMAN_PREAMBLE = (
 )
 
 
+# Auto-compact threshold ladder — port of auto-claude-logic
+# services/compact/autoCompact.ts. When cumulative prompt tokens approach
+# the model's context window, the run_loop should warn / compact / abort
+# before the provider rejects with prompt_too_long.
+AUTOCOMPACT_BUFFER_TOKENS = 13_000
+WARNING_THRESHOLD_BUFFER_TOKENS = 20_000
+ERROR_THRESHOLD_BUFFER_TOKENS = 20_000
+MAX_OUTPUT_TOKENS_FOR_SUMMARY = 20_000
+MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES = 3
+
+# Rough context window per model family. Conservative — providers may
+# offer larger windows, but staying well below avoids surprises.
+_CONTEXT_WINDOW_DEFAULTS = {
+    "claude": 200_000,
+    "gpt-4": 128_000,
+    "gemini": 1_000_000,
+    "llama": 8_192,
+    "qwen": 32_768,
+    "mistral": 32_768,
+    "deepseek": 32_768,
+}
+
+
+def get_context_window_for_model(model: str) -> int:
+    m = (model or "").lower()
+    for key, win in _CONTEXT_WINDOW_DEFAULTS.items():
+        if key in m:
+            return win
+    # Override via env for testing: CLAUDE_CODE_AUTO_COMPACT_WINDOW
+    override = os.environ.get("AUTOCOOKER_CONTEXT_WINDOW", "")
+    if override.isdigit():
+        return int(override)
+    return 16_000  # safe small default
+
+
+def get_effective_context_window(model: str) -> int:
+    win = get_context_window_for_model(model)
+    return max(8_000, win - MAX_OUTPUT_TOKENS_FOR_SUMMARY)
+
+
+def get_autocompact_threshold(model: str) -> int:
+    return get_effective_context_window(model) - AUTOCOMPACT_BUFFER_TOKENS
+
+
+def calculate_token_warning_state(token_usage: int, model: str) -> dict:
+    eff = get_effective_context_window(model)
+    autocompact_t = get_autocompact_threshold(model)
+    warn_t = eff - WARNING_THRESHOLD_BUFFER_TOKENS
+    err_t = eff - ERROR_THRESHOLD_BUFFER_TOKENS
+    return {
+        "percent_left": max(0, int(100 * (eff - token_usage) / max(1, eff))),
+        "is_above_warning": token_usage >= warn_t,
+        "is_above_error": token_usage >= err_t,
+        "is_above_autocompact": token_usage >= autocompact_t,
+        "effective_window": eff,
+    }
+
+
 # Module-level cache: prompt .md files are immutable during a run.
 # Eliminates ~100 disk reads per planning run AND guarantees byte-identical
 # prefix text so Anthropic prompt-cache hits (see _openai_to_anthropic) stay
@@ -195,6 +253,20 @@ class BasePhase:
         project_context = self._load_relevant_project_index()
         if project_context:
             parts.append(project_context)
+
+        # Session memory — facts extracted from previous tasks. Injected
+        # once per system prompt so the model sees prior learnings before
+        # re-discovering them. Cached on disk via core.session_memory.
+        try:
+            from core.session_memory import load_session_memory
+            mem = load_session_memory(os.getcwd())
+            if mem.strip():
+                parts.append(
+                    "\n\n---\n## Session memory — facts from prior tasks\n"
+                    + mem.strip()
+                )
+        except Exception:
+            pass
         
         if cache.file_paths:
             parts.append(
@@ -1049,6 +1121,13 @@ Token count: {token_count} / {config['max_total_tokens']}
         _metrics_start = _metrics_time.monotonic()
         _metrics_llm_calls = 0
         _metrics_retries = 0
+        # Diminishing-returns tracker (port from auto-claude-logic
+        # query/tokenBudget.ts). If the model produces near-zero new output
+        # AND fails validation twice in a row with the same reason, abort
+        # the loop early instead of grinding to max_outer_iterations.
+        _DR_DELTA_FLOOR = 200  # chars
+        _dr_last_reason: str | None = None
+        _dr_consec_diminishing = 0
         for outer in range(max_outer_iterations):
             # ── Abort checkpoint ──────────────────────────────────
             self.state.check_abort(self.task.id)
@@ -1189,6 +1268,31 @@ Token count: {token_count} / {config['max_total_tokens']}
                     )
                     return False
                 
+                # Diminishing-returns check: if the LLM produced almost nothing
+                # AND the failure reason hasn't changed since last iteration,
+                # further retries are unlikely to recover. Abort fast.
+                _output_size = len(final_text or "") + (tool_calls_made or 0) * 50
+                _same_reason = (_dr_last_reason is not None and reason == _dr_last_reason)
+                if _output_size < _DR_DELTA_FLOOR and _same_reason:
+                    _dr_consec_diminishing += 1
+                else:
+                    _dr_consec_diminishing = 0
+                _dr_last_reason = reason
+                if _dr_consec_diminishing >= 2:
+                    self.log(
+                        f"  [DIMINISHING] Step '{step_name}' — 2+ iterations with "
+                        f"<{_DR_DELTA_FLOOR} chars output AND same failure ({reason[:80]}). "
+                        "Aborting early.",
+                        "warn",
+                    )
+                    _elapsed = _metrics_time.monotonic() - _metrics_start
+                    self.log(
+                        f"  [METRICS] step='{step_name}' FAILED-DR elapsed={_elapsed:.1f}s "
+                        f"iterations={outer + 1} retries={_metrics_retries}",
+                        "warn",
+                    )
+                    return False
+
                 # НЕ последняя итерация - логируем коротко, но СОЗДАЕМ retry_msg
                 if _DEBUG: print(f"[RUN_LOOP] Validation failed on iteration {outer + 1}/{max_outer_iterations}, creating retry message...", flush=True)
                 self.log(f"  ⚙️ Iteration {outer + 1}/{max_outer_iterations} - validation failed, retrying...", "info")
