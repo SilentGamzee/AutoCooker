@@ -37,6 +37,84 @@ class ProviderQuotaExhaustedError(RuntimeError):
 # Heuristics for distinguishing "real quota exhausted" 429s (where retrying is
 # pointless) from transient burst-limit 429s. If any phrase matches in the
 # response body, we fail fast instead of exhausting the retry schedule.
+def _estimate_tokens(text: str) -> int:
+    """Rough token estimator used when provider does not report `usage`.
+
+    Uses the standard ~4-char-per-token approximation. Underestimates non-ASCII,
+    but the goal is order-of-magnitude visibility into spend, not billing.
+    """
+    if not text:
+        return 0
+    return max(1, len(text) // 4)
+
+
+def _estimate_messages_tokens(messages: list[dict]) -> int:
+    """Estimate prompt size by serializing role+content+tool_calls of every message."""
+    total = 0
+    for m in messages or []:
+        c = m.get("content")
+        if isinstance(c, str):
+            total += _estimate_tokens(c)
+        elif isinstance(c, list):
+            for blk in c:
+                if isinstance(blk, dict):
+                    total += _estimate_tokens(blk.get("text") or json.dumps(blk, ensure_ascii=False))
+        tc = m.get("tool_calls") or []
+        for t in tc:
+            try:
+                total += _estimate_tokens(json.dumps(t, ensure_ascii=False))
+            except Exception:
+                pass
+    return total
+
+
+def _log_usage(
+    log_fn: Optional[Callable],
+    data: dict,
+    *,
+    prompt_messages: Optional[list[dict]] = None,
+    response_text: str = "",
+    tool_calls: Optional[list[dict]] = None,
+    label: str = "LLM",
+) -> None:
+    """Log token usage for an LLM response.
+
+    If the provider returned a `usage` dict, log its values verbatim.
+    Otherwise estimate from the request (prompt_messages) and the response text.
+    """
+    if log_fn is None:
+        return
+    usage = (data or {}).get("usage") or {}
+    if usage:
+        prompt = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+        completion = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+        total = int(usage.get("total_tokens") or (prompt + completion))
+        cache_read = int(usage.get("cache_read_input_tokens") or 0)
+        cache_create = int(usage.get("cache_creation_input_tokens") or 0)
+        extra = ""
+        if cache_read or cache_create:
+            extra = f" (cache_read={cache_read}, cache_create={cache_create})"
+        log_fn(
+            f"[{label}] tokens: prompt={prompt}, completion={completion}, "
+            f"total={total}{extra}",
+            "info",
+        )
+        return
+    # Fallback — estimate.
+    est_prompt = _estimate_messages_tokens(prompt_messages or [])
+    est_completion = _estimate_tokens(response_text)
+    if tool_calls:
+        try:
+            est_completion += _estimate_tokens(json.dumps(tool_calls, ensure_ascii=False))
+        except Exception:
+            pass
+    log_fn(
+        f"[{label}] tokens (estimated): prompt~{est_prompt}, "
+        f"completion~{est_completion}, total~{est_prompt + est_completion}",
+        "info",
+    )
+
+
 _QUOTA_EXHAUSTED_MARKERS = (
     "would exceed your account's rate limit",
     "quota exceeded",
@@ -426,6 +504,14 @@ class OllamaClient:
                     if log_fn:
                         log_fn("[LM Studio] Model hit max_tokens limit.", "warn")
 
+            _log_usage(
+                log_fn,
+                json_data,
+                prompt_messages=[{"role": "user", "content": prompt}],
+                response_text=result,
+                tool_calls=tool_calls,
+                label="LLM",
+            )
             if log_fn:
                 log_fn(f"[LM Studio] complete() done — response_len={len(result)}")
             return result
@@ -721,9 +807,19 @@ class OllamaClient:
 
             # Build messages list: system prompt as first message (OpenAI format),
             # not as a top-level "system" field (Ollama-only, rejected by Gemini etc.)
+            #
+            # BasePhase.build_system may embed a "<<<CACHE_BOUNDARY>>>" sentinel
+            # separating the stable cacheable prefix from the volatile tail
+            # (recent logs). The Anthropic transport splits on this marker;
+            # every other provider must not see it — strip here.
+            _effective_system = system
+            if _effective_system and self.auth_style != "anthropic":
+                _effective_system = _effective_system.replace(
+                    "\n<<<CACHE_BOUNDARY>>>\n", ""
+                )
             final_messages = messages
-            if system and (not messages or messages[0].get("role") != "system"):
-                final_messages = [{"role": "system", "content": system}] + messages
+            if _effective_system and (not messages or messages[0].get("role") != "system"):
+                final_messages = [{"role": "system", "content": _effective_system}] + messages
 
             payload: dict = {
                 "model": model,
@@ -940,6 +1036,27 @@ class OllamaClient:
             message = choice0.get("message") or {}
             content = message.get("content") or ""
             model_tool_calls: list[dict] = message.get("tool_calls") or []
+
+            _log_usage(
+                log_fn,
+                data,
+                prompt_messages=messages,
+                response_text=content,
+                tool_calls=model_tool_calls,
+                label="LLM",
+            )
+
+            # Surface truncation explicitly — small models often hit max_tokens
+            # mid-JSON, returning a partial response that fails downstream
+            # validation with a confusing error. Logging it loudly helps users
+            # bump the budget or shrink context.
+            if choice0.get("finish_reason") == "length" and log_fn:
+                log_fn(
+                    f"[LLM] Output hit max_tokens — response truncated "
+                    f"(content_len={len(content)}, tool_calls={len(model_tool_calls)}). "
+                    "Increase max_tokens or shrink prompt.",
+                    "warn",
+                )
 
             # Keep assistant message in conversation history.
             assistant_message = {"role": "assistant", "content": content}
@@ -1294,10 +1411,16 @@ class OllamaClient:
 
             if validate_fn:
                 ok, reason = validate_fn()
-                if ok == False:
-                    _last_validation_reason = reason
-                else:
+                if ok:
                     _last_validation_reason = ""
+                    if log_fn:
+                        log_fn(
+                            f"[EARLY EXIT] Round {_round + 1}: validation passed — "
+                            "exiting tool loop",
+                            "info",
+                        )
+                    return "", _tool_calls_made
+                _last_validation_reason = reason
                 _rounds_without_write += 1
 
         return "", _tool_calls_made

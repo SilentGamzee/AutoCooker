@@ -52,13 +52,13 @@ from core.phases.planning.utils import UtilsMixin
 
 class PlanningPhase(SpecMixin, ActionsMixin, CritiqueMixin, LegacyStepsMixin, LoaderMixin, UtilsMixin, BasePhase):
     # ── Checkpoint helpers (resume after abort/crash) ────────────
-    _CP_STAGES = ("spec_done", "actions_done", "subtasks_loaded", "complete")
+    _CP_STAGES = ("spec_done", "outline_done", "actions_done", "subtasks_loaded", "complete")
 
     def __init__(self, state: AppState, task: KanbanTask):
         super().__init__(state, task, "planning")
 
     # ── Checkpoint helpers (resume after abort/crash) ────────────
-    _CP_STAGES = ("spec_done", "actions_done", "subtasks_loaded", "complete")
+    _CP_STAGES = ("spec_done", "outline_done", "actions_done", "subtasks_loaded", "complete")
 
     def _cp_path(self) -> str:
         return os.path.join(self.task.task_dir, "planning_checkpoint.json")
@@ -182,13 +182,20 @@ class PlanningPhase(SpecMixin, ActionsMixin, CritiqueMixin, LegacyStepsMixin, Lo
         critique_issues: list[dict] = []
         max_iterations = 5
         skip_action_loop = self._cp_at_or_after(resume_stage, "actions_done")
+        resume_outline_flag = self._cp_at_or_after(resume_stage, "outline_done") and not skip_action_loop
         if skip_action_loop:
             self.log("─── Steps 2/3/3b: Actions+Critique (skipped — resumed from checkpoint) ───", "info")
+        elif resume_outline_flag:
+            self.log("  ↻ Resume: outline + partial actions from checkpoint — skipping 2a, re-using action files already on disk", "info")
 
         for iteration in range(0 if skip_action_loop else max_iterations):
             self.log(f"─── Step 2: Write Actions (iter {iteration+1}/{max_iterations}) ───")
+            # Resume only applies on the very first iteration — subsequent
+            # iterations are critique retries and need a full rebuild.
+            resume_this_iter = resume_outline_flag and iteration == 0
             if not self._new_step2_write_actions(
-                model, critique_feedback, issues=critique_issues or None
+                model, critique_feedback, issues=critique_issues or None,
+                resume_outline=resume_this_iter,
             ):
                 self.log("[FAIL] Step 2 Write Actions failed – aborting planning", "error")
                 return False

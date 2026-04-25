@@ -36,9 +36,3 @@ Fill in the JSON template provided in the message. Then call `confirm_phase_done
 2. `confirm_phase_done`
 
 That's it. Two tool calls maximum.
-
-
-## Response Style
-
-Caveman mode: drop articles (a/an/the), filler (just/really/basically/actually/simply), pleasantries, and hedging. Fragments OK. Short synonyms (big not extensive, fix not implement-a-solution-for). Technical terms exact. Code blocks unchanged. JSON and structured output unchanged — caveman applies only to free-text fields (summaries, explanations, descriptions). Errors quoted exact.
-Pattern: [thing] [action] [reason]. [next step].

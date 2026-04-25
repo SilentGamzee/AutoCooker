@@ -48,6 +48,7 @@ class ActionsMixin:
         model: str,
         critique_feedback: str = "",
         issues: list[dict] | None = None,
+        resume_outline: bool = False,
     ) -> bool:
         """
         Compose Step 2 as three smaller LLM calls to keep each prompt tight:
@@ -59,6 +60,11 @@ class ActionsMixin:
         In targeted mode (retry after critic FAIL), the outline is rebuilt
         from the failing action files instead of calling 2a. 2c still
         runs so that coverage-gap issues produce brand-new action files.
+
+        `resume_outline=True`: skip 2a and the stale-file sweep — reuse
+        `subtasks_outline.json` + any valid action files already on disk
+        from a previous aborted run. Only 2b-missing action files get
+        re-generated. Applied only for the very first critique iteration.
         """
         wd = self.task.project_path or self.state.working_dir
         actions_dir = os.path.join(self.task.task_dir, "actions")
@@ -85,6 +91,37 @@ class ActionsMixin:
                 f"preserved)",
                 "info",
             )
+        elif resume_outline:
+            outline_path = os.path.join(self.task.task_dir, "subtasks_outline.json")
+            outline = []
+            try:
+                with open(outline_path, "r", encoding="utf-8") as fh:
+                    d = json.load(fh) or {}
+                outline = list(d.get("subtasks") or [])
+            except Exception as e:
+                self.log(
+                    f"  [WARN] Resume: failed to load {outline_path!r}: {e} — "
+                    f"falling back to fresh 2a outline",
+                    "warn",
+                )
+                outline = []
+            if not outline:
+                resume_outline = False  # fall through to normal 2a below
+                self.log("─── 2a Outline ───")
+                ok, outline = self._new_step2a_outline(
+                    model, critique_feedback, spec_content, wd, issues
+                )
+                if not ok:
+                    self.log("[FAIL] Could not build subtasks outline", "error")
+                    return False
+                self.log(f"  Outline: {len(outline)} subtask(s)", "info")
+            else:
+                self.log(
+                    f"  ↻ Resume: reusing existing outline with {len(outline)} "
+                    f"subtask(s); skipping 2a",
+                    "info",
+                )
+                self._cp_save("outline_done")
         else:
             self.log("─── 2a Outline ───")
             ok, outline = self._new_step2a_outline(
@@ -94,6 +131,7 @@ class ActionsMixin:
                 self.log("[FAIL] Could not build subtasks outline", "error")
                 return False
             self.log(f"  Outline: {len(outline)} subtask(s)", "info")
+            self._cp_save("outline_done")
 
             # Clean up stale action files whose IDs are NOT in the new
             # outline. The fresh outline from 2a is authoritative — any
@@ -135,8 +173,38 @@ class ActionsMixin:
         # write conflicts.  Targeted-fix (after critic FAIL): run serially
         # so that corrections stay consistent (one agent sees one issue
         # at a time, no interleaved reasoning across files).
-        if targeted_mode:
+        #
+        # On resume: skip entries whose action file already exists and
+        # parses as JSON. Leftover partial/corrupt files get regenerated.
+        outline_to_write = outline
+        if resume_outline and not targeted_mode:
+            kept, skipped = [], []
             for entry in outline:
+                eid = str(entry.get("id") or "").strip()
+                raw = eid.replace("-", "")  # "T001"
+                action_path = os.path.join(actions_dir, f"{raw}.json")
+                valid = False
+                if os.path.isfile(action_path):
+                    try:
+                        with open(action_path, "r", encoding="utf-8") as fh:
+                            json.load(fh)
+                        valid = True
+                    except Exception:
+                        valid = False
+                if valid:
+                    skipped.append(eid)
+                else:
+                    kept.append(entry)
+            if skipped:
+                self.log(
+                    f"  ↻ Resume 2b: skipping {len(skipped)} already-written "
+                    f"action file(s): {', '.join(skipped)}",
+                    "info",
+                )
+            outline_to_write = kept
+
+        if targeted_mode:
+            for entry in outline_to_write:
                 label = str(entry.get("id") or "?")
                 self.log(f"─── 2b Write {label} (serial, targeted fix) ───")
                 if not self._new_step2b_write_single(
@@ -145,8 +213,11 @@ class ActionsMixin:
                     self.log(f"[FAIL] Writing action for {label} failed", "error")
                     return False
         else:
-            if not self._run_2b_parallel(outline, model, spec_content, wd, issues=None):
-                return False
+            if outline_to_write:
+                if not self._run_2b_parallel(outline_to_write, model, spec_content, wd, issues=None):
+                    return False
+            else:
+                self.log("  ↻ Resume 2b: all action files already written", "ok")
 
         # ── 2c. Completeness loop (bounded) ────────────────────────
         # Even in targeted mode we run this, because the critic's issues
@@ -358,7 +429,7 @@ class ActionsMixin:
         ok = self.run_loop(
             "2a Outline", "p_action_outline.md",
             PLANNING_TOOLS, executor, msg, validate, model,
-            reconstruct_after=2, max_outer_iterations=4, max_tool_rounds=20,
+            reconstruct_after=2, max_outer_iterations=2, max_tool_rounds=10,
         )
         if not ok:
             return False, []
@@ -740,14 +811,40 @@ class ActionsMixin:
         if not merged:
             return ""
 
+        # Adaptive budget: total rendered file content capped at ~8000 chars.
+        # Prevents silent prompt truncation on small models when scored_files
+        # contains a few large files.
+        char_budget = 8000
         sections = []
+        truncated = 0
         for rel_path in merged:
             section = self._render_file_section(project_path, rel_path, max_lines)
-            if section:
-                sections.append(section)
+            if not section:
+                continue
+            if char_budget <= 0:
+                truncated += 1
+                continue
+            if len(section) > char_budget:
+                # Shrink remaining file by halving max_lines until it fits or hits floor
+                shrunk_lines = max(40, max_lines // 2)
+                while shrunk_lines >= 40 and len(section) > char_budget:
+                    section = self._render_file_section(project_path, rel_path, shrunk_lines)
+                    if not section:
+                        break
+                    shrunk_lines //= 2
+                if not section or len(section) > char_budget:
+                    truncated += 1
+                    continue
+            sections.append(section)
+            char_budget -= len(section)
 
         if not sections:
             return ""
+        if truncated:
+            sections.append(
+                f"\n[CONTEXT TRUNCATED: {truncated} additional file(s) "
+                "dropped to fit budget — call read_file if needed]\n"
+            )
 
         return (
             "KEY SOURCE FILES (line numbers shown — use them for code.line in each step):\n"

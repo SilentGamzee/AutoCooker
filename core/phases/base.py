@@ -38,12 +38,39 @@ PROJECT_CONTEXT_CONFIG = {
 }
 
 
+# Caveman response style — injected ONCE per system prompt instead of being
+# duplicated in every individual prompt .md file. Kept byte-identical so it
+# stays inside the Anthropic cached prefix.
+CAVEMAN_PREAMBLE = (
+    "## Response Style\n\n"
+    "Caveman mode: drop articles (a/an/the), filler (just/really/basically/"
+    "actually/simply), pleasantries, hedging. Fragments OK. Short synonyms "
+    "(big not extensive, fix not implement-a-solution-for). Technical terms "
+    "exact. Code blocks unchanged. JSON and structured output unchanged — "
+    "caveman applies only to free-text fields (summaries, descriptions). "
+    "Errors quoted exact.\n"
+    "Pattern: [thing] [action] [reason]. [next step].\n"
+)
+
+
+# Module-level cache: prompt .md files are immutable during a run.
+# Eliminates ~100 disk reads per planning run AND guarantees byte-identical
+# prefix text so Anthropic prompt-cache hits (see _openai_to_anthropic) stay
+# valid. App restart reloads from disk.
+_PROMPT_CACHE: dict[str, str] = {}
+
+
 def load_prompt(filename: str) -> str:
+    cached = _PROMPT_CACHE.get(filename)
+    if cached is not None:
+        return cached
     path = os.path.join(PROMPTS_DIR, filename)
     if not os.path.isfile(path):
         return f"(system prompt file not found: {filename})"
     with open(path, "r", encoding="utf-8") as f:
-        return f.read()
+        text = f.read()
+    _PROMPT_CACHE[filename] = text
+    return text
 
 
 class BasePhase:
@@ -64,6 +91,12 @@ class BasePhase:
         # Lives per-phase-instance so entries persist across a run's subtasks.
         self._file_section_cache: dict = {}
         self._file_section_lock = _threading.Lock()
+        # Memoized relevant-project-index section. Task description is
+        # static across a phase so the filter result + Ollama LLM call used
+        # to build it are safe to compute once. Keyed on description text
+        # so patch-mode (description mutates) invalidates automatically.
+        self._cached_project_index_section: str | None = None
+        self._cached_project_index_desc: str | None = None
 
     # ── Gevent-safe eel dispatcher ────────────────────────────────
     @staticmethod
@@ -142,11 +175,21 @@ class BasePhase:
         task_dict = self.task.to_dict_ui()
         self._gevent_safe(lambda: eel.task_updated(task_dict))
 
+    # Sentinel separating the stable (cacheable) prefix of the system
+    # prompt from the volatile tail. Anthropic transport splits on this
+    # string and attaches cache_control only to the prefix block so that
+    # volatile content (recent logs, dynamic task state) does not bust
+    # the cache every round. Other providers strip the sentinel and see
+    # the joined text unchanged.
+    CACHE_BOUNDARY = "\n<<<CACHE_BOUNDARY>>>\n"
+
     # ── System prompt ────────────────────────────────────────────
     def build_system(self, prompt_file: str) -> str:
         base = load_prompt(prompt_file)
         cache = self.state.cache
-        parts = [base]
+        # Caveman preamble first — single source of truth, byte-identical
+        # so it stays inside the Anthropic cached prefix.
+        parts = [CAVEMAN_PREAMBLE, base]
         
         # NEW: Add relevant project structure
         project_context = self._load_relevant_project_index()
@@ -195,13 +238,12 @@ class BasePhase:
         # are excluded so the model can still fetch their full content.
         cache._rendered_paths = rendered
 
-        recent_logs = self.task.logs[-10:]
-        if recent_logs:
-            log_lines = "\n".join(
-                f"[{e.get('ts','')}][{e.get('phase','')}] {e.get('msg','')}"
-                for e in recent_logs
-            )
-            parts.append("\n\n---\n## Recent task logs (last 10)\n```\n" + log_lines + "\n```")
+        # Everything appended above this point is stable across tool
+        # rounds and (mostly) across outer retries of the same step →
+        # eligible for prompt cache. Insert the boundary, then append
+        # volatile content (recent logs) so the Anthropic transport can
+        # cut the cached prefix right here. Keep the mandatory response-
+        # format block inside the cached prefix — it never changes.
         parts.append(
             "\n\n---\n## RESPONSE FORMAT — MANDATORY\n"
             "Every response MUST consist of tool calls ONLY.\n"
@@ -209,6 +251,15 @@ class BasePhase:
             "No reasoning, no explanation, no prose — tool calls only.\n"
             "Text-only responses (without a tool call) cause immediate task failure."
         )
+        parts.append(self.CACHE_BOUNDARY)
+
+        recent_logs = self.task.logs[-10:]
+        if recent_logs:
+            log_lines = "\n".join(
+                f"[{e.get('ts','')}][{e.get('phase','')}] {e.get('msg','')}"
+                for e in recent_logs
+            )
+            parts.append("\n\n---\n## Recent task logs (last 10)\n```\n" + log_lines + "\n```")
         return "\n".join(parts)
 
     # ── File snapshot helper ─────────────────────────────────────
@@ -665,11 +716,25 @@ Maximum {max_files} files."""
         return "\n".join(lines)
 
     def _load_relevant_project_index(self) -> str:
-        """Load project_index.json with relevance filtering and batching."""
+        """Load project_index.json with relevance filtering and batching.
+
+        Memoized per-phase: task description is static across a run, so the
+        keyword filter + Ollama relevance LLM call run only once. Busts
+        automatically if description mutates (patch mode).
+        """
+        cur_desc = self.task.description or ""
+        if (
+            self._cached_project_index_section is not None
+            and self._cached_project_index_desc == cur_desc
+        ):
+            return self._cached_project_index_section
+
         config = PROJECT_CONTEXT_CONFIG
-        
+
         project_index = self._load_project_index_file()
         if not project_index:
+            self._cached_project_index_section = ""
+            self._cached_project_index_desc = cur_desc
             return ""
 
         # ── Normalise services to dict format ─────────────────────────
@@ -733,12 +798,14 @@ Maximum {max_files} files."""
         
         if not relevant_files:
             print("[PROJECT_CONTEXT] No relevant files found, returning empty context", flush=True)
+            self._cached_project_index_section = ""
+            self._cached_project_index_desc = cur_desc
             return ""
-        
+
         batched_index = self._batch_project_index_to_limit(project_index, relevant_files, max_tokens=config["max_total_tokens"])
         formatted = self._format_project_index_section(batched_index)
         token_count = self._count_tokens(formatted)
-        
+
         header = f"""
 
 {'=' * 60}
@@ -747,8 +814,11 @@ Token count: {token_count} / {config['max_total_tokens']}
 {'=' * 60}
 
 """
-        
-        return header + formatted
+
+        rendered = header + formatted
+        self._cached_project_index_section = rendered
+        self._cached_project_index_desc = cur_desc
+        return rendered
 
     # ── Extract file path from error message ─────────────────
     def _extract_file_path_from_error(self, error_msg: str) -> str | None:

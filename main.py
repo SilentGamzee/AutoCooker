@@ -545,6 +545,11 @@ def _launch_pipeline(task_id: str) -> None:
             _QUEUE_EVENT.set()  # wake up queue processor — a slot just opened
 
     def _run_pipeline():
+        # Defensive: clear any stale abort flag left over from a previous run.
+        # Abort is cooperative — if the previous pipeline exited before polling
+        # is_aborted (e.g. during disk IO or between phases), the flag stays in
+        # the set and would auto-abort this fresh run on the first poll.
+        STATE.abort_requested.discard(task_id)
         STATE.active_task_id = task_id
         task.column = "in_progress"
         task.has_errors = False

@@ -199,32 +199,17 @@ After writing implementation_plan.json, call `confirm_phase_done`.
 Every subtask that touches `.css` or `.html` MUST include `visual_spec`: a one-sentence layout/style description using `var(--*)` token names (e.g. `"var(--accent) button, var(--bg2) list items, var(--r6) radius"`).
 
 ## FORBIDDEN PATTERNS
-- Backend subtasks for logic already handled by existing code (audit it first)
-- `files_to_modify` containing a non-existent file
-- Multiple subtasks modifying the same element
-- JS subtask before the HTML subtask that creates the elements it needs
-- `code` referencing a method not confirmed to exist via `read_file`
-- `code` referencing a DOM id (`#something`) not confirmed to exist in HTML via `read_file`
-- `code` referencing a task state field not confirmed to exist in the dataclass via `read_file`
-- A subtask whose only purpose is to "ensure styling is consistent" when no new CSS is needed
-- A subtask that modifies planning/workflow logic to "skip steps on restart" unless the task description explicitly requires it
-- `verify_methods` listing a name that was NOT found in the file read (remove the reference instead)
-- `service` field in subtasks — not read by runtime, omit it
-- `code` containing `...`, `# existing code`, `# TODO`, `# rest of`, `// implementation here`
-- Steps that say "locate the function" or "find the existing" without providing the exact `find` string
-- A "Testing", "QA", "Validation", "Analyze", "Review", or "Examine" phase — keep only implementation phases
-- A subtask titled "Review...", "Examine...", "Analyze...", "Document..." — these have no code output
-- `implementation_steps` using field `code_snippet` instead of `code` — the required field name is `"code"`
-- `files_to_modify` paths containing `.tasks/` prefix (e.g. `.tasks/task_021/main.py` is WRONG; use `main.py`)
-- Writing `implementation_plan.json` before reading source files — read first, then write once
-- Any subtask with empty or missing `implementation_steps` — every subtask needs at least 1 step with `code`
-- A phase-3 "Wiring" that creates files under `tests/`, `docs/`, or `*.md` files
-- A phase-3 that creates test scenarios, integration tests, performance benchmarks, or documentation
-- A subtask whose only purpose is adding inline comments, docstrings, or updating README/documentation — documentation is not a code change and will be rejected
-- Steps with `"code": ""` (empty string) — every step must contain real implementation code; remove "Read current X" and "Test modified X" placeholder steps entirely
+- Subtask for logic already present in code
+- Duplicate subtasks on same element
+- JS subtask before HTML subtask that adds its DOM
+- Reference to symbol/DOM id/state field not confirmed via `read_file`
+- `verify_methods` listing unconfirmed name
+- `code` with `...`, `# existing code`, `# TODO`, `# rest of`, `// implementation here`
+- "locate"/"find existing" without exact `find` string
+- Phase or subtask titled Test/QA/Validate/Review/Analyze/Examine/Document
+- Wiring phase creating `tests/`, `docs/`, `*.md`
+- Subtask only adding comments/docstrings/README
+- Empty `code: ""` or placeholder "Read X"/"Test X" steps
 
-
-## Response Style
-
-Caveman mode: drop articles (a/an/the), filler (just/really/basically/actually/simply), pleasantries, and hedging. Fragments OK. Short synonyms (big not extensive, fix not implement-a-solution-for). Technical terms exact. Code blocks unchanged. JSON and structured output unchanged — caveman applies only to free-text fields (summaries, explanations, descriptions). Errors quoted exact.
-Pattern: [thing] [action] [reason]. [next step].
+## PYTHON IMPORT VERIFICATION
+For every Python file in `files_to_modify`/`files_to_create`, list every imported symbol your `code` uses (`Optional`, `dataclass`, `Path`, project classes…). If import missing in target file, FIRST step adds the import line via `find`/`replace` on existing import block. Do NOT assume `from typing import Optional` exists — read the file's import header first.

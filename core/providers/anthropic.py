@@ -214,13 +214,57 @@ class AnthropicTransport(BaseTransport):
         #   2. The system field to be an array of content blocks (not a raw
         #      string) — matches the shape the official CLI sends. Raw strings
         #      get rejected by the OAuth-scoped token policy.
+        #
+        # Prompt caching: we mark the last system block + last tool with
+        # cache_control: ephemeral. Anthropic caches every byte up to and
+        # including the marked block for ~5 minutes, billing cache-hit
+        # tokens at ~10% of normal input cost. The system prompt and tool
+        # schemas are identical across:
+        #   - Parallel 2b workers (same p_action_writer.md + spec)
+        #   - Inner tool-call rounds within a single run_loop iteration
+        #   - Critique retry iterations (spec + outline stable)
+        # so the hit rate is high (~70-95% on prefix) and the savings are
+        # substantial on Claude-backed planning runs.
+        CACHE_MARK = {"type": "ephemeral"}
+        CACHE_SENTINEL = "\n<<<CACHE_BOUNDARY>>>\n"
+
+        # BasePhase.build_system splits stable/volatile content with a
+        # sentinel. Before the sentinel = cacheable (static prompt, spec,
+        # cached file dump). After = volatile (recent logs). Mark only the
+        # stable prefix with cache_control so mutation of the tail does not
+        # invalidate the cache every round.
+        stable_system = system_text or ""
+        volatile_system = ""
+        if system_text and CACHE_SENTINEL in system_text:
+            stable_system, volatile_system = system_text.split(CACHE_SENTINEL, 1)
+
         if self._oauth_mode:
             blocks = [{"type": "text", "text": self._CLAUDE_CODE_IDENTITY}]
-            if system_text:
-                blocks.append({"type": "text", "text": system_text})
+            if stable_system:
+                blocks.append({
+                    "type": "text",
+                    "text": stable_system,
+                    "cache_control": CACHE_MARK,
+                })
+            else:
+                # Cache identity alone if no static prompt (edge case).
+                blocks[-1] = {**blocks[-1], "cache_control": CACHE_MARK}
+            if volatile_system:
+                blocks.append({"type": "text", "text": volatile_system})
             req["system"] = blocks
         elif system_text:
-            req["system"] = system_text
+            # Use array form so we can attach cache_control. API accepts
+            # both string and array system fields for non-OAuth tokens.
+            blocks = []
+            if stable_system:
+                blocks.append({
+                    "type": "text",
+                    "text": stable_system,
+                    "cache_control": CACHE_MARK,
+                })
+            if volatile_system:
+                blocks.append({"type": "text", "text": volatile_system})
+            req["system"] = blocks
 
         if tools:
             anthropic_tools = []
@@ -233,6 +277,12 @@ class AnthropicTransport(BaseTransport):
                         "type": "object", "properties": {}
                     },
                 })
+            # Mark the final tool — caches everything up to and including it.
+            if anthropic_tools:
+                anthropic_tools[-1] = {
+                    **anthropic_tools[-1],
+                    "cache_control": CACHE_MARK,
+                }
             req["tools"] = anthropic_tools
 
         return req
@@ -274,9 +324,19 @@ class AnthropicTransport(BaseTransport):
         if tool_calls:
             message["tool_calls"] = tool_calls
 
+        # Carry usage through so downstream logger reports tokens uniformly.
+        u = anthropic_resp.get("usage") or {}
+        usage_oa = {
+            "prompt_tokens": int(u.get("input_tokens", 0) or 0),
+            "completion_tokens": int(u.get("output_tokens", 0) or 0),
+            "total_tokens": int(u.get("input_tokens", 0) or 0) + int(u.get("output_tokens", 0) or 0),
+            "cache_read_input_tokens": int(u.get("cache_read_input_tokens", 0) or 0),
+            "cache_creation_input_tokens": int(u.get("cache_creation_input_tokens", 0) or 0),
+        }
         return {
             "choices": [{"message": message, "finish_reason": finish_reason, "index": 0}],
             "model": model,
+            "usage": usage_oa,
         }
 
     # ── HTTP calls ────────────────────────────────────────────────
@@ -357,6 +417,14 @@ class AnthropicTransport(BaseTransport):
         finish_reason = "stop"
         result_model = model
         current_idx: int = -1
+        # Anthropic emits initial usage in message_start and updates output_tokens
+        # in message_delta. Capture both so we can log token spend per call.
+        usage_acc: dict = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+        }
 
         _start = _t.monotonic()
         _first_byte_at: Optional[float] = None
@@ -429,7 +497,14 @@ class AnthropicTransport(BaseTransport):
                     evt_type = evt.get("type", "")
 
                     if evt_type == "message_start":
-                        result_model = evt.get("message", {}).get("model", model)
+                        msg_obj = evt.get("message", {})
+                        result_model = msg_obj.get("model", model)
+                        u0 = msg_obj.get("usage") or {}
+                        if u0:
+                            usage_acc["input_tokens"] = int(u0.get("input_tokens", 0) or 0)
+                            usage_acc["output_tokens"] = int(u0.get("output_tokens", 0) or 0)
+                            usage_acc["cache_read_input_tokens"] = int(u0.get("cache_read_input_tokens", 0) or 0)
+                            usage_acc["cache_creation_input_tokens"] = int(u0.get("cache_creation_input_tokens", 0) or 0)
 
                     elif evt_type == "content_block_start":
                         idx = evt.get("index", 0)
@@ -465,6 +540,9 @@ class AnthropicTransport(BaseTransport):
                                 "stop_sequence": "stop",
                             }
                             finish_reason = finish_map.get(sr, "stop")
+                        u1 = evt.get("usage") or {}
+                        if u1.get("output_tokens") is not None:
+                            usage_acc["output_tokens"] = int(u1["output_tokens"])
 
                     _emit_progress()
 
@@ -523,9 +601,19 @@ class AnthropicTransport(BaseTransport):
         if tool_calls:
             message["tool_calls"] = tool_calls
 
+        # Translate Anthropic usage -> OpenAI-compat usage so downstream
+        # uniform logger picks it up without provider-specific branching.
+        synth_usage = {
+            "prompt_tokens": usage_acc["input_tokens"],
+            "completion_tokens": usage_acc["output_tokens"],
+            "total_tokens": usage_acc["input_tokens"] + usage_acc["output_tokens"],
+            "cache_read_input_tokens": usage_acc["cache_read_input_tokens"],
+            "cache_creation_input_tokens": usage_acc["cache_creation_input_tokens"],
+        }
         synth = {
             "choices": [{"message": message, "finish_reason": finish_reason or "stop", "index": 0}],
             "model": result_model,
+            "usage": synth_usage,
         }
         body_bytes = json.dumps(synth, ensure_ascii=False).encode("utf-8")
         _emit_progress(force=True)

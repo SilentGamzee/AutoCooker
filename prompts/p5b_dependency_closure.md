@@ -83,9 +83,3 @@ response — only tool calls.
   plan is one atomic unit.
 - If every subtask is clean, still write the file with all verdicts=`ok`.
   Do not omit the write: the absence of the file is treated as a failure.
-
-
-## Response Style
-
-Caveman mode: drop articles (a/an/the), filler (just/really/basically/actually/simply), pleasantries, and hedging. Fragments OK. Short synonyms (big not extensive, fix not implement-a-solution-for). Technical terms exact. Code blocks unchanged. JSON and structured output unchanged — caveman applies only to free-text fields (summaries, explanations, descriptions). Errors quoted exact.
-Pattern: [thing] [action] [reason]. [next step].

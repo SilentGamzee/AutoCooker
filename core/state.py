@@ -646,6 +646,31 @@ class AppState:
         except Exception:
             pass
 
+        # Recover tasks left mid-execution by a previous process crash/close.
+        # Any task still in "in_progress" at load time had no live runner, so
+        # mark it Aborted and route to Human Review (keep can_resume=True so
+        # user can manually restart from the last phase).
+        _recovered = False
+        for t in self.kanban_tasks:
+            if t.column == "in_progress":
+                t.column = "human_review"
+                t.has_errors = True
+                t.can_resume = True
+                for ph, st in list(t.phase_status.items()):
+                    if st == "in_progress":
+                        t.phase_status[ph] = "failed"
+                        if not t.resume_from_phase:
+                            t.resume_from_phase = ph
+                t.tags = list(set(t.tags + ["Aborted", "Needs Review"]))
+                t.add_log(
+                    "  ⚠ Task was in_progress when app last closed — "
+                    "moved to Human Review (Aborted). Resume manually if needed.",
+                    "system", "warn",
+                )
+                _recovered = True
+        if _recovered:
+            self._save_kanban()
+
     # ── Task dir init ────────────────────────────────────────────
     def init_task_dir(self, task: KanbanTask):
         root = task.project_path or self.working_dir
