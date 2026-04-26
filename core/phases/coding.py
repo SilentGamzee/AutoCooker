@@ -413,6 +413,86 @@ class CodingPhase(BasePhase):
             except Exception as e:
                 ok, lint_msg = False, f"linter crashed: {e}"
             if not ok:
+                # Baseline-aware filter: skip lint failure if the same hard
+                # errors existed in the file BEFORE this subtask's apply.
+                # Pre-existing pyflakes complaints (e.g. forward-ref string
+                # annotations) are not this subtask's responsibility.
+                baseline_bytes = snapshot.get(rel)
+                if baseline_bytes is not None:
+                    import tempfile as _tf, re as _re_base
+                    base_lint_ok = False
+                    base_lint_msg = ""
+                    try:
+                        with _tf.NamedTemporaryFile(
+                            mode="wb", suffix=os.path.splitext(rel)[1] or ".py",
+                            delete=False,
+                        ) as _btmp:
+                            _btmp.write(baseline_bytes)
+                            _btmp.flush()
+                            _btmp_path = _btmp.name
+                        try:
+                            base_lint_ok, base_lint_msg = lint_file(_btmp_path)
+                        finally:
+                            try:
+                                os.unlink(_btmp_path)
+                            except OSError:
+                                pass
+                    except Exception:
+                        pass
+
+                    new_undef = set(_re_base.findall(
+                        r"undefined name '([^']+)'", str(lint_msg)
+                    ))
+                    base_undef = set(_re_base.findall(
+                        r"undefined name '([^']+)'", str(base_lint_msg)
+                    ))
+                    introduced = new_undef - base_undef
+                    has_syntax_now = ("SyntaxError" in str(lint_msg)
+                                      or "IndentationError" in str(lint_msg))
+                    has_syntax_base = ("SyntaxError" in str(base_lint_msg)
+                                       or "IndentationError" in str(base_lint_msg))
+                    introduces_syntax = has_syntax_now and not has_syntax_base
+                    if not introduced and not introduces_syntax:
+                        self.log(
+                            f"  [LINT-IGNORE] {rel}: errors were pre-existing "
+                            f"in baseline, not introduced by {sid}. "
+                            f"Skipping rollback.",
+                            "warn",
+                        )
+                        continue
+
+                lint_full = str(lint_msg)
+                undefined_names: list[str] = []
+                try:
+                    import re as _re_lint
+                    seen_un: set[str] = set()
+                    for nm in _re_lint.findall(r"undefined name '([^']+)'", lint_full):
+                        if nm not in seen_un:
+                            seen_un.add(nm)
+                            undefined_names.append(nm)
+                except Exception:
+                    pass
+                existing_imports: list[str] = []
+                try:
+                    with open(abs_p, "r", encoding="utf-8", errors="replace") as _fh:
+                        _src = _fh.read()
+                    import re as _re_imp
+                    for ln in _src.splitlines():
+                        m1 = _re_imp.match(r"^\s*import\s+([\w\.]+)", ln)
+                        m2 = _re_imp.match(r"^\s*from\s+([\w\.]+)\s+import\s+(.+)$", ln)
+                        if m1:
+                            existing_imports.append(m1.group(1))
+                        elif m2:
+                            mod = m2.group(1)
+                            for nm in m2.group(2).split(","):
+                                nm = nm.strip().split(" as ")[0].strip("() ")
+                                if nm:
+                                    existing_imports.append(f"{mod}.{nm}")
+                        elif ln.strip() and not ln.startswith((" ", "\t", "#", '"""', "'''")):
+                            if existing_imports:
+                                break
+                except Exception:
+                    pass
                 _rollback()
                 return False, {
                     "category": "lint",
@@ -420,7 +500,9 @@ class CodingPhase(BasePhase):
                     "step_index": None,
                     "block_index": None,
                     "target_file": rel,
-                    "message": f"Lint failed for {rel}: {str(lint_msg)[:500]}",
+                    "message": f"Lint failed for {rel}: {lint_full[:500]}",
+                    "lint_undefined_names": undefined_names,
+                    "existing_imports": existing_imports[:60],
                 }
 
         return True, {}

@@ -782,18 +782,55 @@ def _launch_pipeline(task_id: str) -> None:
                         
                         if needs_analysis:
                             task.update_phase_status("coding", "needs_analysis")
-                            
+
                             # Подсчитать сколько подзадач нужен анализ
                             analysis_count = sum(
-                                1 for st in task.subtasks 
+                                1 for st in task.subtasks
                                 if st.get("status") == "needs_analysis"
                             )
-                            
+
                             task.add_log(
                                 f"  ⚠️ {analysis_count} subtask(s) need analysis after reaching loop limit",
                                 "system", "warn"
                             )
-                            
+
+                            # Lint-loop fast-fail: if a subtask keeps failing
+                            # with the same lint signature across iterations,
+                            # replanning will not unblock it — escalate now.
+                            try:
+                                lint_repeats = getattr(task, "_lint_repeats", {}) or {}
+                            except Exception:
+                                lint_repeats = {}
+                            stuck_lint = []
+                            for st in task.subtasks:
+                                if st.get("status") != "needs_analysis":
+                                    continue
+                                fd = st.get("failure_details") or {}
+                                if fd.get("category") != "lint":
+                                    continue
+                                sid = st.get("id", "?")
+                                sig = (fd.get("message") or "")[:200]
+                                key = f"{sid}::{sig}"
+                                lint_repeats[key] = lint_repeats.get(key, 0) + 1
+                                if lint_repeats[key] >= 3:
+                                    stuck_lint.append((sid, sig))
+                            task._lint_repeats = lint_repeats
+                            if stuck_lint:
+                                for sid, sig in stuck_lint:
+                                    task.add_log(
+                                        f"  ❌ Subtask {sid} stuck in lint loop "
+                                        f"({lint_repeats.get(f'{sid}::{sig}', 0)}× same error). "
+                                        f"Escalating to Human Review. Error: {sig[:160]}",
+                                        "system", "error"
+                                    )
+                                task.column = "human_review"
+                                task.has_errors = True
+                                task.tags = list(set(task.tags + ["Lint Loop", "Needs Review"]))
+                                _push_task(task)
+                                _push_board()
+                                STATE.active_task_id = ""
+                                return
+
                             if patch_iteration < max_patches:
                                 # Можем попробовать ещё раз с патчем
                                 remaining_patches = max_patches - patch_iteration

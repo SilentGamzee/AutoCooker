@@ -404,6 +404,7 @@ class ToolExecutor:
         log_fn: Optional[Callable[[str, str], None]] = None,
         sandbox: Optional['core.sandbox.Sandbox'] = None,
         fallback_read_root: Optional[str] = None,
+        session_state_path: Optional[str] = None,
     ):
         self.working_dir = os.path.realpath(working_dir)
         # Secondary read-only root: if a file is listed in cached paths but not
@@ -445,6 +446,12 @@ class ToolExecutor:
         # Session-level read deduplication: rel_path → content
         # Populated during read-only phases; prevents re-reading the same file twice.
         self.session_read_files: dict[str, str] = {}
+
+        # Persisted across resume: list of rel paths the model has already
+        # read this task. Hydrated lazily by re-reading current disk content
+        # so stale snapshots don't slip in if the file changed between runs.
+        self._session_state_path = session_state_path
+        self._hydrate_session_state()
 
         # Signals from tools back to the phase runner
         self.last_confirmed_task_id: Optional[str] = None
@@ -590,12 +597,63 @@ class ToolExecutor:
             if self.on_content_cached:
                 self.on_content_cached(rel, content)
             self.session_read_files[rel] = content
+            self._save_session_state()
             READ_FILE_CAP = 12_000
             if len(content) > READ_FILE_CAP:
                 return self._truncated_with_skeleton(rel, content, READ_FILE_CAP)
             return content
         except Exception as e:
             return f"ERROR reading file: {e}"
+
+    def _hydrate_session_state(self) -> None:
+        """Load list of previously-read paths from disk (resume support).
+
+        Re-reads file contents at hydration time so the cache reflects the
+        current on-disk state, not the snapshot from a prior session.
+        """
+        path = self._session_state_path
+        if not path or not os.path.isfile(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except Exception:
+            return
+        if not isinstance(data, dict):
+            return
+        rels = data.get("read_paths") or []
+        if not isinstance(rels, list):
+            return
+        for rel in rels:
+            if not isinstance(rel, str):
+                continue
+            for root in (self.working_dir, self.fallback_read_root):
+                if not root:
+                    continue
+                abs_p = os.path.realpath(os.path.join(root, rel))
+                if not abs_p.startswith(root):
+                    continue
+                if os.path.isfile(abs_p):
+                    try:
+                        with open(abs_p, "r", encoding="utf-8", errors="replace") as fh:
+                            self.session_read_files[rel] = fh.read()
+                    except Exception:
+                        pass
+                    break
+
+    def _save_session_state(self) -> None:
+        path = self._session_state_path
+        if not path:
+            return
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            payload = {"read_paths": sorted(self.session_read_files.keys())}
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=False, indent=2)
+            os.replace(tmp, path)
+        except Exception:
+            pass
 
     def _truncated_with_skeleton(self, rel: str, content: str, head_cap: int) -> str:
         """For big files: head with line numbers + skeleton (def/class @ line N) + hint.
@@ -703,8 +761,38 @@ class ToolExecutor:
 
     def _read_file_range(self, args: dict) -> str:
         path_raw   = args.get("path", "")
-        start_line = int(args.get("start_line", 1))
-        end_line   = int(args.get("end_line", -1))
+
+        def _coerce_int(value, default: int) -> int:
+            if value is None:
+                return default
+            if isinstance(value, bool):
+                return int(value)
+            if isinstance(value, int):
+                return value
+            if isinstance(value, float):
+                return int(value)
+            if isinstance(value, (list, tuple)):
+                return _coerce_int(value[0] if value else default, default)
+            s = str(value).strip().strip("[]() ").replace(",", " ")
+            tokens = [t for t in s.split() if t]
+            if not tokens:
+                return default
+            try:
+                return int(tokens[0])
+            except ValueError:
+                try:
+                    return int(float(tokens[0]))
+                except Exception:
+                    return default
+
+        start_line = _coerce_int(args.get("start_line"), 1)
+        end_line   = _coerce_int(args.get("end_line"), -1)
+        # Some models pass a combined "1, 50" into start_line; salvage end_line.
+        sraw = args.get("start_line")
+        if isinstance(sraw, str) and "," in sraw and (args.get("end_line") in (None, "")):
+            parts = [p.strip() for p in sraw.split(",") if p.strip()]
+            if len(parts) >= 2:
+                end_line = _coerce_int(parts[1], end_line)
         abs_path   = self._safe_path(path_raw)
 
         validation = self._validate_path(abs_path, "read")
@@ -973,6 +1061,32 @@ class ToolExecutor:
                     f"submit_critic_verdict with the file field populated "
                     f"for every issue."
                 )
+
+        # Normalize: model occasionally emits issues as bare strings or as a
+        # single string — coerce to list[dict] so downstream `issue.get(...)`
+        # never crashes with AttributeError.
+        if isinstance(issues, str):
+            issues = [issues]
+        if isinstance(issues, list):
+            normalized: list[dict] = []
+            for raw in issues:
+                if isinstance(raw, dict):
+                    normalized.append(raw)
+                elif isinstance(raw, str):
+                    normalized.append({
+                        "severity": "critical",
+                        "file": "",
+                        "description": raw,
+                    })
+                else:
+                    normalized.append({
+                        "severity": "critical",
+                        "file": "",
+                        "description": str(raw),
+                    })
+            issues = normalized
+        else:
+            issues = []
 
         # Store on executor for retrieval by _run_llm_critic
         self.critic_verdict         = verdict

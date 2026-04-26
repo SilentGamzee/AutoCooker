@@ -398,12 +398,43 @@ class PlanningPhase(SpecMixin, ActionsMixin, CritiqueMixin, LegacyStepsMixin, Lo
         if block_idx is not None:
             loc.append(f"block {block_idx}")
         loc_str = (" ".join(loc) + ": ") if loc else ""
-        issue_desc = (
-            f"Coding phase rolled this action back ({details.get('category', 'apply')}). "
-            f"{loc_str}{details.get('message', '(no message)')} "
-            "Rewrite the failing step so the SEARCH text exists verbatim in the "
-            "target file (or use an empty SEARCH when creating a new file)."
-        )
+        category = (details.get("category") or "apply").lower()
+        msg = details.get("message", "(no message)")
+        target_file = details.get("target_file", "")
+
+        if category == "lint":
+            undef = details.get("lint_undefined_names") or []
+            existing = details.get("existing_imports") or []
+            undef_str = ", ".join(repr(n) for n in undef[:10]) if undef else "(none extracted)"
+            existing_preview = ", ".join(existing[:25]) if existing else "(none detected)"
+            existing_more = f" (+{len(existing) - 25} more)" if len(existing) > 25 else ""
+            issue_desc = (
+                f"Coding phase ran static lint on {target_file or 'the modified file'} "
+                f"after applying this action and ROLLED BACK due to lint errors.\n"
+                f"Lint output (truncated): {msg[:300]}\n"
+                f"Undefined names detected: {undef_str}\n"
+                f"Existing top-level imports in file: [{existing_preview}{existing_more}]\n\n"
+                "REQUIRED CORRECTION:\n"
+                "1. Add an EXTRA implementation_step at position 1 that imports the "
+                "missing name(s). Use search-anchor on the LAST existing top-level "
+                "import line in the file so the new import lands among existing imports.\n"
+                "2. Example block:\n"
+                "   {\"search\": \"import shutil\\nimport time\", "
+                "\"replace\": \"import shutil\\nimport time\\nfrom typing import Optional\"}\n"
+                "3. Keep the original code-changing step AFTER the import step. "
+                "Do NOT remove or rename the original change — only prepend the import.\n"
+                "4. If a name comes from a project module, use a `from <pkg> import <name>` "
+                "form mirroring how other files in the project import it (check the "
+                "KEY SOURCE FILES section).\n"
+                "5. Do NOT skip the import step — pyflakes will reject the action again."
+            )
+        else:
+            issue_desc = (
+                f"Coding phase rolled this action back ({category}). "
+                f"{loc_str}{msg} "
+                "Rewrite the failing step so the SEARCH text exists verbatim in the "
+                "target file (or use an empty SEARCH when creating a new file)."
+            )
         issues = [{
             "severity": "critical",
             "file": action_file,

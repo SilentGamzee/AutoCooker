@@ -482,6 +482,7 @@ class ActionsMixin:
                 if len(refs) < 2:
                     continue
                 regions = []
+                shared_ids = [str(_s.get("id")) for _, _s in refs]
                 for i, s in refs:
                     region = s.get("region") or {}
                     if (not isinstance(region, dict)
@@ -489,9 +490,17 @@ class ActionsMixin:
                             or not region.get("end_line")):
                         return False, (
                             f"subtasks[{i}] ({s.get('id')}) shares file {fpath!r} "
-                            f"with another subtask but has no `region` "
-                            f"{{anchor_symbol, start_line, end_line}}. "
-                            f"Required when ≥2 subtasks modify the same file."
+                            f"with subtasks {shared_ids} but has no `region` "
+                            f"object. REQUIRED when ≥2 subtasks modify the same "
+                            f"file. Add this field to EACH of {shared_ids} with "
+                            f"non-overlapping line ranges from the project "
+                            f"index outline. Example shape: "
+                            f'"region": {{"file": "{fpath}", '
+                            f'"anchor_symbol": "<pick from outline e.g. '
+                            f'#some-id or ClassName.method>", '
+                            f'"start_line": <int>, "end_line": <int>}}. '
+                            f"Resubmit subtasks_outline.json with regions "
+                            f"populated for ALL shared-file subtasks."
                         )
                     try:
                         a = int(region["start_line"])
@@ -519,12 +528,60 @@ class ActionsMixin:
                             f"Adjust line ranges so each subtask owns a "
                             f"distinct slice (≥1 line gap)."
                         )
+
+            # Cross-subtask contract: every `consumes` entry must be
+            # `provides` by an earlier subtask, or already present in the
+            # project outline (existing symbols/elements).
+            try:
+                project_index = self._load_project_index_file()
+            except Exception:
+                project_index = None
+            existing_symbols: set[str] = set()
+            if isinstance(project_index, dict):
+                files_dict = project_index.get("files") if isinstance(
+                    project_index.get("files"), dict) else project_index
+                if isinstance(files_dict, dict):
+                    for _fp, _meta in files_dict.items():
+                        if not isinstance(_meta, dict):
+                            continue
+                        for sym in (_meta.get("symbols") or []):
+                            if isinstance(sym, str):
+                                existing_symbols.add(sym)
+                        for o in (_meta.get("outline") or []):
+                            if isinstance(o, dict):
+                                nm = o.get("name")
+                                if isinstance(nm, str):
+                                    existing_symbols.add(nm)
+            provided_so_far: set[str] = set(existing_symbols)
+            for i, s in enumerate(subs):
+                provides = s.get("provides") or []
+                consumes = s.get("consumes") or []
+                if not isinstance(provides, list) or not isinstance(consumes, list):
+                    return False, (
+                        f"subtasks[{i}] ({s.get('id')}) provides/consumes "
+                        f"must be arrays of strings."
+                    )
+                for cons in consumes:
+                    if not isinstance(cons, str) or not cons.strip():
+                        continue
+                    if cons not in provided_so_far:
+                        return False, (
+                            f"subtasks[{i}] ({s.get('id')}) consumes "
+                            f"{cons!r}, but no earlier subtask declares it "
+                            f"in `provides` and it is not in the existing "
+                            f"project outline. Either reorder so the "
+                            f"producer subtask comes first, add it to that "
+                            f"subtask's `provides`, or remove the consume."
+                        )
+                for prov in provides:
+                    if isinstance(prov, str) and prov.strip():
+                        provided_so_far.add(prov)
             return True, "OK"
 
         ok = self.run_loop(
             "2a Outline", "p_action_outline.md",
             PLANNING_TOOLS, executor, msg, validate, model,
-            reconstruct_after=2, max_outer_iterations=2, max_tool_rounds=10,
+            reconstruct_after=2, max_outer_iterations=4, max_tool_rounds=10,
         )
         if not ok:
             return False, []
@@ -904,6 +961,49 @@ class ActionsMixin:
                     out.append(rel)
         return out
 
+    @staticmethod
+    def _extract_top_imports(text: str) -> list[str]:
+        """Return a flat list of imported names found at the top of a .py file.
+
+        Stops at the first non-import, non-blank, non-docstring line so the
+        list reflects only top-level imports — not deferred ones inside
+        functions.
+        """
+        out: list[str] = []
+        in_triple = False
+        triple_q = ""
+        for ln in text.splitlines():
+            stripped = ln.strip()
+            if in_triple:
+                if triple_q in stripped:
+                    in_triple = False
+                continue
+            if not stripped or stripped.startswith("#"):
+                continue
+            if stripped.startswith(('"""', "'''")):
+                triple_q = stripped[:3]
+                rest = stripped[3:]
+                if triple_q in rest:
+                    continue
+                in_triple = True
+                continue
+            m1 = re.match(r"^import\s+([\w\.]+)(?:\s+as\s+(\w+))?", stripped)
+            m2 = re.match(r"^from\s+([\w\.]+)\s+import\s+(.+)$", stripped)
+            if m1:
+                out.append(m1.group(2) or m1.group(1))
+                continue
+            if m2:
+                items = m2.group(2).strip().rstrip("\\").strip()
+                items = items.strip("()")
+                for nm in items.split(","):
+                    nm = nm.strip().split(" as ")
+                    name = (nm[1] if len(nm) == 2 else nm[0]).strip()
+                    if name and name != "*":
+                        out.append(name)
+                continue
+            break
+        return list(dict.fromkeys(out))
+
     def _render_file_section(
         self, project_path: str, rel_path: str, max_lines: int
     ) -> str:
@@ -940,7 +1040,24 @@ class ActionsMixin:
                     f"call read_file_range('{rel_path}', start, end) "
                     f"for specific regions)\n"
                 )
-            section = f"=== {rel_path} (total {total} lines) ===\n{numbered}\n"
+            imports_summary = ""
+            if rel_path.lower().endswith(".py"):
+                full_text = "".join(raw_lines)
+                imports_list = self._extract_top_imports(full_text)
+                if imports_list:
+                    imports_summary = (
+                        f"Top-level imports already in {rel_path}: "
+                        f"[{', '.join(imports_list[:30])}"
+                        f"{'…' if len(imports_list) > 30 else ''}]\n"
+                        "If your patch uses a name NOT in this list, add a "
+                        "separate earlier step that imports it (R8).\n"
+                    )
+            section = (
+                f"=== {rel_path} (total {total} lines) ===\n"
+                + imports_summary
+                + numbered
+                + "\n"
+            )
         except Exception:
             return ""
 

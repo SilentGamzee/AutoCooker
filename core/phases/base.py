@@ -1179,12 +1179,15 @@ Token count: {token_count} / {config['max_total_tokens']}
             if callable(_user_hook):
                 _user_hook(rel_path, content)
 
+        session_state_path = os.path.join(task.task_dir, "_session_reads.json") if task.task_dir else None
+
         return ToolExecutor(
             working_dir=wd,
             cache=self.state.cache,
             on_content_cached=_cache_content,
             on_file_written=_composite_on_file_written,
             log_fn=self.log,
+            session_state_path=session_state_path,
             # Sandbox always anchored to task_dir; project_path for read-only reference
             sandbox=create_sandbox(
                 task.task_dir,

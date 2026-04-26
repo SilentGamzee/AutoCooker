@@ -56,6 +56,40 @@ code blocks, no search/replace, just a subtask list.
   frontend, HTML before JS that binds to it, CSS last.
 - **Do NOT write any other file here** — only `subtasks_outline.json`.
 
+## Cross-subtask contracts — `provides` / `consumes`
+
+When two subtasks talk to each other (one defines a field, function, or
+DOM id; another reads it), declare the contract so the writer phase
+cannot drift on names.
+
+- `provides` — list of identifiers this subtask defines or exports.
+  Examples: `KanbanTask.attachments`, `upload_attachment`, `esc`,
+  `populateAttachmentList`, `#new-attachments`, `.att-empty`.
+- `consumes` — list of identifiers this subtask references that another
+  subtask must provide first. Same naming convention as `provides`.
+
+Rules:
+
+- For every item in `consumes`, some EARLIER subtask MUST list the same
+  string in `provides` (or it must already exist in the project
+  `outline`). The validator rejects orphan `consumes`.
+- Order subtasks so producers come before consumers (data → backend →
+  HTML → JS → CSS already enforces this for files; `provides` /
+  `consumes` enforces it at the symbol level).
+- Use full names: include class for methods (`KanbanTask.to_dict`),
+  `#id` for DOM ids, `.cls` for CSS classes. Avoid generic words
+  (`task`, `data`).
+
+Example:
+
+```json
+{"id": "T-001", "files_to_modify": ["core/state.py"],
+ "provides": ["KanbanTask.attachments", "KanbanTask.attachment_data_uri"]}
+{"id": "T-005", "files_to_modify": ["web/js/app.js"],
+ "consumes": ["KanbanTask.attachments", "KanbanTask.attachment_data_uri", "#new-attachments"],
+ "provides": ["populateAttachmentList", "esc"]}
+```
+
 ## Shared-file regions — MANDATORY when ≥2 subtasks share a file
 
 If a single file appears in `files_to_modify` of two or more subtasks, EACH such subtask MUST include a `region` object:

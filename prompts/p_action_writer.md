@@ -55,6 +55,7 @@ For appending near end of file: anchor on last existing function/`if __name__` g
 - **R5** — `replace` is ONLY source code. No outer JSON braces leaking (`}"`, `"}`, `],` at end → mis-escaped quote, re-emit).
 - **R6** — No `...`, `# existing code`, `# TODO`, `# rest of`. No Review/Analyze/Test subtasks — every action produces real code.
 - **R7** — If the message contains a `REGION ANCHOR` block, every `search` MUST match lines within that region (±5 line slack at the boundary for anchor preservation). The pre-fetched region view shown in the message is the ground truth — copy `search` from it byte-for-byte. Do NOT patch outside the declared lines; another subtask owns the rest of the file.
+- **R8** — If the `replace` text uses a name from the standard library or another project module that is NOT in the file's existing top-level imports (shown in `KEY SOURCE FILES` / `Top-level imports`), you MUST add a SEPARATE earlier `step` that imports the missing name. Anchor the import step on the LAST existing top-level import line in the file. Pyflakes runs on a simulated apply — actions that introduce undefined names are auto-rejected. Examples: using `Optional` requires `from typing import Optional`; using `Path` requires `from pathlib import Path`; using a project class requires `from <pkg>.<module> import <Class>` mirroring how other files import it. Never assume an import is implicit.
 
 ---
 

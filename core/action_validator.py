@@ -31,8 +31,144 @@ from core.patcher import (
     legacy_step_to_blocks,
     validate_block_shape,
     validate_block_quality,
+    apply_block,
     _find_with_fuzz,
 )
+
+
+def _dry_run_lint_block_cumulative(
+    target_file: str,
+    baseline_content: str,
+    block: dict,
+) -> tuple[str | None, str | None]:
+    """Apply ONE block on top of `baseline_content` and lint the result.
+
+    Returns (issue_message, new_content). issue_message is None when the
+    patch is lint-clean relative to baseline; new_content is the post-apply
+    text suitable for chaining as the next baseline.
+    """
+    if not target_file or not target_file.lower().endswith(".py"):
+        return None, None
+    if baseline_content is None:
+        return None, None
+    try:
+        ok, new_content, _msg = apply_block(baseline_content, block)
+    except Exception:
+        return None, None
+    if not ok or new_content == baseline_content:
+        return None, new_content if ok else None
+
+    try:
+        from core.linter import _lint_python  # type: ignore
+    except Exception:
+        return None, new_content
+    import tempfile
+
+    def _lint_string(src: str) -> tuple[bool, str]:
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".py", delete=False, encoding="utf-8"
+        )
+        try:
+            tmp.write(src)
+            tmp.flush()
+            tmp.close()
+            return _lint_python(tmp.name)
+        finally:
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass
+
+    base_ok, base_msg = _lint_string(baseline_content)
+    new_ok, new_msg = _lint_string(new_content)
+    if new_ok:
+        return None, new_content
+    if not base_ok and base_msg.strip() == new_msg.strip():
+        return None, new_content
+    new_undef = set(re.findall(r"undefined name '([^']+)'", new_msg))
+    base_undef = set(re.findall(r"undefined name '([^']+)'", base_msg))
+    introduced = sorted(new_undef - base_undef)
+    if introduced:
+        names = ", ".join(repr(n) for n in introduced[:5])
+        more = f" (+{len(introduced) - 5} more)" if len(introduced) > 5 else ""
+        return (
+            f"simulated apply introduces undefined name(s) {names}{more} "
+            f"in {target_file}. Likely a missing import."
+        ), new_content
+    head = (new_msg or "").splitlines()[0][:200]
+    if "SyntaxError" in new_msg or "IndentationError" in new_msg:
+        return f"simulated apply produces syntax error: {head}", new_content
+    return None, new_content
+
+
+def _dry_run_lint_block(
+    target_file: str,
+    target_content: str,
+    block: dict,
+    project_root: str,
+) -> str | None:
+    """Apply ONE search/replace block in-memory and run pyflakes/py_compile
+    on the synthetic file. Return a short error string when a HARD lint
+    error appears AFTER the patch but is NOT present in the original
+    content (i.e. the patch itself introduced it). Return None if the
+    patch is lint-clean (relative to baseline).
+
+    Only runs for `.py` targets; other extensions return None.
+    """
+    if not target_file or not target_file.lower().endswith(".py"):
+        return None
+    if target_content is None:
+        return None
+    try:
+        ok, new_content, _msg = apply_block(target_content, block)
+    except Exception:
+        return None
+    if not ok or new_content == target_content:
+        return None
+
+    try:
+        from core.linter import _lint_python  # type: ignore
+    except Exception:
+        return None
+    import tempfile
+
+    def _lint_string(src: str) -> tuple[bool, str]:
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".py", delete=False, encoding="utf-8"
+        )
+        try:
+            tmp.write(src)
+            tmp.flush()
+            tmp.close()
+            return _lint_python(tmp.name)
+        finally:
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass
+
+    base_ok, base_msg = _lint_string(target_content)
+    new_ok, new_msg = _lint_string(new_content)
+    if new_ok:
+        return None
+    # If baseline already fails with the SAME message, the patch isn't to
+    # blame — silence to avoid false positives on pre-existing problems.
+    if not base_ok and base_msg.strip() == new_msg.strip():
+        return None
+    new_undef = set(re.findall(r"undefined name '([^']+)'", new_msg))
+    base_undef = set(re.findall(r"undefined name '([^']+)'", base_msg))
+    introduced = sorted(new_undef - base_undef)
+    if introduced:
+        names = ", ".join(repr(n) for n in introduced[:5])
+        more = f" (+{len(introduced) - 5} more)" if len(introduced) > 5 else ""
+        return (
+            f"simulated apply introduces undefined name(s) {names}{more} "
+            f"in {target_file}. Likely a missing import."
+        )
+    head = (new_msg or "").splitlines()[0][:200]
+    if "SyntaxError" in new_msg or "IndentationError" in new_msg:
+        return f"simulated apply produces syntax error: {head}"
+    return None
 
 # Literal truncation-marker patterns that unambiguously mean "LLM stopped
 # emitting code and left a placeholder at the END". We ONLY flag these
@@ -143,6 +279,11 @@ def validate_action_file(
                 f"Otherwise use an existing path (check spelling/case)."
             ))
 
+    # Cumulative file state across steps for dry-run lint baseline.
+    # Each successful dry-run advances the entry so a later block sees the
+    # imports added by an earlier step.
+    cumulative_content: dict[str, str] = {}
+
     # Per-step / per-block checks
     for i, step in enumerate(steps, start=1):
         if not isinstance(step, dict):
@@ -246,6 +387,25 @@ def validate_action_file(
                     f"surrounding context so the match is unique."
                 ))
             else:
+                cum = cumulative_content.get(target_file)
+                if cum is None:
+                    cum = target_content
+                    cumulative_content[target_file] = cum
+                _lint_issue, _new_cum = _dry_run_lint_block_cumulative(
+                    target_file, cum, blk,
+                )
+                if _lint_issue:
+                    issues.append(_issue(
+                        fname,
+                        f"Step {i} block {j}: {_lint_issue} "
+                        "Add a separate implementation_step BEFORE this one "
+                        "that imports the missing name(s) — anchor on an "
+                        "existing import line. Then keep this step unchanged."
+                    ))
+                    continue
+                if _new_cum is not None:
+                    cumulative_content[target_file] = _new_cum
+
                 _region = data.get("region") or {}
                 _r_file = (_region.get("file") or "").replace("\\", "/").lstrip("./")
                 _t_norm = target_file.replace("\\", "/").lstrip("./")
