@@ -34,6 +34,33 @@ class ProviderQuotaExhaustedError(RuntimeError):
         self.provider_hint = provider_hint
 
 
+class ProviderBadRequestError(RuntimeError):
+    """Raised on HTTP 400 from the provider after exhausting client retries.
+
+    Carries `body_text` so phase code can decide whether the failure is
+    likely context-overflow and whether to attempt a smaller payload.
+    """
+    def __init__(self, message: str, body_text: str = "", status: int = 400):
+        super().__init__(message)
+        self.body_text = body_text
+        self.status = status
+
+    @property
+    def is_context_overflow(self) -> bool:
+        b = (self.body_text or "").lower()
+        return any(m in b for m in (
+            "context length",
+            "context window",
+            "too long",
+            "tokens exceed",
+            "maximum context",
+            "exceeds the maximum",
+            "input is too long",
+            "prompt is too long",
+            "context_length_exceeded",
+        ))
+
+
 # Heuristics for distinguishing "real quota exhausted" 429s (where retrying is
 # pointless) from transient burst-limit 429s. If any phrase matches in the
 # response body, we fail fast instead of exhausting the retry schedule.
@@ -1015,6 +1042,34 @@ class OllamaClient:
                 except requests.exceptions.HTTPError as e:
                     status = getattr(getattr(e, "response", None), "status_code", 0)
                     _last_exc = e
+                    if status == 400:
+                        try:
+                            _body_400 = (
+                                getattr(e, "response", None).text
+                                if getattr(e, "response", None) is not None else ""
+                            ) or ""
+                        except Exception:
+                            _body_400 = ""
+                        # One short retry: occasional spurious 400s from
+                        # streaming endpoints succeed on retry. After that,
+                        # raise distinct error so phase code can react.
+                        if _attempt < 2:
+                            import time as _time, random as _rnd
+                            backoff = 0.8 * _rnd.uniform(0.8, 1.2)
+                            if log_fn:
+                                log_fn(
+                                    f"[Ollama] HTTP 400 (attempt {_attempt}/2) — "
+                                    f"retrying once in {backoff:.1f}s. "
+                                    f"Body: {_body_400[:800]}",
+                                    "warn",
+                                )
+                            _time.sleep(backoff)
+                            continue
+                        raise ProviderBadRequestError(
+                            f"Ollama HTTP 400 after retry: {str(e)[:200]}",
+                            body_text=_body_400,
+                            status=400,
+                        ) from e
                     if status == 500:
                         error_msg = (
                             "Ollama returned 500 Internal Server Error. "

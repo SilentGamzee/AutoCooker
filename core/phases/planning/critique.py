@@ -143,12 +143,28 @@ class CritiqueMixin:
             return True, []
         elif verdict == "FAIL":
             self.log(f"  ✗ Critique FAILED ({len(issues)} issue(s)): {summary}", "warn")
-            for i, issue in enumerate(issues[:5], 1):
-                desc = issue.get("description", str(issue))[:100]
+            normalized: list[dict] = []
+            for raw in issues:
+                if isinstance(raw, dict):
+                    normalized.append(raw)
+                elif isinstance(raw, str):
+                    normalized.append({
+                        "severity": "critical",
+                        "file": "",
+                        "description": raw,
+                    })
+                else:
+                    normalized.append({
+                        "severity": "critical",
+                        "file": "",
+                        "description": str(raw),
+                    })
+            for i, issue in enumerate(normalized[:5], 1):
+                desc = (issue.get("description") or str(issue))[:100]
                 sev = issue.get("severity", "?")
                 fname = (issue.get("file") or "").strip() or "(file unknown)"
                 self.log(f"    {i}. [{sev}] {fname}: {desc}", "warn")
-            return False, issues
+            return False, normalized
         else:
             self.log("  [WARN] No critique verdict submitted — treating as PASS", "warn")
             return True, []

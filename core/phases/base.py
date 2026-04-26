@@ -1360,9 +1360,23 @@ Token count: {token_count} / {config['max_total_tokens']}
                 # Provider quota exhausted — non-recoverable within this run.
                 # Re-raise so the pipeline catches it and aborts the task with
                 # resume info, instead of this step's retry loop eating it.
-                from core.ollama_client import ProviderQuotaExhaustedError
+                from core.ollama_client import (
+                    ProviderQuotaExhaustedError,
+                    ProviderBadRequestError,
+                )
                 if isinstance(e, ProviderQuotaExhaustedError):
                     self.log(f"  [FATAL] Provider quota exhausted: {e}", "error")
+                    raise
+                # Provider rejected the request body (HTTP 400 — typically
+                # context overflow or malformed payload). Outer retries
+                # without payload changes can't fix this. Re-raise so the
+                # phase can react (QA shrinks, others escalate).
+                if isinstance(e, ProviderBadRequestError):
+                    self.log(
+                        f"  [FATAL] Provider HTTP 400: {str(e)[:160]} — "
+                        f"re-raising to phase handler.",
+                        "error",
+                    )
                     raise
                 self.log(f"  [ERROR] Ollama: {e}", "error")
                 # Network errors get an outer retry with a circuit-breaker:

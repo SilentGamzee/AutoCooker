@@ -254,6 +254,56 @@ class AnthropicTransport(BaseTransport):
                 user_content = _split_user_str_for_cache(str(content))
             raw_messages.append({"role": "user", "content": user_content})
 
+        # Sanitize: tool_result blocks must follow an assistant tool_use with
+        # the same id EARLIER in the conversation. Orphans (e.g. produced
+        # when history compaction drops the assistant message but keeps the
+        # tool reply, or when a phase starts with stale tool messages) get
+        # rewritten to plain text so Anthropic does not 400 with
+        # "unexpected tool_use_id". Walk in order, track issued ids
+        # progressively.
+        issued_tool_ids: set[str] = set()
+        for msg in raw_messages:
+            role_p = msg.get("role")
+            content_p = msg.get("content")
+            if role_p == "assistant" and isinstance(content_p, list):
+                for blk in content_p:
+                    if isinstance(blk, dict) and blk.get("type") == "tool_use":
+                        _id = blk.get("id")
+                        if isinstance(_id, str) and _id:
+                            issued_tool_ids.add(_id)
+                continue
+            if role_p == "user" and isinstance(content_p, list):
+                new_blocks: list[dict] = []
+                for blk in content_p:
+                    if not isinstance(blk, dict):
+                        new_blocks.append(blk)
+                        continue
+                    if blk.get("type") == "tool_result":
+                        tid = blk.get("tool_use_id")
+                        if isinstance(tid, str) and tid in issued_tool_ids:
+                            new_blocks.append(blk)
+                        else:
+                            body = blk.get("content")
+                            if isinstance(body, list):
+                                body_text = "\n".join(
+                                    str(p.get("text", "")) for p in body
+                                    if isinstance(p, dict)
+                                )
+                            else:
+                                body_text = str(body or "")
+                            if body_text:
+                                new_blocks.append({
+                                    "type": "text",
+                                    "text": (
+                                        "[orphaned tool result — "
+                                        "originating tool_use was trimmed]\n"
+                                        + body_text
+                                    ),
+                                })
+                    else:
+                        new_blocks.append(blk)
+                msg["content"] = new_blocks if new_blocks else "Continue."
+
         # Merge consecutive user messages (Anthropic requires strict alternation).
         merged: list[dict] = []
         for msg in raw_messages:

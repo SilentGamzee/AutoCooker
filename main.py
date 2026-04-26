@@ -894,53 +894,69 @@ def _launch_pipeline(task_id: str) -> None:
                         task.update_phase_status("qa", "in_progress")
                         _push_task(task)
                         
-                        qa_passed, qa_issues = QAPhase(STATE, task).run()
-                        
+                        qa_phase = QAPhase(STATE, task)
+                        qa_passed, qa_issues = qa_phase.run()
+
                         if qa_passed:
                             task.update_phase_status("qa", "done")
                             task.add_log("  ✓ QA passed", "system", "ok")
                             _push_task(task)
                             break  # Success!
-                        else:
-                            # QA failed
+
+                        # Provider rejected QA payload (HTTP 400 even after
+                        # context shrink). No verdict produced — patching is
+                        # meaningless. Phase already routed to human_review.
+                        if getattr(qa_phase, "qa_provider_overflow", False):
                             task.update_phase_status("qa", "failed")
-                            
-                            if patch_iteration < max_patches:
-                                # Попробовать патч на основе QA issues
-                                remaining_patches = max_patches - patch_iteration
-                                task.corrections = _format_qa_as_corrections(
-                                    qa_issues, task.title, task.description
-                                )
-                                task.add_log(
-                                    f"  QA failed ({len(qa_issues)} issue(s)) "
-                                    f"— starting patch iteration {patch_iteration + 1}/{max_patches} "
-                                    f"({remaining_patches} patch(es) remaining)",
-                                    "system", "warn"
-                                )
-                                
-                                # Сброс всех фаз для retry (включая Planning для обновления плана)
-                                task.phase_status["planning"] = "pending"
-                                task.phase_status["coding"] = "pending"
-                                task.phase_status["qa"] = "pending"
-                                task.resume_from_phase = "planning"
-                                
-                                _push_task(task)
-                                # Continue to next patch iteration (НЕ human review)
-                                continue
-                            else:
-                                # Max patches - escalate
-                                task.add_log(
-                                    f"  QA failed after {max_patches} patch(es) "
-                                    f"— escalating to human review",
-                                    "system", "error"
-                                )
-                                task.column = "human_review"
-                                task.has_errors = True
-                                task.tags = list(set(task.tags + ["QA Failed", "Needs Review"]))
-                                _push_task(task)
-                                _push_board()
-                                STATE.active_task_id = ""
-                                return
+                            task.add_log(
+                                "  ❌ QA aborted by provider HTTP 400 — "
+                                "skipping patch loop, sending to Human Review.",
+                                "system", "error"
+                            )
+                            _push_task(task)
+                            _push_board()
+                            STATE.active_task_id = ""
+                            return
+
+                        # QA failed
+                        task.update_phase_status("qa", "failed")
+
+                        if patch_iteration < max_patches:
+                            # Попробовать патч на основе QA issues
+                            remaining_patches = max_patches - patch_iteration
+                            task.corrections = _format_qa_as_corrections(
+                                qa_issues, task.title, task.description
+                            )
+                            task.add_log(
+                                f"  QA failed ({len(qa_issues)} issue(s)) "
+                                f"— starting patch iteration {patch_iteration + 1}/{max_patches} "
+                                f"({remaining_patches} patch(es) remaining)",
+                                "system", "warn"
+                            )
+
+                            # Сброс всех фаз для retry (включая Planning для обновления плана)
+                            task.phase_status["planning"] = "pending"
+                            task.phase_status["coding"] = "pending"
+                            task.phase_status["qa"] = "pending"
+                            task.resume_from_phase = "planning"
+
+                            _push_task(task)
+                            # Continue to next patch iteration (НЕ human review)
+                            continue
+                        else:
+                            # Max patches - escalate
+                            task.add_log(
+                                f"  QA failed after {max_patches} patch(es) "
+                                f"— escalating to human review",
+                                "system", "error"
+                            )
+                            task.column = "human_review"
+                            task.has_errors = True
+                            task.tags = list(set(task.tags + ["QA Failed", "Needs Review"]))
+                            _push_task(task)
+                            _push_board()
+                            STATE.active_task_id = ""
+                            return
                 else:
                     # No QA phase — считаем успешным
                     break

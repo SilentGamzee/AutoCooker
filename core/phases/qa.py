@@ -49,7 +49,44 @@ class QAPhase(BasePhase):
 
         # ── Single read-only review (NO fix cycles) ───────────────────────
         self.log("─── QA Review ───")
-        verdict, all_issues, summary = self._review(model, scope_summary, [], branch_diff)
+        from core.ollama_client import ProviderBadRequestError
+        self.qa_provider_overflow = False
+        try:
+            verdict, all_issues, summary = self._review(
+                model, scope_summary, [], branch_diff,
+            )
+        except ProviderBadRequestError as e:
+            self.log(
+                f"  [QA HTTP 400] Provider rejected initial payload "
+                f"(likely context overflow). Body: {e.body_text[:200]}. "
+                f"Retrying with shrunk context (no file previews, no diff).",
+                "warn",
+            )
+            try:
+                verdict, all_issues, summary = self._review(
+                    model, scope_summary, [], "", shrink=True,
+                )
+            except ProviderBadRequestError as e2:
+                self.log(
+                    f"  [QA HTTP 400] Shrunk retry also rejected: "
+                    f"{e2.body_text[:200]}. Escalating to Human Review — "
+                    f"QA cannot produce a verdict for this payload.",
+                    "error",
+                )
+                self.qa_provider_overflow = True
+                self.task.has_errors = True
+                self.task.tags = list(set(
+                    (self.task.tags or []) + ["QA Provider Error", "Needs Review"]
+                ))
+                self.task.column = "human_review"
+                self.log(
+                    "═══ QA PHASE COMPLETE — FAILED (provider HTTP 400) ═══",
+                    "error",
+                )
+                return False, [
+                    f"QA aborted: provider returned HTTP 400 even after "
+                    f"context shrink. Body: {e2.body_text[:200]}"
+                ]
         
         subtask_passed = (verdict == "PASS")
         
@@ -153,7 +190,7 @@ class QAPhase(BasePhase):
     # ── Review ────────────────────────────────────────────────────────
     def _review(
         self, model: str, scope_summary: str, prior_issues: list[str],
-        branch_diff: str = "",
+        branch_diff: str = "", shrink: bool = False,
     ) -> tuple[str, list[str], str]:
         workdir = os.path.join(self.task.task_dir, WORKDIR_NAME)
         # Ensure workdir exists so list_directory('.') can resolve even when
@@ -171,26 +208,32 @@ class QAPhase(BasePhase):
             + "\n".join(f"  - {i}" for i in prior_issues)
         ) if prior_issues else ""
 
-        # Pre-read scope files so reviewer has content without extra rounds
+        # Pre-read scope files so reviewer has content without extra rounds.
+        # Shrink mode skips previews entirely — reviewer can call read_file
+        # on demand instead of carrying everything in the system prompt.
         file_previews = ""
-        for line in scope_summary.splitlines():
-            line = line.strip()
-            if line.startswith("✓") and "MISSING" not in line:
-                fpath = line.lstrip("✓ ")
-                full = os.path.join(workdir, fpath)
-                if os.path.isfile(full):
-                    try:
-                        with open(full, "r", encoding="utf-8", errors="replace") as _f:
-                            content = _f.read()
-                        preview = content[:3000] + ("…(truncated)" if len(content) > 3000 else "")
-                        file_previews += f"\n=== {fpath} ===\n{preview}\n"
-                    except Exception:
-                        pass
+        if not shrink:
+            preview_cap = 3000
+            for line in scope_summary.splitlines():
+                line = line.strip()
+                if line.startswith("✓") and "MISSING" not in line:
+                    fpath = line.lstrip("✓ ")
+                    full = os.path.join(workdir, fpath)
+                    if os.path.isfile(full):
+                        try:
+                            with open(full, "r", encoding="utf-8", errors="replace") as _f:
+                                content = _f.read()
+                            preview = content[:preview_cap] + (
+                                "…(truncated)" if len(content) > preview_cap else ""
+                            )
+                            file_previews += f"\n=== {fpath} ===\n{preview}\n"
+                        except Exception:
+                            pass
 
         # Include diff section when available — gives reviewer a precise view
         # of what will land on the target branch.
         diff_section = ""
-        if branch_diff and "(no " not in branch_diff and "(project is not" not in branch_diff:
+        if (not shrink) and branch_diff and "(no " not in branch_diff and "(project is not" not in branch_diff:
             diff_section = (
                 f"\n\n## DIFF vs target branch `{self.task.git_branch}`\n"
                 f"This is the exact patch that will be applied.  "

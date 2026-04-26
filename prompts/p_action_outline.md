@@ -102,6 +102,8 @@ Hard rules for regions on shared files:
 - Regions of subtasks targeting the same file MUST NOT overlap. Leave at least 1 line of gap between them.
 - Order subtasks by ascending `start_line` for the same file.
 - If you cannot identify two non-overlapping regions, MERGE the work into a single subtask instead.
+- **If you don't know the line numbers**, call `read_files_batch(paths=["<shared_file>"])` BEFORE writing the outline. The truncated view + skeleton in the tool result lists every symbol with its absolute line. Pick non-overlapping `start_line`/`end_line` from there. NEVER guess — the validator will reject missing or overlapping regions and force a retry.
+- The validator is mechanical: missing `region.start_line` or `region.end_line` on any shared-file subtask blocks the entire outline. Every shared-file subtask must satisfy the schema before submission.
 
 Example — two subtasks touching `web/index.html`:
 
