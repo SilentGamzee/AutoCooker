@@ -36,6 +36,74 @@ from core.patcher import (
 )
 
 
+def _detect_duplicate_insert(
+    baseline: str,
+    new_content: str,
+    block: dict,
+) -> str | None:
+    """Detect when a search/replace inserted lines that duplicate code
+    already present near the patch site.
+
+    Common failure: model emits replace = <old_block> + <new_lines>, but
+    forgets to include matching lines in `search`, so apply_block leaves
+    the original lines in place AND adds the new copy. Result: same call
+    appears twice within a few lines.
+    """
+    if not baseline or not new_content or baseline == new_content:
+        return None
+    search = (block.get("search") or "").strip()
+    if not search:
+        return None
+    base_lines = baseline.splitlines()
+    new_lines = new_content.splitlines()
+    # Find anchor line in baseline (first line of search).
+    first_search_line = search.splitlines()[0].strip() if search.splitlines() else ""
+    if not first_search_line:
+        return None
+    anchor_idx = -1
+    for i, ln in enumerate(base_lines):
+        if ln.strip() == first_search_line:
+            anchor_idx = i
+            break
+    if anchor_idx < 0:
+        return None
+    # Inspect a ±20 line window in the post-apply content around the anchor.
+    win_start = max(0, anchor_idx - 5)
+    win_end = min(len(new_lines), anchor_idx + 25)
+    window = new_lines[win_start:win_end]
+    # Look for non-trivial call-like or assignment lines that appear ≥2 times
+    # in the post-apply window but only once (or not at all) in the same
+    # window of the baseline.
+    base_window = base_lines[win_start:min(len(base_lines), win_end)]
+    counts_new: dict[str, int] = {}
+    for ln in window:
+        s = ln.strip()
+        if len(s) < 8:
+            continue
+        if s.startswith("#") or s.startswith("//"):
+            continue
+        # Only flag lines that look like calls or assignments (not headers
+        # such as `def x:` which legitimately differ).
+        if "(" not in s and "=" not in s:
+            continue
+        counts_new[s] = counts_new.get(s, 0) + 1
+    counts_base: dict[str, int] = {}
+    for ln in base_window:
+        s = ln.strip()
+        counts_base[s] = counts_base.get(s, 0) + 1
+    for s, cnt in counts_new.items():
+        if cnt >= 2 and counts_base.get(s, 0) < cnt:
+            return (
+                f"simulated apply produces duplicate line {s[:120]!r} "
+                f"appearing {cnt} times within a few lines of the patch "
+                f"site (baseline had {counts_base.get(s, 0)}). The replace "
+                f"likely re-emitted code that was already present — make "
+                f"`search` cover ALL the lines you intend to overwrite, "
+                f"or trim duplicate lines from `replace`."
+            )
+    return None
+
+
 def _dry_run_lint_block_cumulative(
     target_file: str,
     baseline_content: str,
@@ -57,6 +125,10 @@ def _dry_run_lint_block_cumulative(
         return None, None
     if not ok or new_content == baseline_content:
         return None, new_content if ok else None
+
+    dup = _detect_duplicate_insert(baseline_content, new_content, block)
+    if dup:
+        return dup, new_content
 
     try:
         from core.linter import _lint_python  # type: ignore

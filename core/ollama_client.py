@@ -994,8 +994,8 @@ class OllamaClient:
             # "time-to-first-byte" variable irrelevant because any keep-alive
             # chunk resets the idle clock.
             _stream_liveness = True
-            _FIRST_BYTE_TIMEOUT = 300.0
-            _IDLE_TIMEOUT = 300.0
+            _FIRST_BYTE_TIMEOUT = 900.0   # 15 min — thinking models can be slow to first byte
+            _IDLE_TIMEOUT = 900.0
             _HARD_TIMEOUT = 1800.0
             # Connect timeout 10s, socket read timeout == idle timeout.
             _post_timeout = (10, _IDLE_TIMEOUT)

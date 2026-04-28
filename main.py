@@ -666,6 +666,30 @@ def _launch_pipeline(task_id: str) -> None:
                             "system", "warn"
                         )
 
+                    # When workdir is wiped, subtasks marked `done` from the
+                    # previous iteration must re-apply — otherwise coding's
+                    # `_verify_structural_completion` (files_to_create-only
+                    # check) lets them skip and workdir/diff stays pristine.
+                    # Reset every prior `done` subtask back to `pending` so
+                    # the full plan re-runs.
+                    _resurrected = 0
+                    for _st in task.subtasks:
+                        if _st.get("status") == "done":
+                            _st["status"] = "pending"
+                            _st.pop("failure_reason", None)
+                            _st.pop("failure_details", None)
+                            _resurrected += 1
+                    if _resurrected:
+                        task.add_log(
+                            f"  ↺ {_resurrected} previously-done subtask(s) "
+                            "marked `pending` for re-apply after workdir reset.",
+                            "system", "info"
+                        )
+                        try:
+                            STATE.save_subtasks_for_task(task)
+                        except Exception:
+                            pass
+
                     _push_task(task)
                 
                 # ══════════════════════════════════════════════════════

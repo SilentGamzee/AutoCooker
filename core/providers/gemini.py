@@ -19,12 +19,16 @@ _DEBUG = os.environ.get("AUTOCOOKER_DEBUG", "").lower() in ("1", "true", "yes")
 # __GEMINI_THOUGHT_STALL__ so the wrapper can fall back to non-stream and
 # the caller can retry with an anti-thinking prompt nudge.
 def _gemini_thought_stall_secs() -> float:
-    raw = os.environ.get("AUTOCOOKER_GEMINI_THOUGHT_STALL_SECS", "30")
+    # Default 15 minutes. Long thinking traces are normal for reasoning
+    # models on hard planning prompts — short watchdog (30s) was firing
+    # mid-thought and forcing a non-stream fallback. Override with
+    # AUTOCOOKER_GEMINI_THOUGHT_STALL_SECS if needed.
+    raw = os.environ.get("AUTOCOOKER_GEMINI_THOUGHT_STALL_SECS", "900")
     try:
         v = float(raw)
-        return v if v > 0 else 30.0
+        return v if v > 0 else 900.0
     except ValueError:
-        return 30.0
+        return 900.0
 
 
 def _gemini_force_nonstream() -> bool:
@@ -69,40 +73,30 @@ class GeminiTransport(BaseTransport):
         is_aborted: Optional[Callable[[], bool]] = None,
         timeout=None,
     ) -> UrllibResponse:
-        # Force-non-stream override: skip streaming entirely. Useful when a
-        # model family (e.g. some Gemma variants) keeps stalling in thought
-        # parts during streaming. Non-stream returns full response or errors
-        # immediately — no death-by-thought-dribble.
+        # Stream-only path: no non-stream fallback. Long thinking traces
+        # are normal; the watchdog (default 15 min) raises only on hard
+        # stall, and the caller's retry layer will re-issue the request
+        # rather than silently switching to non-stream.
         if _gemini_force_nonstream():
             if log_fn:
-                log_fn("[Gemini] AUTOCOOKER_GEMINI_FORCE_NONSTREAM=1 — using non-stream", "info")
-            return self._non_stream_call(session, payload, timeout=timeout or (10, 300))
+                log_fn(
+                    "[Gemini] AUTOCOOKER_GEMINI_FORCE_NONSTREAM=1 — using non-stream",
+                    "info",
+                )
+            return self._non_stream_call(session, payload, timeout=timeout or (10, 900))
 
         if stream:
-            try:
-                return self._stream_call(
-                    session, payload,
-                    connect_timeout=connect_timeout,
-                    first_byte_timeout=first_byte_timeout,
-                    idle_timeout=idle_timeout,
-                    hard_timeout=hard_timeout,
-                    log_fn=log_fn,
-                    progress_fn=progress_fn,
-                    is_aborted=is_aborted,
-                )
-            except RuntimeError as e:
-                # Thought-stall fallback: retry once via non-stream. Caller's
-                # retry layer (ollama_client) will append anti-thinking
-                # nudge if the non-stream attempt also returns empty.
-                if GEMINI_THOUGHT_STALL_TOKEN in str(e):
-                    if log_fn:
-                        log_fn(
-                            "[Gemini] thought-stall — falling back to non-stream",
-                            "warn",
-                        )
-                    return self._non_stream_call(session, payload, timeout=(10, 300))
-                raise
-        return self._non_stream_call(session, payload, timeout=timeout or (10, 120))
+            return self._stream_call(
+                session, payload,
+                connect_timeout=connect_timeout,
+                first_byte_timeout=first_byte_timeout,
+                idle_timeout=idle_timeout,
+                hard_timeout=hard_timeout,
+                log_fn=log_fn,
+                progress_fn=progress_fn,
+                is_aborted=is_aborted,
+            )
+        return self._non_stream_call(session, payload, timeout=timeout or (10, 900))
 
     def _stream_call(
         self,
@@ -199,6 +193,27 @@ class GeminiTransport(BaseTransport):
             if to_log and log_fn:
                 log_fn(f"[gemini_stream] {msg}", level)
 
+        def _emit_progress(force: bool = False) -> None:
+            """Throttled stream progress callback. Emits at most once per
+            _PROGRESS_INTERVAL seconds; `force=True` bypasses the throttle
+            (used after stream end to guarantee a final tick).
+            """
+            now_p = _t.monotonic()
+            if not force and (now_p - _last_progress[0]) < _PROGRESS_INTERVAL:
+                return
+            _last_progress[0] = now_p
+            if progress_fn is None:
+                return
+            try:
+                _tc = token_count[0]
+                _phase = "thinking" if (thought_texts and not thought_done[0]) else "streaming"
+                progress_fn(
+                    f"[Gemini] {_phase} — ~{_tc} tok, "
+                    f"{int(now_p - _start)}s elapsed"
+                )
+            except Exception:
+                pass
+
         def _consume_event(evt: dict) -> None:
             nonlocal finish_reason, model_name
             if evt.get("modelVersion"):
@@ -278,20 +293,32 @@ class GeminiTransport(BaseTransport):
                 # part so far has been "thought", short-circuit before the
                 # idle_timeout (300s) wears out the planning step.
                 _elapsed_since_first = now - (_first_byte_at or now)
-                if (
+                # Time-based stall (default 900s).
+                _stall_time = (
                     not thought_done[0]
                     and thought_texts
                     and _elapsed_since_first > _STALL_SECS
-                ):
+                )
+                # Parts-based stall: sustained thought-only stream with no
+                # text tokens emitted suggests the model is stuck in a
+                # reasoning loop. Fires faster than the 900s time gate.
+                _stall_parts = (
+                    not thought_done[0]
+                    and len(thought_texts) >= 200
+                    and token_count[0] == 0
+                    and _elapsed_since_first > 90
+                )
+                if _stall_time or _stall_parts:
                     try:
                         resp.close()
                     except Exception:
                         pass
                     _summary = "".join(thought_texts)[:500]
+                    _why = "time" if _stall_time else "parts"
                     raise RuntimeError(
                         f"{GEMINI_THOUGHT_STALL_TOKEN}: stalled in thoughts for "
                         f"{_elapsed_since_first:.1f}s ({len(thought_texts)} thought parts, "
-                        f"~{token_count[0]} tokens). Last thought: {_summary!r}"
+                        f"~{token_count[0]} tokens, trigger={_why}). Last thought: {_summary!r}"
                     )
                 # Throttled "still thinking" warn (every 5s) once thoughts
                 # exist but no real output. Disarms when thought_done flips.

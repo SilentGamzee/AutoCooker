@@ -559,10 +559,54 @@ class CodingPhase(BasePhase):
     def _verify_structural_completion(
         self, subtask_dict: dict
     ) -> tuple[bool, str]:
+        from core.patcher import legacy_step_to_blocks
         wd = os.path.join(self.task.task_dir, WORKDIR_NAME)
         for f in subtask_dict.get("files_to_create") or []:
             if not os.path.isfile(os.path.join(wd, f)):
                 return False, f"Required file missing: {f}"
+
+        # Patch-applied check for files_to_modify: if the original SEARCH
+        # text is still present verbatim in the workdir copy, the patch
+        # was never (re-)applied here — likely a fresh workdir after a
+        # patch-iteration reset. Re-applying is required to keep the diff
+        # honest and prevent QA from seeing an unchanged tree.
+        for step in subtask_dict.get("implementation_steps") or []:
+            if not isinstance(step, dict):
+                continue
+            blocks, step_file, _action = legacy_step_to_blocks(step)
+            if not blocks:
+                continue
+            target = step_file or ""
+            if not target:
+                mods = subtask_dict.get("files_to_modify") or []
+                if len(mods) == 1:
+                    target = mods[0]
+            if not target or target in (subtask_dict.get("files_to_create") or []):
+                continue
+            target_abs = os.path.join(wd, target)
+            if not os.path.isfile(target_abs):
+                return False, f"Modified file missing in workdir: {target}"
+            try:
+                with open(target_abs, "r", encoding="utf-8", errors="replace") as fh:
+                    body = fh.read()
+            except Exception as e:
+                return False, f"Could not read {target} for verification: {e}"
+            for blk in blocks:
+                if not isinstance(blk, dict):
+                    continue
+                search = blk.get("search") or ""
+                replace = blk.get("replace") or ""
+                if not search or not replace:
+                    continue
+                # Patch already applied: search no longer matches but the
+                # replacement is now present. If the workdir still contains
+                # the original search verbatim AND not the replacement, the
+                # change was rolled back / never applied.
+                if search in body and (replace not in body):
+                    return False, (
+                        f"Patch not applied in {target}: search still "
+                        f"matches and replace is absent."
+                    )
         return True, "OK"
 
     # ── 2.3 README (LLM-driven, runs only on overall success) ──────

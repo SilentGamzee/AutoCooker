@@ -17,6 +17,13 @@ live inside the project workspace.
 
 ## Workflow
 
+**WRITE-FIRST RULE**: your FIRST tool call MUST be `write_file` with a
+skeleton `dependency_report.json` (verdict="ok" for every subtask, empty
+unresolved arrays). Then refine — call `read_file` only if a specific
+symbol needs verification, and overwrite `dependency_report.json` again.
+Do NOT spend tool rounds reading files before writing. The artifact
+absence is treated as failure even when your reasoning is correct.
+
 1. Read every action file under `.tasks/.../actions/` (use `read_files_batch`
    if multiple at once).
 2. For each subtask, enumerate the symbols it references:

@@ -27,6 +27,53 @@ from core.git_utils import get_branch_diff, get_workdir_diff, get_changed_files_
 
 
 
+def _salvage_json_with_key(text: str, required_key: str) -> dict | None:
+    """Find a JSON object in `text` that contains `required_key` at top level.
+
+    Used to recover when the model emits the artifact body in chat instead
+    of calling write_file. Tries fenced ```json blocks first, then bare
+    {...} candidates. Returns the first matching object, or None.
+    """
+    if not text or not required_key:
+        return None
+    candidates: list[str] = []
+    for m in re.finditer(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL):
+        candidates.append(m.group(1))
+    starts = [i for i, ch in enumerate(text) if ch == "{"]
+    for s in starts:
+        depth = 0
+        in_str = False
+        esc = False
+        for i in range(s, len(text)):
+            c = text[i]
+            if esc:
+                esc = False
+                continue
+            if c == "\\" and in_str:
+                esc = True
+                continue
+            if c == '"':
+                in_str = not in_str
+                continue
+            if in_str:
+                continue
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    candidates.append(text[s:i + 1])
+                    break
+    for raw in candidates:
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            continue
+        if isinstance(obj, dict) and required_key in obj:
+            return obj
+    return None
+
+
 from core.phases.planning._helpers import (
     _extract_style_audit,
     _lenient_json_loads,
@@ -130,6 +177,35 @@ class ActionsMixin:
             if not ok:
                 self.log("[FAIL] Could not build subtasks outline", "error")
                 return False
+            # Already-implemented short-circuit: outline marked the spec as
+            # already satisfied by existing code. Skip 2b/3b and route to
+            # human review with the evidence string.
+            outline_path_check = os.path.join(self.task.task_dir, "subtasks_outline.json")
+            try:
+                with open(outline_path_check, "r", encoding="utf-8") as _fh:
+                    _outline_data = json.load(_fh)
+            except Exception:
+                _outline_data = {}
+            if (isinstance(_outline_data, dict)
+                    and _outline_data.get("already_implemented")
+                    and not outline):
+                evidence = str(_outline_data.get("evidence") or "").strip()
+                self.log(
+                    f"  ⚠ Spec marked ALREADY IMPLEMENTED by planner. "
+                    f"Evidence: {evidence}",
+                    "warn",
+                )
+                self.task.add_log(
+                    f"Planner concluded feature is already implemented. "
+                    f"{evidence}", "system", "warn",
+                )
+                self._cp_save("already_implemented")
+                # Planning ends successfully with zero subtasks. Coding
+                # phase will iterate an empty list (no-op) and QA will
+                # confirm against the unchanged workdir. The evidence is
+                # surfaced in the task log so a human reviewer sees why no
+                # patches were generated.
+                return True
             self.log(f"  Outline: {len(outline)} subtask(s)", "info")
             self._cp_save("outline_done")
 
@@ -145,6 +221,7 @@ class ActionsMixin:
                     keep_ids.add(eid)
                     keep_ids.add(eid.replace("-", ""))  # T-001 and T001
             removed = []
+            removed_canonical_ids: set[str] = set()
             for fname in list(os.listdir(actions_dir)):
                 m = re.match(r"(T\d{3})\.json$", fname)
                 if not m:
@@ -155,6 +232,7 @@ class ActionsMixin:
                     try:
                         os.remove(os.path.join(actions_dir, fname))
                         removed.append(fname)
+                        removed_canonical_ids.add(canonical)
                     except OSError as e:
                         self.log(
                             f"  [WARN] Failed to remove stale {fname}: {e}",
@@ -166,6 +244,30 @@ class ActionsMixin:
                     f"new outline: {', '.join(removed)}",
                     "info",
                 )
+                # Sync task.subtasks: drop entries whose action file just got
+                # deleted, then push so the UI Subtasks badge updates without
+                # waiting for the final loader pass.
+                before_count = len(self.task.subtasks or [])
+                norm_removed = {rid.replace("-", "") for rid in removed_canonical_ids}
+                self.task.subtasks = [
+                    s for s in (self.task.subtasks or [])
+                    if str(s.get("id") or "").replace("-", "") not in norm_removed
+                ]
+                after_count = len(self.task.subtasks)
+                if after_count != before_count:
+                    try:
+                        self.state.save_subtasks_for_task(self.task)
+                    except Exception:
+                        pass
+                    try:
+                        self.push_task()
+                    except Exception:
+                        pass
+                    self.log(
+                        f"  Subtasks list trimmed {before_count} → "
+                        f"{after_count} after stale-action cleanup.",
+                        "info",
+                    )
 
         # ── 2b. Write each action file ─────────────────────────────
         # First-pass (non-targeted): run agents in parallel to cut wall
@@ -318,12 +420,13 @@ class ActionsMixin:
             union_paths.extend(list(e.get("files_to_modify") or []))
         self._prewarm_file_sections(wd, union_paths, max_lines=150)
 
-        def _one(entry: dict) -> tuple[str, bool]:
+        def _one(entry: dict, shared_overrides: dict[str, str] | None = None) -> tuple[str, bool]:
             label = str(entry.get("id") or "?")
             ok = False
             try:
                 ok = self._new_step2b_write_single(
-                    model, entry, spec_content, wd, issues
+                    model, entry, spec_content, wd, issues,
+                    shared_overrides=shared_overrides,
                 )
             except Exception as e:
                 self.log(f"[FAIL] 2b {label} raised: {e!r}", "error")
@@ -361,15 +464,35 @@ class ActionsMixin:
             for fut in as_completed(futures):
                 results.append(fut.result())
         # Shared-file groups: one group can run in parallel with another, but
-        # entries WITHIN a group run sequentially.
+        # entries WITHIN a group run sequentially. Within a group we maintain
+        # a cumulative buffer per owner file: each subtask sees the file as
+        # it would look AFTER prior subtasks of the same group apply, and
+        # downstream `region` line ranges are shifted to match.
         if shared_groups:
-            def _run_group(group: list[dict]) -> list[tuple[str, bool]]:
+            def _run_group(owner: str, group: list[dict]) -> list[tuple[str, bool]]:
+                buffers: dict[str, str] = {}
+                baseline = self._read_group_baseline(wd, owner)
+                if baseline is not None:
+                    buffers[owner] = baseline
+                else:
+                    self.log(
+                        f"  [shared-group] {owner}: baseline not readable; "
+                        "subtasks will see disk view, no cumulative drift "
+                        "tracking.",
+                        "warn",
+                    )
                 out: list[tuple[str, bool]] = []
-                for e in group:
-                    out.append(_one(e))
+                for idx, e in enumerate(group):
+                    out.append(_one(e, shared_overrides=buffers if buffers else None))
+                    if not buffers:
+                        continue
+                    delta, apply_point = self._apply_action_to_buffer(e, owner, buffers)
+                    if delta:
+                        for later in group[idx + 1:]:
+                            self._shift_region(later, owner, delta, apply_point)
                 return out
             with ThreadPoolExecutor(max_workers=max_workers) as pool:
-                futures = {pool.submit(_run_group, g): owner
+                futures = {pool.submit(_run_group, owner, g): owner
                            for owner, g in shared_groups.items()}
                 for fut in as_completed(futures):
                     results.extend(fut.result())
@@ -389,6 +512,86 @@ class ActionsMixin:
         return True
 
     # ── 2a. Outline LLM step ──────────────────────────────────────────
+    def _existing_impl_hint(self, spec_content: str) -> str:
+        """Heuristic: surface project symbols whose name keywords match the
+        spec text. Helps the planner notice "feature already implemented"
+        cases (e.g. spec asks for queue→in_progress automation, but
+        `_process_queue` already does exactly that).
+
+        Returns a textual hint block to inject into the outline prompt,
+        or empty string if no plausible match found.
+        """
+        try:
+            idx = self._load_project_index_file()
+        except Exception:
+            idx = None
+        if not isinstance(idx, dict):
+            return ""
+        files_dict = idx.get("files") if isinstance(idx.get("files"), dict) else idx
+        if not isinstance(files_dict, dict):
+            return ""
+        text = (spec_content or "").lower()
+        if not text:
+            return ""
+        spec_words = {
+            w for w in re.findall(r"[a-z_][a-z0-9_]{3,}", text)
+            if w not in {
+                "this","that","with","from","into","over","under","when",
+                "task","tasks","feature","system","method","function","class",
+                "spec","ensure","allow","make","return","value","field",
+                "based","being","does","such","each","also","they","then",
+                "must","shall","should","would","could","will","done",
+                "implementation","implement","implemented",
+            }
+        }
+        if not spec_words:
+            return ""
+        candidates: list[tuple[int, str, str, int, int]] = []
+        for fpath, meta in files_dict.items():
+            if not isinstance(meta, dict):
+                continue
+            outline = meta.get("outline") or []
+            if not isinstance(outline, list):
+                continue
+            for o in outline:
+                if not isinstance(o, dict):
+                    continue
+                name = str(o.get("name") or "")
+                if not name or name.startswith("_thread"):
+                    continue
+                tokens = {
+                    t.lower() for t in re.findall(r"[A-Za-z][A-Za-z0-9]+", name)
+                    if len(t) >= 3
+                }
+                if not tokens:
+                    continue
+                hits = tokens & spec_words
+                if not hits:
+                    continue
+                start = int(o.get("line") or 0)
+                end = int(o.get("end_line") or start)
+                body_size = max(0, end - start)
+                if body_size < 3:
+                    continue
+                score = len(hits) * 10 + body_size
+                candidates.append((score, fpath, name, start, end))
+        if not candidates:
+            return ""
+        candidates.sort(reverse=True)
+        top = candidates[:5]
+        lines = [
+            "POSSIBLY ALREADY IMPLEMENTED — check before generating subtasks:",
+        ]
+        for score, fp, name, a, b in top:
+            lines.append(f"  - {fp}:{a}-{b}  `{name}`  (keyword overlap)")
+        lines.append(
+            "BEFORE generating subtasks, read these symbol(s) with "
+            "read_file_range and decide whether they already satisfy the "
+            "spec. If they do, do NOT add subtasks that re-implement them — "
+            "see the empty-subtasks instruction below."
+        )
+        return "\n".join(lines) + "\n\n"
+
     def _new_step2a_outline(
         self,
         model: str,
@@ -419,16 +622,24 @@ class ActionsMixin:
         )
         rel_outline = self._rel(outline_path)
 
+        existing_impl_hint = self._existing_impl_hint(spec_content)
         stable_prefix = (
             f"Task: {self.task.title}\n"
             f"Description: {self.task.description}\n\n"
             f"SPECIFICATION:\n{spec_content}\n\n"
+            f"{existing_impl_hint}"
             f"{file_contents_section}"
             f"Project files available:\n{existing_files}\n\n"
             f"Write the subtask outline to: {rel_outline}\n"
             "Schema: {\"subtasks\": [{\"id\":\"T-001\",\"title\":\"...\","
             "\"files_to_modify\":[...],\"files_to_create\":[...],"
             "\"brief\":\"...\"}, ...]}\n"
+            "If after reading the candidate symbol(s) above you conclude "
+            "the spec is ALREADY satisfied by existing code, write "
+            "subtasks_outline.json with `{\"subtasks\": [], "
+            "\"already_implemented\": true, \"evidence\": \"<symbol>:<lines> "
+            "— why it covers the spec\"}` instead of inventing duplicate "
+            "subtasks.\n"
             "After write_file, call confirm_phase_done.\n"
         )
         volatile_tail = crit_section
@@ -447,6 +658,14 @@ class ActionsMixin:
             except Exception as e:
                 return False, f"subtasks_outline.json invalid JSON: {e}"
             subs = d.get("subtasks") if isinstance(d, dict) else None
+            if isinstance(d, dict) and d.get("already_implemented") and isinstance(subs, list) and not subs:
+                if not str(d.get("evidence") or "").strip():
+                    return False, (
+                        "subtasks_outline.json marked already_implemented=true "
+                        "but `evidence` is empty. Provide '<symbol>:<lines> "
+                        "— why it covers the spec' so a human can verify."
+                    )
+                return True, "OK"
             if not isinstance(subs, list) or not subs:
                 return False, "subtasks_outline.json needs non-empty 'subtasks'"
             known = {
@@ -564,7 +783,11 @@ class ActionsMixin:
                 for cons in consumes:
                     if not isinstance(cons, str) or not cons.strip():
                         continue
-                    if cons not in provided_so_far:
+                    candidates = {cons}
+                    if "." in cons:
+                        candidates.add(cons.rsplit(".", 1)[-1])
+                        candidates.add(cons.split(".", 1)[0])
+                    if not (candidates & provided_so_far):
                         return False, (
                             f"subtasks[{i}] ({s.get('id')}) consumes "
                             f"{cons!r}, but no earlier subtask declares it "
@@ -583,6 +806,33 @@ class ActionsMixin:
             PLANNING_TOOLS, executor, msg, validate, model,
             reconstruct_after=2, max_outer_iterations=4, max_tool_rounds=10,
         )
+        if not ok and not os.path.isfile(outline_path):
+            salvaged = _salvage_json_with_key(
+                getattr(executor, "last_assistant_text", "") or "",
+                "subtasks",
+            )
+            if isinstance(salvaged, dict) and isinstance(salvaged.get("subtasks"), list):
+                try:
+                    with open(outline_path, "w", encoding="utf-8") as fh:
+                        json.dump(salvaged, fh, ensure_ascii=False, indent=2)
+                    self.log(
+                        "  [RECOVER] subtasks_outline.json salvaged from "
+                        "last assistant message (LLM emitted JSON in chat "
+                        "instead of write_file)", "info",
+                    )
+                    ok2, reason = validate()
+                    if ok2:
+                        ok = True
+                    else:
+                        self.log(
+                            f"  [RECOVER] salvaged outline still invalid: "
+                            f"{reason}", "warn",
+                        )
+                except Exception as _e:
+                    self.log(
+                        f"  [RECOVER] failed to write salvaged outline: "
+                        f"{_e}", "warn",
+                    )
         if not ok:
             return False, []
         try:
@@ -619,6 +869,7 @@ class ActionsMixin:
         spec_content: str,
         wd: str,
         extra_issues: list[dict] | None,
+        shared_overrides: dict[str, str] | None = None,
     ) -> bool:
         """Write exactly one action file for one subtask entry."""
         from core.action_validator import validate_action_file
@@ -642,8 +893,10 @@ class ActionsMixin:
         create_paths = list(entry.get("files_to_create") or [])
 
         # Inject JUST this subtask's existing files (focused context).
+        # Shared-group overrides (post-prior-subtask buffers) win over disk.
         file_contents_section = self._load_top_file_contents(
-            wd, top_n=0, max_lines=150, extra_paths=modify_paths
+            wd, top_n=0, max_lines=150, extra_paths=modify_paths,
+            overrides=shared_overrides,
         )
 
         # Relevant critic issues for THIS file (targeted-mode retries).
@@ -747,7 +1000,19 @@ class ActionsMixin:
             f"SPECIFICATION (for context):\n{spec_content[:2500]}\n\n"
             f"Project files list:\n{existing_files}\n\n"
         )
-        region_section = self._render_region_section(entry, wd)
+        region_override = None
+        if shared_overrides:
+            _r = entry.get("region") or {}
+            _rfile = (_r.get("file") or "").replace("\\", "/").lstrip("./") if isinstance(_r, dict) else ""
+            if not _rfile:
+                _mods = entry.get("files_to_modify") or []
+                if _mods:
+                    _rfile = str(_mods[0]).replace("\\", "/").lstrip("./")
+            if _rfile in (shared_overrides or {}):
+                region_override = shared_overrides[_rfile]
+        region_section = self._render_region_section(
+            entry, wd, override_content=region_override,
+        )
         volatile_tail = (
             f"YOUR SINGLE SUBTASK:\n"
             f"  id:                {entry.get('id')}\n"
@@ -1005,24 +1270,32 @@ class ActionsMixin:
         return list(dict.fromkeys(out))
 
     def _render_file_section(
-        self, project_path: str, rel_path: str, max_lines: int
+        self, project_path: str, rel_path: str, max_lines: int,
+        override_content: str | None = None,
     ) -> str:
         """Render one file's numbered content block. Memoized across parallel
         2b workers via self._file_section_cache so overlapping modify_paths
         (e.g. two subtasks editing the same file) don't re-open disk.
-        """
-        key = (rel_path, int(max_lines))
-        with self._file_section_lock:
-            cached = self._file_section_cache.get(key)
-        if cached is not None:
-            return cached
 
-        abs_path = os.path.join(project_path, rel_path)
-        if not os.path.isfile(abs_path):
-            return ""
+        If `override_content` is supplied, it is rendered instead of disk
+        content and the result is NOT memoized (per-call shared-group view).
+        """
+        if override_content is None:
+            key = (rel_path, int(max_lines))
+            with self._file_section_lock:
+                cached = self._file_section_cache.get(key)
+            if cached is not None:
+                return cached
+
         try:
-            with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
-                raw_lines = f.readlines()
+            if override_content is not None:
+                raw_lines = override_content.splitlines(keepends=True)
+            else:
+                abs_path = os.path.join(project_path, rel_path)
+                if not os.path.isfile(abs_path):
+                    return ""
+                with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
+                    raw_lines = f.readlines()
             total = len(raw_lines)
             shown = raw_lines[:max_lines]
             # Char-cap fallback: wide lines can blow up a 150-line slice to 30K+.
@@ -1052,8 +1325,9 @@ class ActionsMixin:
                         "If your patch uses a name NOT in this list, add a "
                         "separate earlier step that imports it (R8).\n"
                     )
+            tag = "" if override_content is None else " (reflects prior shared-group subtasks)"
             section = (
-                f"=== {rel_path} (total {total} lines) ===\n"
+                f"=== {rel_path} (total {total} lines){tag} ===\n"
                 + imports_summary
                 + numbered
                 + "\n"
@@ -1061,8 +1335,9 @@ class ActionsMixin:
         except Exception:
             return ""
 
-        with self._file_section_lock:
-            self._file_section_cache[key] = section
+        if override_content is None:
+            with self._file_section_lock:
+                self._file_section_cache[(rel_path, int(max_lines))] = section
         return section
 
     def _prewarm_file_sections(
@@ -1083,6 +1358,7 @@ class ActionsMixin:
         top_n: int = 5,
         max_lines: int = 300,
         extra_paths: list[str] | None = None,
+        overrides: dict[str, str] | None = None,
     ) -> str:
         """Load contents of top-scored project files for inline context injection.
 
@@ -1112,7 +1388,10 @@ class ActionsMixin:
         sections = []
         truncated = 0
         for rel_path in merged:
-            section = self._render_file_section(project_path, rel_path, max_lines)
+            ovr = (overrides or {}).get(rel_path)
+            section = self._render_file_section(
+                project_path, rel_path, max_lines, override_content=ovr,
+            )
             if not section:
                 continue
             if char_budget <= 0:
@@ -1122,7 +1401,9 @@ class ActionsMixin:
                 # Shrink remaining file by halving max_lines until it fits or hits floor
                 shrunk_lines = max(40, max_lines // 2)
                 while shrunk_lines >= 40 and len(section) > char_budget:
-                    section = self._render_file_section(project_path, rel_path, shrunk_lines)
+                    section = self._render_file_section(
+                        project_path, rel_path, shrunk_lines, override_content=ovr,
+                    )
                     if not section:
                         break
                     shrunk_lines //= 2
@@ -1146,13 +1427,16 @@ class ActionsMixin:
             + "\n"
         )
 
-    def _render_region_section(self, entry: dict, wd: str) -> str:
+    def _render_region_section(
+        self, entry: dict, wd: str,
+        override_content: str | None = None,
+    ) -> str:
         """Pre-fetch the declared region (with ±20 line padding) so the model
         can copy `search` blocks verbatim without an exploratory read_file.
 
-        Only fires when the subtask carries a `region` object from outline.
-        Padding leaves room for anchor preservation while staying inside
-        sibling subtask gaps.
+        If `override_content` is provided, render from that string instead of
+        reading the file from disk. Used by the shared-group runner so each
+        successive subtask sees the cumulative buffer (post-prior-subtasks).
         """
         region = entry.get("region") or {}
         if not isinstance(region, dict):
@@ -1175,30 +1459,34 @@ class ActionsMixin:
         view_start = max(1, start - PAD)
         view_end = end + PAD
 
-        project_root = self.task.project_path or self.state.working_dir
-        candidates = [
-            os.path.join(wd, rel_path),
-            os.path.join(project_root, rel_path),
-        ]
         body_lines: list[str] = []
         total_lines = 0
-        chosen_path = ""
-        for cp in candidates:
-            if os.path.isfile(cp):
-                try:
-                    with open(cp, "r", encoding="utf-8", errors="replace") as fh:
-                        all_lines = fh.read().splitlines()
-                    total_lines = len(all_lines)
-                    lo = min(view_start, max(1, total_lines))
-                    hi = min(view_end, total_lines)
-                    body_lines = [
-                        f"{idx:>5}\t{all_lines[idx - 1]}"
-                        for idx in range(lo, hi + 1)
-                    ]
-                    chosen_path = cp
-                    break
-                except Exception:
-                    continue
+        all_lines: list[str] = []
+        if override_content is not None:
+            all_lines = override_content.splitlines()
+            total_lines = len(all_lines)
+        else:
+            project_root = self.task.project_path or self.state.working_dir
+            candidates = [
+                os.path.join(wd, rel_path),
+                os.path.join(project_root, rel_path),
+            ]
+            for cp in candidates:
+                if os.path.isfile(cp):
+                    try:
+                        with open(cp, "r", encoding="utf-8", errors="replace") as fh:
+                            all_lines = fh.read().splitlines()
+                        total_lines = len(all_lines)
+                        break
+                    except Exception:
+                        continue
+        if all_lines:
+            lo = min(view_start, max(1, total_lines))
+            hi = min(view_end, total_lines)
+            body_lines = [
+                f"{idx:>5}\t{all_lines[idx - 1]}"
+                for idx in range(lo, hi + 1)
+            ]
         if not body_lines:
             return (
                 f"REGION ANCHOR:\n"
@@ -1210,11 +1498,18 @@ class ActionsMixin:
                 f"end_line={end}) once.)\n\n"
             )
 
+        cumulative_note = (
+            "  NOTE:          this view reflects prior shared-group subtasks "
+            "(line numbers already shifted to match).\n"
+            if override_content is not None else ""
+        )
         return (
             f"REGION ANCHOR (your search/replace MUST stay within this slice):\n"
             f"  file:          {rel_path} ({total_lines} lines total)\n"
             f"  anchor_symbol: {anchor}\n"
-            f"  region:        L{start}-L{end} (±20 lines of context shown below)\n\n"
+            f"  region:        L{start}-L{end} (±20 lines of context shown below)\n"
+            + cumulative_note
+            + "\n"
             f"=== {rel_path} [L{view_start}-L{min(view_end, total_lines)}] ===\n"
             + "\n".join(body_lines)
             + f"\n=== end of region view ===\n\n"
@@ -1224,18 +1519,171 @@ class ActionsMixin:
             f"read_file_range with explicit lines once.\n\n"
         )
 
+    def _read_group_baseline(self, wd: str, rel_path: str) -> str | None:
+        """Read shared file baseline for cumulative buffer. Prefer workdir,
+        fall back to project root.
+        """
+        project_root = self.task.project_path or self.state.working_dir
+        for cp in (os.path.join(wd, rel_path),
+                   os.path.join(project_root, rel_path)):
+            if os.path.isfile(cp):
+                try:
+                    with open(cp, "r", encoding="utf-8", errors="replace") as fh:
+                        return fh.read()
+                except Exception:
+                    continue
+        return None
+
+    def _apply_action_to_buffer(
+        self, entry: dict, owner: str, buffers: dict[str, str],
+    ) -> tuple[int, int]:
+        """Read the action JSON just written for `entry`, apply its blocks
+        targeting `owner` to `buffers[owner]` in-memory.
+
+        Returns (delta_lines, apply_point_line). delta_lines is the line-count
+        change introduced by this action; apply_point_line is the 1-based
+        line of the first match in the OLD buffer (used to decide whether
+        downstream regions need shifting). On failure both are 0 and the
+        buffer is left unchanged.
+        """
+        from core.patcher import apply_blocks, legacy_step_to_blocks
+
+        sid_raw = str(entry.get("id") or "").replace("-", "").upper()
+        if not re.match(r"^T\d{3}$", sid_raw):
+            return 0, 0
+        action_path = os.path.join(self.task.task_dir, "actions", f"{sid_raw}.json")
+        if not os.path.isfile(action_path):
+            return 0, 0
+        try:
+            with open(action_path, "r", encoding="utf-8") as fh:
+                action_data = json.load(fh)
+        except Exception:
+            return 0, 0
+
+        steps = action_data.get("implementation_steps") or []
+        owner_norm = owner.replace("\\", "/").lstrip("./")
+        all_blocks: list[dict] = []
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            blocks, step_file, _action = legacy_step_to_blocks(step)
+            target = (step_file or "").replace("\\", "/").lstrip("./")
+            if not target:
+                mods = action_data.get("files_to_modify") or []
+                if len(mods) == 1:
+                    target = str(mods[0]).replace("\\", "/").lstrip("./")
+            if target != owner_norm:
+                continue
+            all_blocks.extend(blocks)
+
+        if not all_blocks:
+            return 0, 0
+
+        old_buf = buffers.get(owner)
+        if old_buf is None:
+            return 0, 0
+        # Compute apply_point (1-based) from FIRST block's search before apply.
+        first_search = (all_blocks[0].get("search") or "")
+        if first_search and first_search in old_buf:
+            apply_point = old_buf.count("\n", 0, old_buf.index(first_search)) + 1
+        else:
+            apply_point = 0
+
+        ok, new_buf, msgs = apply_blocks(old_buf, all_blocks)
+        if not ok:
+            self.log(
+                f"  [shared-group] {entry.get('id')}: in-memory apply failed "
+                f"({'; '.join(msgs)[:200]}). Next subtask will see "
+                "pre-apply buffer.",
+                "warn",
+            )
+            return 0, 0
+
+        delta = new_buf.count("\n") - old_buf.count("\n")
+        buffers[owner] = new_buf
+        if delta:
+            self.log(
+                f"  [shared-group] {entry.get('id')}: applied "
+                f"{len(all_blocks)} block(s) to {owner} buffer "
+                f"(Δ {delta:+d} lines, apply_point=L{apply_point}).",
+                "info",
+            )
+        return delta, apply_point
+
+    @staticmethod
+    def _shift_region(
+        entry: dict, owner: str, delta: int, apply_point: int,
+    ) -> None:
+        """Shift entry.region.{start_line,end_line} by `delta` if the region
+        sits below `apply_point`. Group-local mutation only; outline JSON on
+        disk untouched.
+        """
+        if not delta:
+            return
+        region = entry.get("region") or {}
+        if not isinstance(region, dict):
+            return
+        rfile = (region.get("file") or "").replace("\\", "/").lstrip("./")
+        if rfile != owner.replace("\\", "/").lstrip("./"):
+            return
+        try:
+            start = int(region.get("start_line") or 0)
+            end = int(region.get("end_line") or 0)
+        except Exception:
+            return
+        if start <= 0 or end < start:
+            return
+        if apply_point and start < apply_point:
+            return
+        region["start_line"] = max(1, start + delta)
+        region["end_line"] = max(region["start_line"], end + delta)
+        entry["region"] = region
+
     def _cleanup_orphaned_actions(self, actions_dir: str, written_basenames: set[str]):
-        """Remove action files not written in this iteration (plan shrank)."""
+        """Remove action files not written in this iteration (plan shrank).
+
+        Also drop the corresponding subtask entries from `task.subtasks` and
+        push an immediate UI update so the Subtasks badge / list reflects
+        the reduced count without waiting for the final loader pass.
+        """
         if not os.path.isdir(actions_dir):
             return
-        removed = []
+        removed: list[str] = []
         for fname in os.listdir(actions_dir):
             if fname.endswith(".json") and fname not in written_basenames:
                 os.remove(os.path.join(actions_dir, fname))
                 removed.append(fname)
                 self.log(f"  ✗ removed orphaned action: {fname}", "warn")
-        if removed:
-            self.log(f"  Cleaned {len(removed)} orphaned action file(s)", "warn")
+        if not removed:
+            return
+        self.log(f"  Cleaned {len(removed)} orphaned action file(s)", "warn")
+
+        removed_ids: set[str] = set()
+        for fname in removed:
+            base = fname[:-5] if fname.endswith(".json") else fname
+            removed_ids.add(base)
+            removed_ids.add(base.replace("T", "T-", 1) if base.startswith("T") else base)
+        before = len(self.task.subtasks)
+        self.task.subtasks = [
+            s for s in (self.task.subtasks or [])
+            if str(s.get("id") or "").replace("-", "") not in {
+                rid.replace("-", "") for rid in removed_ids
+            }
+        ]
+        after = len(self.task.subtasks)
+        if after != before:
+            try:
+                self.state.save_subtasks_for_task(self.task)
+            except Exception:
+                pass
+            try:
+                self.push_task()
+            except Exception:
+                pass
+            self.log(
+                f"  Subtasks list trimmed {before} → {after} after orphan cleanup.",
+                "info",
+            )
 
     def _renumber_action_files(self, actions_dir: str):
         """Rename action files to be strictly sequential: T001.json, T002.json, …

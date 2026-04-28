@@ -242,13 +242,34 @@ class CritiqueMixin:
         self.run_loop(
             "3b Dep Closure", "p5b_dependency_closure.md",
             PLANNING_TOOLS, executor, msg, validate, model,
-            max_outer_iterations=4,
-            max_tool_rounds=12,
-            reconstruct_after=2,
+            max_outer_iterations=2,
+            max_tool_rounds=10,
+            reconstruct_after=1,
         )
 
         # Final read: validate again to return feedback regardless of run_loop outcome
         ok, reason = validate()
+        if not ok and not os.path.isfile(report_path):
+            from core.phases.planning.actions import _salvage_json_with_key
+            salvaged = _salvage_json_with_key(
+                getattr(executor, "last_assistant_text", "") or "",
+                "subtasks",
+            )
+            if isinstance(salvaged, dict) and isinstance(salvaged.get("subtasks"), list):
+                try:
+                    import json as _json
+                    with open(report_path, "w", encoding="utf-8") as fh:
+                        _json.dump(salvaged, fh, ensure_ascii=False, indent=2)
+                    self.log(
+                        "  [RECOVER] dependency_report.json salvaged from "
+                        "last assistant message", "info",
+                    )
+                    ok, reason = validate()
+                except Exception as _e:
+                    self.log(
+                        f"  [RECOVER] failed to write salvaged dep report: "
+                        f"{_e}", "warn",
+                    )
         if ok:
             self.log("  ✓ Dependency closure PASSED — plan complete", "ok")
             return True, ""

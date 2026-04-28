@@ -56,6 +56,21 @@ code blocks, no search/replace, just a subtask list.
   frontend, HTML before JS that binds to it, CSS last.
 - **Do NOT write any other file here** — only `subtasks_outline.json`.
 
+## Already-implemented short-circuit
+
+Before generating any subtasks, scan the project files (especially any
+"POSSIBLY ALREADY IMPLEMENTED" hints in the user message). If existing
+code already satisfies every acceptance criterion of the spec, do NOT
+invent duplicate subtasks. Instead emit:
+
+```json
+{"subtasks": [], "already_implemented": true,
+ "evidence": "main.py:_process_queue (L1112-1145) already moves Queue→InProgress when a slot is free — covers AC-1/AC-2/AC-3"}
+```
+
+`evidence` MUST cite file:symbol:line-range and explain how it covers the
+acceptance criteria. The pipeline routes such tasks straight to review.
+
 ## Cross-subtask contracts — `provides` / `consumes`
 
 When two subtasks talk to each other (one defines a field, function, or
@@ -79,6 +94,12 @@ Rules:
 - Use full names: include class for methods (`KanbanTask.to_dict`),
   `#id` for DOM ids, `.cls` for CSS classes. Avoid generic words
   (`task`, `data`).
+- Naming rules:
+  - **Bare** function/class names (`_process_queue`, `KanbanTask`).
+  - **Class members**: `Class.method` / `Class.field` (e.g. `KanbanTask.to_dict`, `AppState.kanban_tasks`).
+  - **DOM/CSS**: `#id`, `.class`.
+  - Do **NOT** prefix with module path (`main.foo` is wrong → use `foo`).
+  - For singleton/global state, use the dataclass form (`AppState.kanban_tasks`), not the instance-attr form (`STATE.kanban_tasks`).
 
 Example:
 
