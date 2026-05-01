@@ -1398,8 +1398,8 @@ Token count: {token_count} / {config['max_total_tokens']}
                         )
                         return False
                     import time as _time
-                    # Escalating backoff: 60, 120, 180, 240 — capped at 300s (5 min).
-                    _outer_sleep = min(60 * _consec_net, 300)
+                    # Escalating backoff: 60, 120, 180, 240 — capped at 900s (15 min).
+                    _outer_sleep = min(60 * _consec_net, 900)
                     self.log(
                         f"  [RETRY] Network error ({_consec_net}/5) — "
                         f"waiting {_outer_sleep}s before retry…",

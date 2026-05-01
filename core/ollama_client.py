@@ -279,7 +279,7 @@ def shutdown_all_clients() -> None:
 
 class OllamaClient:
     def __init__(self, base_url: str = "http://localhost:1234", api_key: str = "",
-                 read_timeout: int = 600, auth_style: str = "bearer"):
+                 read_timeout: int = 900, auth_style: str = "bearer"):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.read_timeout = read_timeout  # seconds; 600 for local, 300 for cloud APIs
@@ -423,7 +423,7 @@ class OllamaClient:
         progress_fn: Optional[Callable[[str], None]] = None,
         is_aborted: Optional[Callable[[], bool]] = None,
         first_byte_timeout: float = 300.0,
-        idle_timeout: float = 300.0,
+        idle_timeout: float = 900.0,
         hard_timeout: float = 1800.0,
     ) -> UrllibResponse:
         """Dispatch an LLM request to the provider transport.
@@ -562,7 +562,7 @@ class OllamaClient:
                             "stream": False,
                             "max_tokens": max_tokens,
                         },
-                        (10, 300),
+                        (10, 900),
                     )
                     resp.raise_for_status()
                     break
